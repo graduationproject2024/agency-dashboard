@@ -1,0 +1,8 @@
+{
+  "provider": "gemini",
+  "openrouter_key": "",
+  "openrouter_model": "gemini-3.5-flash-lite",
+  "opencode_url": "http://127.0.0.1:4096",
+  "opencode_ai_provider": "anthropic",
+  "opencode_model": "claude-haiku-4-5"
+}

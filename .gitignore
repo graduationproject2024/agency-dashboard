@@ -1,0 +1,16 @@
+# Secrets and environment configuration
+settings.json
+.env
+.env.*
+!.env.example
+
+# Python cache & artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs and temporary files
+*.log

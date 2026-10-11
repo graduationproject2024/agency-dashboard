@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>تتريس برو 🎮 TETRIS PRO — أركيد كلاسيكي حديث</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🕹️</text></svg>">
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800;900&family=Press+Start+2P&family=Outfit:wght@400;600;700;800&display=swap" rel="stylesheet">
+    <!-- Font Awesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="stars-bg"></div>
+    <div class="grid-overlay"></div>
+
+    <div class="tetris-app">
+        <!-- Top Arcade Bar -->
+        <header class="arcade-header">
+            <div class="arcade-logo">
+                <i class="fa-solid fa-gamepad logo-icon"></i>
+                <div class="logo-text">
+                    <h1>TETRIS <span>PRO</span></h1>
+                    <p class="tagline">أركيد كلاسيكي بأداء احترافي ومؤثرات حديثة</p>
+                </div>
+            </div>
+            <div class="header-tools">
+                <button id="sound-btn" class="arcade-btn icon-btn" title="كتم / تشغيل الصوت">
+                    <i class="fa-solid fa-volume-high"></i>
+                </button>
+                <button id="pause-btn" class="arcade-btn icon-btn" title="إيقاف مؤقت (P)">
+                    <i class="fa-solid fa-pause"></i>
+                </button>
+                <button id="restart-btn" class="arcade-btn icon-btn" title="إعادة تشغيل (R)">
+                    <i class="fa-solid fa-rotate-right"></i>
+                </button>
+                <button id="help-btn" class="arcade-btn icon-btn" title="أزرار التحكم">
+                    <i class="fa-solid fa-keyboard"></i>
+                </button>
+            </div>
+        </header>
+
+        <!-- Main Game Layout -->
+        <main class="game-wrapper">
+            <!-- Left Side Panel (Hold & Stats) -->
+            <aside class="panel side-panel left-panel">
+                <!-- Hold Piece Card -->
+                <div class="glass-card card-hold">
+                    <div class="card-title"><i class="fa-solid fa-hand"></i> التثبيت (HOLD)</div>
+                    <div class="preview-box">
+                        <canvas id="hold-canvas" width="120" height="120"></canvas>
+                    </div>
+                    <span class="key-hint">اضغط C أو Shift</span>
+                </div>
+
+                <!-- Stats Cards -->
+                <div class="glass-card stat-card">
+                    <div class="card-title"><i class="fa-solid fa-trophy"></i> أعلى نتيجة</div>
+                    <div class="stat-value neon-gold" id="high-score">0</div>
+                </div>
+
+                <div class="glass-card stat-card">
+                    <div class="card-title"><i class="fa-solid fa-layer-group"></i> المستوى (LEVEL)</div>
+                    <div class="stat-value neon-blue" id="level">1</div>
+                </div>
+
+                <div class="glass-card stat-card">
+                    <div class="card-title"><i class="fa-solid fa-lines-leaning"></i> الصفوف المكتملة</div>
+                    <div class="stat-value neon-green" id="lines">0</div>
+                </div>
+            </aside>
+
+            <!-- Center Matrix Board -->
+            <section class="matrix-container">
+                <div class="canvas-frame">
+                    <canvas id="tetris-canvas" width="300" height="600"></canvas>
+                    <div id="combo-popup" class="combo-banner"></div>
+                    <div id="b2b-badge" class="b2b-banner">BACK-TO-BACK!</div>
+
+                    <!-- Pause Overlay -->
+                    <div id="pause-overlay" class="game-overlay hidden">
+                        <div class="overlay-box">
+                            <i class="fa-solid fa-circle-pause fa-beat"></i>
+                            <h2>اللعبة متوقفة مؤقتاً</h2>
+                            <p>اضغط استئناف أو زر P للمتابعة</p>
+                            <button id="resume-btn" class="btn-glow-blue">استئناف اللعب</button>
+                        </div>
+                    </div>
+
+                    <!-- Start / Game Over Overlay -->
+                    <div id="game-over-overlay" class="game-overlay">
+                        <div class="overlay-box">
+                            <h2 id="modal-title" class="title-glow">TETRIS PRO</h2>
+                            <p id="modal-subtitle">هل أنت مستعد لأفضل تجربة تتريس؟</p>
+                            
+                            <div class="game-summary" id="game-summary" style="display:none;">
+                                <div class="summary-item">
+                                    <span>النقاط النهائية</span>
+                                    <strong id="final-score" class="neon-green">0</strong>
+                                </div>
+                                <div class="summary-item">
+                                    <span>المستوى الأقصى</span>
+                                    <strong id="final-level" class="neon-blue">1</strong>
+                                </div>
+                                <div class="summary-item">
+                                    <span>الصفوف المنتهية</span>
+                                    <strong id="final-lines" class="neon-purple">0</strong>
+                                </div>
+                                <div class="summary-item">
+                                    <span>عدد تتريس (4 صفوف)</span>
+                                    <strong id="final-tetris" class="neon-gold">0</strong>
+                                </div>
+                            </div>
+
+                            <button id="start-game-btn" class="btn-glow-green">
+                                <i class="fa-solid fa-play"></i> بدء اللعبة الآن
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Right Side Panel (Next Queue & Score) -->
+            <aside class="panel side-panel right-panel">
+                <!-- Score Card -->
+                <div class="glass-card stat-card main-score-card">
+                    <div class="card-title"><i class="fa-solid fa-star"></i> النقاط الحالية</div>
+                    <div class="stat-value neon-pink" id="score">0</div>
+                </div>
+
+                <!-- Next Pieces Queue -->
+                <div class="glass-card card-next">
+                    <div class="card-title"><i class="fa-solid fa-forward"></i> القادم (NEXT)</div>
+                    <div class="next-previews">
+                        <div class="preview-box mini-preview">
+                            <canvas id="next-1" width="90" height="90"></canvas>
+                        </div>
+                        <div class="preview-box mini-preview">
+                            <canvas id="next-2" width="90" height="90"></canvas>
+                        </div>
+                        <div class="preview-box mini-preview">
+                            <canvas id="next-3" width="90" height="90"></canvas>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Streak / Stats -->
+                <div class="glass-card stat-card">
+                    <div class="card-title"><i class="fa-solid fa-bolt"></i> الكومبو المتتالي</div>
+                    <div class="stat-value neon-cyan" id="combo-count">0x</div>
+                </div>
+            </aside>
+        </main>
+
+        <!-- Touch Controls for Mobile/Tablet -->
+        <div class="touch-controls">
+            <div class="touch-row">
+                <button class="t-btn" id="t-hold" title="تثبيت"><i class="fa-solid fa-hand"></i><span>HOLD</span></button>
+                <button class="t-btn" id="t-rot-ccw" title="تدوير يسار"><i class="fa-solid fa-rotate-left"></i></button>
+                <button class="t-btn" id="t-rot-cw" title="تدوير يمين"><i class="fa-solid fa-rotate-right"></i></button>
+                <button class="t-btn highlight" id="t-hard" title="إسقاط فوري"><i class="fa-solid fa-angles-down"></i><span>DROP</span></button>
+            </div>
+            <div class="touch-row dpad">
+                <button class="t-btn dir-btn" id="t-left" title="يسار"><i class="fa-solid fa-chevron-right"></i></button>
+                <button class="t-btn dir-btn" id="t-down" title="تسريع"><i class="fa-solid fa-chevron-down"></i></button>
+                <button class="t-btn dir-btn" id="t-right" title="يمين"><i class="fa-solid fa-chevron-left"></i></button>
+            </div>
+        </div>
+
+        <!-- Keyboard Controls Help Modal -->
+        <div id="controls-modal" class="game-overlay hidden">
+            <div class="overlay-box modal-wide">
+                <h2><i class="fa-solid fa-keyboard"></i> إرشادات أزرار التحكم</h2>
+                <div class="controls-grid">
+                    <div class="ctrl-item">
+                        <span class="ctrl-key">← / →</span> أو <span class="ctrl-key">A / D</span>
+                        <span class="ctrl-desc">تحريك القطعة يميناً ويساراً</span>
+                    </div>
+                    <div class="ctrl-item">
+                        <span class="ctrl-key">↑</span> أو <span class="ctrl-key">W</span>
+                        <span class="ctrl-desc">تدوير القطعة باتجاه عقارب الساعة</span>
+                    </div>
+                    <div class="ctrl-item">
+                        <span class="ctrl-key">Z</span>
+                        <span class="ctrl-desc">تدوير عكس عقارب الساعة</span>
+                    </div>
+                    <div class="ctrl-item">
+                        <span class="ctrl-key">↓</span> أو <span class="ctrl-key">S</span>
+                        <span class="ctrl-desc">سقوط سلس ومسرع (Soft Drop)</span>
+                    </div>
+                    <div class="ctrl-item">
+                        <span class="ctrl-key">مسافة Space</span>
+                        <span class="ctrl-desc">سقوط فوري مباشر (Hard Drop)</span>
+                    </div>
+                    <div class="ctrl-item">
+                        <span class="ctrl-key">C</span> أو <span class="ctrl-key">Shift</span>
+                        <span class="ctrl-desc">تثبيت القطعة الحالية (Hold)</span>
+                    </div>
+                    <div class="ctrl-item">
+                        <span class="ctrl-key">P</span> أو <span class="ctrl-key">Esc</span>
+                        <span class="ctrl-desc">إيقاف مؤقت واستئناف</span>
+                    </div>
+                    <div class="ctrl-item">
+                        <span class="ctrl-key">R</span>
+                        <span class="ctrl-desc">إعادة تشغيل اللعبة</span>
+                    </div>
+                </div>
+                <button id="close-help-btn" class="btn-glow-blue" style="margin-top:20px;">حسناً، فهمت</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>

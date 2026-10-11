@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>لوحة تحكم المدير - Agency Agents</title>
+    <link rel="stylesheet" href="style.css?v=4">
+    <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@300;400;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="logo">
+                <i class="fa-solid fa-bolt"></i>
+                <h2>AGENCY<span>OS</span></h2>
+            </div>
+            <nav>
+                <a href="#" id="nav-overview" class="active" onclick="showSection('overview', this)"><i class="fa-solid fa-chart-pie"></i> نظرة عامة</a>
+                <a href="#" id="nav-agents" onclick="showSection('agents', this)"><i class="fa-solid fa-users-gear"></i> البوتات (Agents)</a>
+                <a href="#" id="nav-approvals" onclick="showSection('approvals', this)"><i class="fa-solid fa-check-double"></i> الموافقات <span class="badge" id="sidebar-badge" style="display:none;">0</span></a>
+                <a href="#" id="nav-projects" onclick="showSection('projects', this)"><i class="fa-solid fa-folder-open"></i> المشاريع</a>
+                <a href="#" id="nav-budget" onclick="showSection('budget', this)"><i class="fa-solid fa-file-invoice-dollar"></i> الميزانية</a>
+                <a href="#" id="nav-settings" onclick="showSection('settings', this)"><i class="fa-solid fa-gear"></i> الإعدادات</a>
+            </nav>
+            <div class="project-info">
+                <p>المشروع الحالي:</p>
+                <h4 id="project-title">لا يوجد مشروع حالياً</h4>
+                <div class="progress-bar"><div class="progress" id="project-progress" style="width: 0%"></div></div>
+                <span id="project-progress-text">0% مكتمل</span>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <div id="section-overview" class="view-section">
+                <header>
+                    <div>
+                        <h1>مرحباً بك يا مدير 👋</h1>
+                        <p>إليك ملخص ما يفعله فريق الذكاء الاصطناعي الآن.</p>
+                    </div>
+                    <div class="header-actions">
+                        <button class="btn btn-primary" onclick="openModal()"><i class="fa-solid fa-plus"></i> مهمة جديدة</button>
+                        <div class="profile-pic">
+                            <img src="https://ui-avatars.com/api/?name=CEO&background=0D8ABC&color=fff" alt="CEO">
+                        </div>
+                    </div>
+                </header>
+
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="icon-wrapper blue"><i class="fa-solid fa-robot"></i></div>
+                        <div class="stat-info">
+                            <h3 id="stat-total-agents">282</h3>
+                            <p>موظف (Agent) متاح</p>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="icon-wrapper green"><i class="fa-solid fa-briefcase"></i></div>
+                        <div class="stat-info">
+                            <h3 id="stat-active-agents">0</h3>
+                            <p>بوت يعملون الآن</p>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="icon-wrapper yellow"><i class="fa-solid fa-clock"></i></div>
+                        <div class="stat-info">
+                            <h3 id="stat-pending-approvals">0</h3>
+                            <p>قرارات بانتظارك</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="workflow-visualization glass-panel">
+                    <h2><i class="fa-solid fa-diagram-project"></i> خريطة مسار العمل (Workflow)</h2>
+                    <div class="mindmap-container">
+                        <div class="node" id="node-strategy">الاستراتيجية</div>
+                        <i class="fa-solid fa-arrow-left arrow"></i>
+                        <div class="node" id="node-product">المنتج (PRD)</div>
+                        <i class="fa-solid fa-arrow-left arrow"></i>
+                        <div class="node" id="node-engineering">الهندسة</div>
+                        <i class="fa-solid fa-arrow-left arrow"></i>
+                        <div class="node" id="node-design">التصميم</div>
+                        <i class="fa-solid fa-arrow-left arrow"></i>
+                        <div class="node" id="node-development">البرمجة</div>
+                        <i class="fa-solid fa-arrow-left arrow"></i>
+                        <div class="node" id="node-qa">ضمان الجودة</div>
+                        <i class="fa-solid fa-arrow-left arrow"></i>
+                        <div class="node" id="node-animation">الأنيميشن</div>
+                        <i class="fa-solid fa-arrow-left arrow"></i>
+                        <div class="node" id="node-seo">الـ SEO</div>
+                    </div>
+                </div>
+
+                <div class="content-grid">
+                    <!-- Activity Feed -->
+                    <div class="feed-section glass-panel">
+                        <h2><i class="fa-solid fa-satellite-dish blink"></i> بث مباشر لعمل البوتات</h2>
+                        <div class="feed-container" id="feed-container">
+                            <!-- Feed items generated by JS -->
+                        </div>
+                    </div>
+
+                    <!-- Departments Status -->
+                    <div class="departments-section glass-panel">
+                        <h2>حالة الأقسام</h2>
+                        <div class="department-list">
+                            <div class="dept-item" id="dept-strategy">
+                                <div class="dept-icon"><i class="fa-solid fa-chess-knight"></i></div>
+                                <div class="dept-details">
+                                    <h4>قسم الاستراتيجية (Strategy)</h4>
+                                    <p class="status text-gray">في انتظار بدء المشروع</p>
+                                </div>
+                                <button class="btn btn-sm" onclick="viewOutput('strategy')"><i class="fa-solid fa-eye"></i></button>
+                            </div>
+                            <div class="dept-item" id="dept-product">
+                                <div class="dept-icon"><i class="fa-solid fa-compass-drafting"></i></div>
+                                <div class="dept-details">
+                                    <h4>قسم المنتجات (Product)</h4>
+                                    <p class="status text-gray">في انتظار بدء المشروع</p>
+                                </div>
+                                <button class="btn btn-sm" onclick="viewOutput('product')"><i class="fa-solid fa-eye"></i></button>
+                            </div>
+                            <div class="dept-item" id="dept-engineering">
+                                <div class="dept-icon"><i class="fa-solid fa-code"></i></div>
+                                <div class="dept-details">
+                                    <h4>قسم الهندسة (Engineering)</h4>
+                                    <p class="status text-gray">في انتظار بدء المشروع</p>
+                                </div>
+                                <button class="btn btn-sm" onclick="viewOutput('engineering')"><i class="fa-solid fa-eye"></i></button>
+                            </div>
+                            <div class="dept-item" id="dept-design">
+                                <div class="dept-icon"><i class="fa-solid fa-palette"></i></div>
+                                <div class="dept-details">
+                                    <h4>قسم التصميم (Design)</h4>
+                                    <p class="status text-gray">في انتظار بدء المشروع</p>
+                                </div>
+                                <button class="btn btn-sm" onclick="viewOutput('design')"><i class="fa-solid fa-eye"></i></button>
+                            </div>
+                            <div class="dept-item" id="dept-development">
+                                <div class="dept-icon"><i class="fa-solid fa-laptop-code"></i></div>
+                                <div class="dept-details">
+                                    <h4>قسم البرمجة والتطوير (Development)</h4>
+                                    <p class="status text-gray">في انتظار بدء المشروع</p>
+                                </div>
+                                <button class="btn btn-sm" onclick="viewOutput('development')"><i class="fa-solid fa-eye"></i></button>
+                            </div>
+                            <div class="dept-item" id="dept-qa">
+                                <div class="dept-icon"><i class="fa-solid fa-bug-slash"></i></div>
+                                <div class="dept-details">
+                                    <h4>قسم ضمان الجودة (QA)</h4>
+                                    <p class="status text-gray">في انتظار بدء المشروع</p>
+                                </div>
+                                <button class="btn btn-sm" onclick="viewOutput('qa')"><i class="fa-solid fa-eye"></i></button>
+                            </div>
+                            <div class="dept-item" id="dept-animation">
+                                <div class="dept-icon"><i class="fa-solid fa-wand-magic-sparkles"></i></div>
+                                <div class="dept-details">
+                                    <h4>قسم الأنيميشن (Motion)</h4>
+                                    <p class="status text-gray">في انتظار بدء المشروع</p>
+                                </div>
+                                <button class="btn btn-sm" onclick="viewOutput('animation')"><i class="fa-solid fa-eye"></i></button>
+                            </div>
+                            <div class="dept-item" id="dept-seo">
+                                <div class="dept-icon"><i class="fa-solid fa-magnifying-glass-chart"></i></div>
+                                <div class="dept-details">
+                                    <h4>قسم الـ SEO</h4>
+                                    <p class="status text-gray">في انتظار بدء المشروع</p>
+                                </div>
+                                <button class="btn btn-sm" onclick="viewOutput('seo')"><i class="fa-solid fa-eye"></i></button>
+                            </div>
+                        </div>
+
+                        <div class="approval-box" id="approval-box" style="display: none;">
+                            <div class="approval-header">
+                                <div class="icon-wrapper yellow" style="width:40px; height:40px; font-size:1.1rem; flex-shrink:0;">
+                                    <i class="fa-solid fa-scale-balanced"></i>
+                                </div>
+                                <div style="flex:1;">
+                                    <div style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
+                                        <h3 style="margin:0;"><i class="fa-solid fa-triangle-exclamation text-yellow"></i> <span id="approval-title">مطلوب اعتمادك</span></h3>
+                                        <span class="approval-role-badge" id="approval-role-badge">مدير المنتج</span>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="approval-content">
+                                <p id="approval-msg" style="color: #c9d1d9; line-height: 1.6; margin: 10px 0;"></p>
+                                <div class="approval-buttons-group">
+                                    <button class="btn btn-sm btn-secondary" onclick="viewOutput('product')"><i class="fa-solid fa-file-contract text-blue"></i> قراءة التفاصيل (PRD)</button>
+                                    <button class="btn btn-sm btn-secondary" onclick="viewOutput('strategy')"><i class="fa-solid fa-chart-line text-blue"></i> قراءة الاستراتيجية</button>
+                                </div>
+                                <div class="form-group" style="margin-top:15px;">
+                                    <label for="approval-feedback">ملاحظات التعديل (اختياري)</label>
+                                    <textarea id="approval-feedback" rows="2" placeholder="اكتب ملاحظاتك هنا ليقوم الفريق بتعديلها..."></textarea>
+                                </div>
+                            </div>
+                            <div class="actions" style="margin-top:15px;">
+                                <button class="btn btn-success approval-btn-submit" onclick="approveTask('approval-feedback')"><i class="fa-solid fa-check"></i> موافق / نفذ التعديلات</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div> <!-- End overview section -->
+
+            <!-- Agents Section -->
+            <div id="section-agents" class="view-section" style="display:none;">
+                <header>
+                    <div>
+                        <h1>فريق العمل والوكلاء المتخصصين (<span id="agents-count-display">282</span>)</h1>
+                        <p>متابعة فورية للوكلاء: من شغال الآن بالمشروع، من أنجز مهمته، ومن في وضع الاستعداد.</p>
+                    </div>
+                </header>
+
+                <!-- Status Summary Cards -->
+                <div class="agents-stats-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 20px;">
+                    <div class="agent-stat-card working-stat" onclick="setStatusFilter('working')" style="cursor: pointer; background: rgba(35, 134, 54, 0.12); border: 1px solid rgba(46, 160, 67, 0.4); border-radius: 12px; padding: 15px; display: flex; align-items: center; gap: 15px; transition: transform 0.2s;">
+                        <div style="width: 45px; height: 45px; border-radius: 10px; background: rgba(46, 160, 67, 0.2); display: flex; align-items: center; justify-content: center; font-size: 1.4rem; color: #3fb950;">
+                            <i class="fa-solid fa-bolt fa-fade"></i>
+                        </div>
+                        <div>
+                            <span style="font-size: 0.85rem; color: #7ee787; font-weight: 600;">🟢 شغالين الآن بالمشروع</span>
+                            <h3 id="agents-working-count" style="margin: 0; font-size: 1.6rem; color: #fff;">0</h3>
+                        </div>
+                    </div>
+
+                    <div class="agent-stat-card completed-stat" onclick="setStatusFilter('completed')" style="cursor: pointer; background: rgba(56, 139, 253, 0.12); border: 1px solid rgba(88, 166, 255, 0.4); border-radius: 12px; padding: 15px; display: flex; align-items: center; gap: 15px; transition: transform 0.2s;">
+                        <div style="width: 45px; height: 45px; border-radius: 10px; background: rgba(88, 166, 255, 0.2); display: flex; align-items: center; justify-content: center; font-size: 1.4rem; color: #58a6ff;">
+                            <i class="fa-solid fa-circle-check"></i>
+                        </div>
+                        <div>
+                            <span style="font-size: 0.85rem; color: #a5d6ff; font-weight: 600;">🔵 أنجزوا مهامهم</span>
+                            <h3 id="agents-completed-count" style="margin: 0; font-size: 1.6rem; color: #fff;">0</h3>
+                        </div>
+                    </div>
+
+                    <div class="agent-stat-card idle-stat" onclick="setStatusFilter('idle')" style="cursor: pointer; background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 12px; padding: 15px; display: flex; align-items: center; gap: 15px; transition: transform 0.2s;">
+                        <div style="width: 45px; height: 45px; border-radius: 10px; background: rgba(255, 255, 255, 0.05); display: flex; align-items: center; justify-content: center; font-size: 1.4rem; color: #8b949e;">
+                            <i class="fa-solid fa-pause"></i>
+                        </div>
+                        <div>
+                            <span style="font-size: 0.85rem; color: #8b949e; font-weight: 600;">⚪ في وضع الاستعداد</span>
+                            <h3 id="agents-idle-count" style="margin: 0; font-size: 1.6rem; color: #fff;">0</h3>
+                        </div>
+                    </div>
+
+                    <div class="agent-stat-card total-stat" onclick="setStatusFilter('all')" style="cursor: pointer; background: rgba(138, 43, 226, 0.1); border: 1px solid rgba(138, 43, 226, 0.3); border-radius: 12px; padding: 15px; display: flex; align-items: center; gap: 15px; transition: transform 0.2s;">
+                        <div style="width: 45px; height: 45px; border-radius: 10px; background: rgba(138, 43, 226, 0.2); display: flex; align-items: center; justify-content: center; font-size: 1.4rem; color: #d2a8ff;">
+                            <i class="fa-solid fa-users"></i>
+                        </div>
+                        <div>
+                            <span style="font-size: 0.85rem; color: #d2a8ff; font-weight: 600;">👥 إجمالي الفريق</span>
+                            <h3 id="agents-total-count" style="margin: 0; font-size: 1.6rem; color: #fff;">0</h3>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Filters & Search Toolbar -->
+                <div class="glass-panel" style="margin-bottom: 20px; padding: 16px;">
+                    <!-- Status Filter Tabs -->
+                    <div style="display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap;" id="status-filter-tabs">
+                        <button class="btn btn-sm btn-primary" id="filter-btn-all" onclick="setStatusFilter('all')"><i class="fa-solid fa-layer-group"></i> الكل</button>
+                        <button class="btn btn-sm btn-secondary" id="filter-btn-working" onclick="setStatusFilter('working')"><i class="fa-solid fa-bolt" style="color: #3fb950;"></i> 🟢 شغالين الآن بالمشروع (<span id="tab-working-count">0</span>)</button>
+                        <button class="btn btn-sm btn-secondary" id="filter-btn-completed" onclick="setStatusFilter('completed')"><i class="fa-solid fa-check" style="color: #58a6ff;"></i> 🔵 أنجزوا مهامهم (<span id="tab-completed-count">0</span>)</button>
+                        <button class="btn btn-sm btn-secondary" id="filter-btn-idle" onclick="setStatusFilter('idle')"><i class="fa-solid fa-pause" style="color: #8b949e;"></i> ⚪ في وضع الاستعداد (<span id="tab-idle-count">0</span>)</button>
+                    </div>
+
+                    <div style="display: flex; gap: 15px; flex-wrap: wrap; align-items: center; justify-content: space-between; border-top: 1px solid rgba(255,255,255,0.06); padding-top: 15px;">
+                        <div style="flex: 1; min-width: 250px; position: relative;">
+                            <input type="text" id="agents-search-input" placeholder="ابحث باسم الموظف أو التخصص..." oninput="handleAgentsFilter()" style="width: 100%; padding: 10px 40px 10px 15px; border-radius: 8px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.1); color: #fff; font-size: 0.9rem;">
+                            <i class="fa-solid fa-search" style="position: absolute; right: 15px; top: 50%; transform: translateY(-50%); color: var(--text-muted);"></i>
+                        </div>
+                        <div id="agents-division-filters" style="display: flex; gap: 8px; flex-wrap: wrap;">
+                            <!-- Filter pills generated by JS -->
+                        </div>
+                    </div>
+                </div>
+
+                <div class="glass-panel" style="max-height: 65vh; overflow-y: auto;">
+                    <div id="agents-list" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 15px;">
+                        <!-- Generated by JS -->
+                        <div style="text-align:center; grid-column: 1 / -1;"><i class="fa-solid fa-spinner fa-spin"></i> جاري التحميل...</div>
+                    </div>
+                </div>
+            </div>
+
+            <div id="section-approvals" class="view-section" style="display:none;">
+                <header>
+                    <div>
+                        <h1>الموافقات والقرارات المعلقة</h1>
+                        <p>سجل بجميع القرارات والاعتمادات التي تتطلب تدخل الإدارة العليا.</p>
+                    </div>
+                </header>
+                
+                <!-- Pending Approvals Area -->
+                <div id="section-approvals-pending" class="pending-approval-wrapper" style="margin-bottom: 30px;">
+                    <!-- Rendered dynamically by JS -->
+                </div>
+
+                <!-- Approval History -->
+                <div class="glass-panel">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                        <h2 style="margin: 0;"><i class="fa-solid fa-clock-rotate-left"></i> سجل القرارات السابقة</h2>
+                        <button class="btn btn-sm btn-secondary" onclick="clearApprovalHistory()"><i class="fa-solid fa-trash-can"></i> مسح السجل</button>
+                    </div>
+                    <div style="overflow-x: auto;">
+                        <table style="width: 100%; text-align: right; border-collapse: collapse;">
+                            <thead>
+                                <tr style="border-bottom: 1px solid rgba(255,255,255,0.1); color: var(--text-muted);">
+                                    <th style="padding: 12px 10px;">التاريخ والوقت</th>
+                                    <th style="padding: 12px 10px;">القرار / المهمة</th>
+                                    <th style="padding: 12px 10px;">القسم</th>
+                                    <th style="padding: 12px 10px;">الحالة</th>
+                                </tr>
+                            </thead>
+                            <tbody id="approvals-history">
+                                <!-- Rendered dynamically by JS -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <div id="section-projects" class="view-section" style="display:none;">
+                <header>
+                    <h1>المشاريع السابقة</h1>
+                    <p>أرشيف بجميع المشاريع التي تم استخراجها مسبقاً، يمكنك تصفح الملفات وفتحها مباشرة في جهازك.</p>
+                </header>
+                <div class="glass-panel" style="max-height: 70vh; overflow-y: auto;">
+                    <div class="projects-grid" id="projects-container">
+                        <!-- Projects loaded here -->
+                    </div>
+                </div>
+            </div>
+
+            <div id="section-budget" class="view-section" style="display:none;">
+                <header>
+                    <div>
+                        <h1>الميزانية والمصروفات الحية</h1>
+                        <p>متابعة التكاليف واستهلاك الـ API (Token Usage) والخصم الفعلي من الرصيد لحظة بلحظة.</p>
+                    </div>
+                </header>
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="icon-wrapper blue"><i class="fa-solid fa-coins"></i></div>
+                        <div class="stat-info">
+                            <h3 id="budget-tokens">0</h3>
+                            <p>Tokens مُستهلكة كلياً</p>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="icon-wrapper red"><i class="fa-solid fa-dollar-sign"></i></div>
+                        <div class="stat-info">
+                            <h3 id="budget-cost">$0.00</h3>
+                            <p>التكلفة الفعلية المحسوبة</p>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="icon-wrapper green"><i class="fa-solid fa-wallet"></i></div>
+                        <div class="stat-info">
+                            <h3 id="budget-limit">$50.00</h3>
+                            <p>الميزانية المتبقية</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Live Transactions Table -->
+                <div class="glass-panel" style="margin-top: 25px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                        <h2 style="margin: 0;"><i class="fa-solid fa-receipt"></i> سجل استهلاك الـ Tokens والخصم الفعلي</h2>
+                        <button class="btn btn-sm btn-secondary" onclick="loadBudgetDetails()"><i class="fa-solid fa-rotate"></i> تحديث السجل</button>
+                    </div>
+                    <div style="overflow-x: auto;">
+                        <table style="width: 100%; text-align: right; border-collapse: collapse;">
+                            <thead>
+                                <tr style="border-bottom: 1px solid rgba(255,255,255,0.1); color: var(--text-muted);">
+                                    <th style="padding: 12px 10px;">التاريخ والوقت</th>
+                                    <th style="padding: 12px 10px;">المهمة / المشروع</th>
+                                    <th style="padding: 12px 10px;">الموظف (Agent)</th>
+                                    <th style="padding: 12px 10px;">القسم</th>
+                                    <th style="padding: 12px 10px;">الـ Tokens</th>
+                                    <th style="padding: 12px 10px;">التكلفة ($)</th>
+                                </tr>
+                            </thead>
+                            <tbody id="budget-transactions">
+                                <tr>
+                                    <td colspan="6" style="text-align: center; padding: 25px; color: var(--text-muted);">لا توجد عمليات مسجلة بعد. عند بدء مشروع جديد سيتم تسجيل الاستهلاك فوراً هنا.</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <div id="section-settings" class="view-section" style="display:none;">
+                <header>
+                    <h1>الإعدادات</h1>
+                    <p>إعدادات النظام، مفاتيح الـ API، وصلاحيات الوصول.</p>
+                </header>
+                <div class="glass-panel" style="max-width: 600px;">
+                    <div style="margin-bottom: 20px;">
+                        <label style="display:block; margin-bottom: 5px;">مزود الذكاء الاصطناعي (API Provider)</label>
+                        <select id="api-provider" style="width:100%; padding: 10px; border-radius: 5px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); color: white;" onchange="toggleProvider()">
+                            <option value="gemini" style="color:black;">Google Gemini (أسرع وأسهل)</option>
+                            <option value="openrouter" style="color:black;">OpenRouter (OpenAI/Anthropic)</option>
+                            <option value="opencode" style="color:black;">⚡ OpenCode محلي (بدون API Key!)</option>
+                        </select>
+                    </div>
+                    <div style="margin-bottom: 20px;">
+                        <label id="lbl-api-key" style="display:block; margin-bottom: 5px;">مفتاح الـ API</label>
+                        <input type="password" id="openrouter-key" style="width:100%; padding: 10px; border-radius: 5px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); color: white;" placeholder="AIzaSy...">
+                    </div>
+                    <div style="margin-bottom: 20px;">
+                        <label style="display:block; margin-bottom: 5px;">الموديل (Model)</label>
+                        <input type="text" id="openrouter-model" value="gemini-3.5-flash-lite" style="width:100%; padding: 10px; border-radius: 5px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); color: white;">
+                    </div>
+                    <div id="opencode-settings" style="margin-bottom: 20px; display: none; background: rgba(99,102,241,0.1); border: 1px solid rgba(99,102,241,0.3); border-radius: 8px; padding: 15px;">
+                        <p style="color: #a78bfa; margin: 0 0 10px;">&#9889; OpenCode متصل وجاهز! لا تحتاج لأي API Key.</p>
+                        <label style="display:block; margin-bottom: 5px;">المزود (Provider) داخل OpenCode</label>
+                        <select id="opencode-ai-provider" style="width:100%; padding: 10px; border-radius: 5px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); color: white; margin-bottom:10px;">
+                            <option value="anthropic" style="color:black;">Anthropic (Claude)</option>
+                            <option value="openai" style="color:black;">OpenAI (GPT)</option>
+                            <option value="google" style="color:black;">Google (Gemini)</option>
+                        </select>
+                        <label style="display:block; margin-bottom: 5px;">الموديل (Model ID)</label>
+                        <input type="text" id="opencode-model-id" value="claude-haiku-4-5" style="width:100%; padding: 10px; border-radius: 5px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); color: white;" placeholder="claude-haiku-4-5">
+                    </div>
+                    <button class="btn btn-primary" id="save-settings-btn" onclick="saveSettings()">حفظ الإعدادات</button>
+                    <p id="settings-msg" style="color: var(--accent-green); margin-top: 10px; display: none;">تم حفظ الإعدادات بنجاح!</p>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Modal for new task -->
+    <div class="modal" id="taskModal">
+        <div class="modal-content glass-panel">
+            <h2>إضافة مهمة جديدة</h2>
+            <p>ما هو المشروع الذي ترغب أن يقوم فريق الوكالة ببنائه؟</p>
+            <textarea id="task-input" rows="4" placeholder="مثال: أريد سيستم لشركة تشطيبات..."></textarea>
+            <div class="modal-actions">
+                <button class="btn btn-primary" onclick="startTask()">إرسال الطلب للفريق</button>
+                <button class="btn btn-danger" onclick="closeModal()">إلغاء</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal for Output Details -->
+    <div class="modal" id="outputModal">
+        <div class="modal-content modal-lg glass-panel">
+            <div class="modal-header">
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <i class="fa-solid fa-file-waveform" style="color: var(--accent-blue); font-size: 1.3rem;"></i>
+                    <h2 id="outputModalTitle" style="margin: 0; font-size: 1.25rem;">تفاصيل المخرجات</h2>
+                </div>
+                <div style="display: flex; gap: 8px;">
+                    <button class="btn btn-sm btn-secondary" id="copyOutputBtn" onclick="copyModalOutput()" title="نسخ المحتوى">
+                        <i class="fa-solid fa-copy"></i> نسخ التقرير
+                    </button>
+                    <button class="btn btn-sm btn-secondary" onclick="closeModal('outputModal')" title="إغلاق">
+                        <i class="fa-solid fa-xmark"></i>
+                    </button>
+                </div>
+            </div>
+            <div class="modal-body" id="outputModalBodyContainer">
+                <div id="outputModalBody" class="markdown-body">
+                    <!-- Output content rendered here -->
+                </div>
+            </div>
+            <div class="modal-actions" style="margin-top: 15px; border-top: 1px solid rgba(255,255,255,0.08); padding-top: 15px;">
+                <button class="btn btn-primary" onclick="closeModal('outputModal')"><i class="fa-solid fa-check"></i> حسناً، إغلاق النافذة</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="script.js?v=6"></script>
+</body>
+</html>

@@ -1,0 +1,295 @@
+{
+  "tokens_used": 418534,
+  "estimated_cost": 0.0629,
+  "budget_limit": 50.0,
+  "transactions": [
+    {
+      "id": 1791734316159,
+      "time": "2026-10-11 18:58:36",
+      "agent": "خبير SEO",
+      "department": "SEO",
+      "task": "# CLIENT PROJECT BRIEF\n## Industria...",
+      "tokens": 10385,
+      "cost": 0.0016
+    },
+    {
+      "id": 1791734316135,
+      "time": "2026-10-11 18:58:36",
+      "agent": "خبير SEO",
+      "department": "البرمجة والتطوير",
+      "task": "# CLIENT PROJECT BRIEF\n## Industria...",
+      "tokens": 13050,
+      "cost": 0.002
+    },
+    {
+      "id": 1791734309989,
+      "time": "2026-10-11 18:58:29",
+      "agent": "خبير الأنيميشن",
+      "department": "MOTION",
+      "task": "# CLIENT PROJECT BRIEF\n## Industria...",
+      "tokens": 14682,
+      "cost": 0.0022
+    },
+    {
+      "id": 1791734309970,
+      "time": "2026-10-11 18:58:29",
+      "agent": "خبير الأنيميشن",
+      "department": "البرمجة والتطوير",
+      "task": "# CLIENT PROJECT BRIEF\n## Industria...",
+      "tokens": 19617,
+      "cost": 0.0029
+    },
+    {
+      "id": 1791734288341,
+      "time": "2026-10-11 18:58:08",
+      "agent": "مهندس الجودة",
+      "department": "QA",
+      "task": "# CLIENT PROJECT BRIEF\n## Industria...",
+      "tokens": 18342,
+      "cost": 0.0028
+    },
+    {
+      "id": 1791734288328,
+      "time": "2026-10-11 18:58:08",
+      "agent": "مهندس الجودة",
+      "department": "البرمجة والتطوير",
+      "task": "# CLIENT PROJECT BRIEF\n## Industria...",
+      "tokens": 22780,
+      "cost": 0.0034
+    },
+    {
+      "id": 1791734265312,
+      "time": "2026-10-11 18:57:45",
+      "agent": "كبير المبرمجين",
+      "department": "DEV",
+      "task": "# CLIENT PROJECT BRIEF\n## Industria...",
+      "tokens": 21971,
+      "cost": 0.0033
+    },
+    {
+      "id": 1791734265300,
+      "time": "2026-10-11 18:57:45",
+      "agent": "كبير المبرمجين",
+      "department": "البرمجة والتطوير",
+      "task": "# CLIENT PROJECT BRIEF\n## Industria...",
+      "tokens": 27224,
+      "cost": 0.0041
+    },
+    {
+      "id": 1791734240407,
+      "time": "2026-10-11 18:57:20",
+      "agent": "مصمم الواجهات",
+      "department": "UI",
+      "task": "# CLIENT PROJECT BRIEF\n## Industria...",
+      "tokens": 9892,
+      "cost": 0.0015
+    },
+    {
+      "id": 1791734240403,
+      "time": "2026-10-11 18:57:20",
+      "agent": "مصمم الواجهات",
+      "department": "البرمجة والتطوير",
+      "task": "# CLIENT PROJECT BRIEF\n## Industria...",
+      "tokens": 16463,
+      "cost": 0.0025
+    },
+    {
+      "id": 1791734220838,
+      "time": "2026-10-11 18:57:00",
+      "agent": "المهندس المعماري",
+      "department": "ENG",
+      "task": "# CLIENT PROJECT BRIEF\n## Industria...",
+      "tokens": 5912,
+      "cost": 0.0009
+    },
+    {
+      "id": 1791734220828,
+      "time": "2026-10-11 18:57:00",
+      "agent": "المهندس المعماري",
+      "department": "البرمجة والتطوير",
+      "task": "# CLIENT PROJECT BRIEF\n## Industria...",
+      "tokens": 8827,
+      "cost": 0.0013
+    },
+    {
+      "id": 1791734200266,
+      "time": "2026-10-11 18:56:40",
+      "agent": "مدير المنتج",
+      "department": "PM",
+      "task": "# CLIENT PROJECT BRIEF\n## Industria...",
+      "tokens": 7332,
+      "cost": 0.0011
+    },
+    {
+      "id": 1791734200255,
+      "time": "2026-10-11 18:56:40",
+      "agent": "مدير المنتج",
+      "department": "البرمجة والتطوير",
+      "task": "# CLIENT PROJECT BRIEF\n## Industria...",
+      "tokens": 14936,
+      "cost": 0.0022
+    },
+    {
+      "id": 1791734187528,
+      "time": "2026-10-11 18:56:27",
+      "agent": "مستشار البزنس",
+      "department": "BS",
+      "task": "# CLIENT PROJECT BRIEF\n## Industria...",
+      "tokens": 7538,
+      "cost": 0.0011
+    },
+    {
+      "id": 1791734187499,
+      "time": "2026-10-11 18:56:27",
+      "agent": "مستشار البزنس",
+      "department": "البرمجة والتطوير",
+      "task": "# CLIENT PROJECT BRIEF\n## Industria...",
+      "tokens": 12745,
+      "cost": 0.0019
+    },
+    {
+      "id": 1791729074290,
+      "time": "2026-10-11 17:31:14",
+      "agent": "خبير SEO",
+      "department": "SEO",
+      "task": "make tetris game\n",
+      "tokens": 8027,
+      "cost": 0.0012
+    },
+    {
+      "id": 1791729074257,
+      "time": "2026-10-11 17:31:14",
+      "agent": "خبير SEO",
+      "department": "البرمجة والتطوير",
+      "task": "make tetris game\n",
+      "tokens": 11279,
+      "cost": 0.0017
+    },
+    {
+      "id": 1791729067379,
+      "time": "2026-10-11 17:31:07",
+      "agent": "خبير الأنيميشن",
+      "department": "MOTION",
+      "task": "make tetris game\n",
+      "tokens": 11145,
+      "cost": 0.0017
+    },
+    {
+      "id": 1791729067367,
+      "time": "2026-10-11 17:31:07",
+      "agent": "خبير الأنيميشن",
+      "department": "البرمجة والتطوير",
+      "task": "make tetris game\n",
+      "tokens": 16539,
+      "cost": 0.0025
+    },
+    {
+      "id": 1791729052458,
+      "time": "2026-10-11 17:30:52",
+      "agent": "مهندس الجودة",
+      "department": "QA",
+      "task": "make tetris game\n",
+      "tokens": 8851,
+      "cost": 0.0013
+    },
+    {
+      "id": 1791729052437,
+      "time": "2026-10-11 17:30:52",
+      "agent": "مهندس الجودة",
+      "department": "البرمجة والتطوير",
+      "task": "make tetris game\n",
+      "tokens": 12188,
+      "cost": 0.0018
+    },
+    {
+      "id": 1791729045302,
+      "time": "2026-10-11 17:30:45",
+      "agent": "كبير المبرمجين",
+      "department": "DEV",
+      "task": "make tetris game\n",
+      "tokens": 15547,
+      "cost": 0.0023
+    },
+    {
+      "id": 1791729045282,
+      "time": "2026-10-11 17:30:45",
+      "agent": "كبير المبرمجين",
+      "department": "البرمجة والتطوير",
+      "task": "make tetris game\n",
+      "tokens": 23318,
+      "cost": 0.0035
+    },
+    {
+      "id": 1791729025141,
+      "time": "2026-10-11 17:30:25",
+      "agent": "مصمم الواجهات",
+      "department": "UI",
+      "task": "make tetris game\n",
+      "tokens": 11651,
+      "cost": 0.0017
+    },
+    {
+      "id": 1791729025126,
+      "time": "2026-10-11 17:30:25",
+      "agent": "مصمم الواجهات",
+      "department": "البرمجة والتطوير",
+      "task": "make tetris game\n",
+      "tokens": 19924,
+      "cost": 0.003
+    },
+    {
+      "id": 1791729008054,
+      "time": "2026-10-11 17:30:08",
+      "agent": "المهندس المعماري",
+      "department": "ENG",
+      "task": "make tetris game\n",
+      "tokens": 6484,
+      "cost": 0.001
+    },
+    {
+      "id": 1791729008042,
+      "time": "2026-10-11 17:30:08",
+      "agent": "المهندس المعماري",
+      "department": "البرمجة والتطوير",
+      "task": "make tetris game\n",
+      "tokens": 10430,
+      "cost": 0.0016
+    },
+    {
+      "id": 1791728963772,
+      "time": "2026-10-11 17:29:23",
+      "agent": "مدير المنتج",
+      "department": "PM",
+      "task": "make tetris game\n",
+      "tokens": 5786,
+      "cost": 0.0009
+    },
+    {
+      "id": 1791728963759,
+      "time": "2026-10-11 17:29:23",
+      "agent": "مدير المنتج",
+      "department": "البرمجة والتطوير",
+      "task": "make tetris game\n",
+      "tokens": 14053,
+      "cost": 0.0021
+    },
+    {
+      "id": 1791728951833,
+      "time": "2026-10-11 17:29:11",
+      "agent": "مستشار البزنس",
+      "department": "BS",
+      "task": "make tetris game\n",
+      "tokens": 2535,
+      "cost": 0.0004
+    },
+    {
+      "id": 1791728951816,
+      "time": "2026-10-11 17:29:11",
+      "agent": "مستشار البزنس",
+      "department": "البرمجة والتطوير",
+      "task": "make tetris game\n",
+      "tokens": 9081,
+      "cost": 0.0014
+    }
+  ]
+}

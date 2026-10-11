@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>عيادة ابتسامة لطب الأسنان</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+</head>
+<body>
+    <header>
+        <div class="container">
+            <div class="logo">
+                <i class="fas fa-tooth"></i>
+                <h1>عيادة ابتسامة</h1>
+            </div>
+            <nav>
+                <ul>
+                    <li><a href="#home">الرئيسية</a></li>
+                    <li><a href="#services">خدماتنا</a></li>
+                    <li><a href="#about">من نحن</a></li>
+                    <li><a href="#booking" class="btn-book">احجز موعداً</a></li>
+                </ul>
+            </nav>
+            <div class="menu-toggle" id="mobile-menu">
+                <i class="fas fa-bars"></i>
+            </div>
+        </div>
+    </header>
+
+    <section id="home" class="hero">
+        <div class="hero-content">
+            <h2>ابتسامتك هي سر جمالك</h2>
+            <p>نقدم لك أفضل رعاية للأسنان بأحدث التقنيات وبأيدي أمهر الأطباء لضمان صحة وجمال أسنانك.</p>
+            <a href="#booking" class="btn-primary">احجز استشارتك الآن</a>
+        </div>
+    </section>
+
+    <section id="services" class="services">
+        <h2>خدماتنا الطبية</h2>
+        <p class="section-desc">نغطي كافة التخصصات في طب الأسنان بأعلى مستويات الجودة.</p>
+        <div class="services-grid">
+            <div class="service-card">
+                <i class="fas fa-magic"></i>
+                <h3>تبييض الأسنان</h3>
+                <p>احصل على ابتسامة ناصعة البياض باستخدام أحدث تقنيات الليزر الآمنة.</p>
+            </div>
+            <div class="service-card">
+                <i class="fas fa-tools"></i>
+                <h3>تقويم الأسنان</h3>
+                <p>تصحيح مسار الأسنان للحصول على مظهر متناسق باستخدام التقويم الشفاف أو المعدني.</p>
+            </div>
+            <div class="service-card">
+                <i class="fas fa-shield-alt"></i>
+                <h3>زراعة الأسنان</h3>
+                <p>حلول دائمة لتعويض الأسنان المفقودة بجذور من التيتانيوم وتيجان طبيعية المظهر.</p>
+            </div>
+            <div class="service-card">
+                <i class="fas fa-smile"></i>
+                <h3>ابتسامة هوليود</h3>
+                <p>تركيب القشور الخزفية (الفينير) للحصول على ابتسامة مثالية كنجوم السينما.</p>
+            </div>
+        </div>
+    </section>
+
+    <section id="booking" class="booking">
+        <div class="booking-container">
+            <h2>احجز موعدك الآن</h2>
+            <form id="bookingForm">
+                <div class="form-group">
+                    <label>الاسم الكامل</label>
+                    <input type="text" id="name" required placeholder="أدخل اسمك">
+                </div>
+                <div class="form-group">
+                    <label>رقم الهاتف</label>
+                    <input type="tel" id="phone" required placeholder="أدخل رقمك">
+                </div>
+                <div class="form-group">
+                    <label>الخدمة المطلوبة</label>
+                    <select id="service">
+                        <option value="تبييض">تبييض الأسنان</option>
+                        <option value="تقويم">تقويم الأسنان</option>
+                        <option value="زراعة">زراعة الأسنان</option>
+                        <option value="استشارة">استشارة عامة</option>
+                    </select>
+                </div>
+                <button type="submit" class="btn-submit">تأكيد الحجز</button>
+            </form>
+            <div id="formMessage" class="hidden"></div>
+        </div>
+    </section>
+
+    <footer>
+        <div class="container">
+            <p>&copy; 2026 عيادة ابتسامة لطب الأسنان. جميع الحقوق محفوظة.</p>
+            <div class="social-icons">
+                <a href="#"><i class="fab fa-facebook"></i></a>
+                <a href="#"><i class="fab fa-instagram"></i></a>
+                <a href="#"><i class="fab fa-twitter"></i></a>
+            </div>
+        </div>
+    </footer>
+
+    <script src="script.js"></script>
+</body>
+</html>
