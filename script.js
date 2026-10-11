@@ -38,14 +38,8 @@ function sanitizeHtml(dirtyHtml) {
             ALLOWED_ATTR: ['class', 'style']
         });
     }
-    // Fallback sanitizer if DOMPurify is unavailable: strip script, iframe, and inline handlers
-    return String(dirtyHtml)
-        .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
-        .replace(/<iframe\b[^<]*(?:(?!<\/iframe>)<[^<]*)*<\/iframe>/gi, '')
-        .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, '')
-        .replace(/\son\w+="[^"]*"/gi, '')
-        .replace(/\son\w+='[^']*'/gi, '')
-        .replace(/javascript:[^"']*/gi, '');
+    // Fail-closed security policy: if DOMPurify is unavailable, escape all HTML entities
+    return escapeHtml(dirtyHtml);
 }
 
 function updateNodeState(nodeId, status) {
@@ -786,17 +780,23 @@ function renderDivisionFilters() {
     const filterContainer = document.getElementById('agents-division-filters');
     if (!filterContainer) return;
     
-    const depts = Array.from(new Set(allAgentsData.map(a => a.department))).filter(Boolean);
-    let html = `<button class="btn btn-sm ${currentAgentDivision === 'all' ? 'btn-primary' : 'btn-secondary'}" onclick="setAgentDivision('all')">كل الأقسام (${allAgentsData.length})</button>`;
+    filterContainer.innerHTML = '';
     
+    const allBtn = document.createElement('button');
+    allBtn.className = `btn btn-sm ${currentAgentDivision === 'all' ? 'btn-primary' : 'btn-secondary'}`;
+    allBtn.textContent = `كل الأقسام (${allAgentsData.length})`;
+    allBtn.addEventListener('click', () => setAgentDivision('all'));
+    filterContainer.appendChild(allBtn);
+    
+    const depts = Array.from(new Set(allAgentsData.map(a => a.department))).filter(Boolean);
     depts.forEach(d => {
         const count = allAgentsData.filter(a => a.department === d).length;
-        const activeClass = currentAgentDivision === d ? 'btn-primary' : 'btn-secondary';
-        const safeDept = escapeHtml(d);
-        html += `<button class="btn btn-sm ${activeClass}" onclick="setAgentDivision('${safeDept}')">${safeDept} (${count})</button>`;
+        const btn = document.createElement('button');
+        btn.className = `btn btn-sm ${currentAgentDivision === d ? 'btn-primary' : 'btn-secondary'}`;
+        btn.textContent = `${d} (${count})`;
+        btn.addEventListener('click', () => setAgentDivision(d));
+        filterContainer.appendChild(btn);
     });
-    
-    filterContainer.innerHTML = html;
 }
 
 function setAgentDivision(div) {

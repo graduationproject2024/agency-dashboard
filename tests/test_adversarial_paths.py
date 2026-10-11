@@ -66,27 +66,46 @@ def test_open_folder_blocks_root_directory_access(client):
     res = client.post('/api/open_folder', json={"path": GENERATED_APPS_DIR})
     assert res.status_code == 403
 
-def test_qa_criteria_rejects_unbalanced_code():
-    """Verify that the enhanced QA criteria flags unbalanced HTML or syntax flaws."""
-    from app import workflow_state
+def test_production_run_qa_checks_directly():
+    """Verify that the production run_qa_checks function directly flags invalid code and fatal errors."""
+    from app import run_qa_checks
     
-    # HTML missing closing tag and without doctype
-    unbalanced_html = "<div><p>Incomplete stub without closing tags"
-    html_has_structure = bool(
-        ("<html" in unbalanced_html and "</html>" in unbalanced_html) or
-        ("<!DOCTYPE html" in unbalanced_html and ("<body" in unbalanced_html or "<div" in unbalanced_html))
-    )
-    assert not html_has_structure
-
-    # CSS with unbalanced braces
-    unbalanced_css = "body { color: red; "
-    css_balanced = bool(not unbalanced_css or (unbalanced_css.count('{') == unbalanced_css.count('}')))
-    assert not css_balanced
-
-    # Valid balanced structure passes
-    valid_html = "<!DOCTYPE html><html><body><div>Valid Content</div></body></html>"
+    valid_html = "<!DOCTYPE html><html><head><title>Test</title></head><body><div>Valid App Content</div></body></html>"
     valid_css = "body { color: blue; } .card { padding: 10px; }"
     valid_js = "function test() { console.log('ok'); }"
-    assert ("<html" in valid_html and "</html>" in valid_html)
-    assert valid_css.count('{') == valid_css.count('}')
-    assert valid_js.count('{') == valid_js.count('}') and valid_js.count('(') == valid_js.count(')')
+
+    # 1. Missing or empty HTML
+    res_empty = run_qa_checks("", valid_css, valid_js)
+    assert not res_empty["passed"]
+    assert any("missing or empty" in e for e in res_empty["errors"])
+
+    # 2. Truncated / short HTML (< 50 chars)
+    res_short = run_qa_checks("<html>stub</html>", valid_css, valid_js)
+    assert not res_short["passed"]
+    assert any("truncated" in e for e in res_short["errors"])
+
+    # 3. Incomplete structure lacking closing tags
+    res_unclosed = run_qa_checks("<div><p>Incomplete stub without doctype or closing html tags " * 3, valid_css, valid_js)
+    assert not res_unclosed["passed"]
+    assert any("structure" in e for e in res_unclosed["errors"])
+
+    # 4. Fatal error placeholder strings in HTML
+    res_fatal = run_qa_checks(f"<!DOCTYPE html><html><body>فشل الاتصال بالخادم {'x'*50}</body></html>", valid_css, valid_js)
+    assert not res_fatal["passed"]
+    assert any("Fatal error" in e for e in res_fatal["errors"])
+
+    # 5. Unbalanced CSS braces
+    res_bad_css = run_qa_checks(valid_html, "body { color: red; ", valid_js)
+    assert not res_bad_css["passed"]
+    assert any("CSS" in e for e in res_bad_css["errors"])
+
+    # 6. Unbalanced JS delimiters
+    res_bad_js = run_qa_checks(valid_html, valid_css, "function test() { if (true) { console.log('unclosed'); }")
+    assert not res_bad_js["passed"]
+    assert any("JavaScript" in e for e in res_bad_js["errors"])
+
+    # 7. Valid complete deliverable passes
+    res_valid = run_qa_checks(valid_html, valid_css, valid_js)
+    assert res_valid["passed"]
+    assert len(res_valid["errors"]) == 0
+    assert all(res_valid["checks"].values())

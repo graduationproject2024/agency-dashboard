@@ -14,7 +14,10 @@ from urllib.parse import urlparse
 # Secure Flask initialization: Never expose current working directory as static root
 app = Flask(__name__, static_folder=None)
 
-AGENTS_DIR = r"c:\Users\sam20\agency-agents"
+DEFAULT_AGENTS_DIR = os.path.abspath(r"c:\Users\sam20\agency-agents")
+AGENTS_DIR = os.environ.get('AGENTS_DIR') or (
+    DEFAULT_AGENTS_DIR if os.path.exists(DEFAULT_AGENTS_DIR) else os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "agency-agents"))
+)
 SETTINGS_FILE = 'settings.json'
 BUDGET_FILE = 'budget.json'
 GENERATED_APPS_DIR = os.path.abspath("generated_apps")
@@ -23,26 +26,139 @@ os.makedirs(GENERATED_APPS_DIR, exist_ok=True)
 # Windows reserved device names that cannot be created or accessed as regular files
 WINDOWS_RESERVED = {'CON', 'PRN', 'AUX', 'NUL'} | {f'COM{i}' for i in range(1, 10)} | {f'LPT{i}' for i in range(1, 10)}
 
+ALLOWED_LOCAL_HOSTS = {'127.0.0.1', 'localhost'}
+
 def is_safe_origin(req):
     """
-    Prevent Cross-Site Request Forgery (CSRF) from malicious third-party websites
-    triggering local server actions via developer's browser.
+    Consistent request-validation policy for browser-originated state-changing requests.
+    - Rejects foreign origins, null origins, and malformed origins.
+    - Defends against Fetch Metadata cross-site indications.
+    - Validates Referer if Origin is absent.
+    - Rejects cross-site browser form submissions (urlencoded/multipart) when Origin is absent.
+    - Never blindly trusts attacker-controlled Host headers.
     """
-    origin = req.headers.get('Origin')
-    if origin:
+    # 1. Fetch Metadata defense-in-depth
+    sec_fetch_site = req.headers.get('Sec-Fetch-Site')
+    if sec_fetch_site == 'cross-site':
+        return False
+        
+    origin_header = req.headers.get('Origin')
+    if origin_header is not None:
+        origin = origin_header.strip()
+        if not origin or origin.lower() == 'null':
+            return False
         try:
             parsed = urlparse(origin)
-            allowed_hosts = ('127.0.0.1', 'localhost', req.host.split(':')[0])
-            if parsed.hostname not in allowed_hosts:
+            if parsed.scheme.lower() not in ('http', 'https') or not parsed.hostname:
+                return False
+            # Never trust req.host - validate strictly against ALLOWED_LOCAL_HOSTS
+            if parsed.hostname.lower() not in ALLOWED_LOCAL_HOSTS:
+                return False
+            if parsed.port is not None and not (1 <= parsed.port <= 65535):
                 return False
         except Exception:
             return False
+        return True
+
+    # 2. If Origin is absent, check Referer
+    referer = req.headers.get('Referer')
+    if referer:
+        referer = referer.strip()
+        try:
+            parsed_ref = urlparse(referer)
+            if parsed_ref.scheme.lower() not in ('http', 'https') or not parsed_ref.hostname:
+                return False
+            if parsed_ref.hostname.lower() not in ALLOWED_LOCAL_HOSTS:
+                return False
+        except Exception:
+            return False
+        return True
+
+    # 3. If both Origin and Referer are absent:
+    # Defend against browser form submissions that strip referrer (e.g. rel="noreferrer")
+    sec_fetch_mode = req.headers.get('Sec-Fetch-Mode')
+    if sec_fetch_mode in ('navigate', 'nested-navigate', 'no-cors'):
+        return False
+
+    content_type = (req.content_type or '').lower()
+    if 'application/x-www-form-urlencoded' in content_type or 'multipart/form-data' in content_type:
+        return False
+        
     return True
 
-# Thread synchronization locks
-state_lock = threading.Lock()
-budget_lock = threading.Lock()
-settings_lock = threading.Lock()
+def atomic_write_json(filepath, data):
+    """
+    Safely write JSON file atomically via temporary file + atomic rename.
+    Ensures that unexpected termination never leaves a corrupt or empty file.
+    """
+    dir_name = os.path.dirname(os.path.abspath(filepath)) or '.'
+    os.makedirs(dir_name, exist_ok=True)
+    tmp_path = os.path.join(dir_name, f".{os.path.basename(filepath)}.{uuid.uuid4().hex}.tmp")
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+    os.replace(tmp_path, filepath)
+
+def discover_agents(agents_dir=None):
+    """
+    Discover available agent markdown definitions in target directory safely.
+    Distinguishes actual discovered count from missing/empty/error states.
+    Never fabricates a count.
+    """
+    target_dir = agents_dir or AGENTS_DIR
+    if not target_dir or not os.path.exists(target_dir):
+        return {
+            "total": 0,
+            "agents": [],
+            "status": "not_found",
+            "directory": target_dir,
+            "error": "Directory does not exist"
+        }
+        
+    agents_list = []
+    ignored_files = {'README.md', 'CONTRIBUTING.md', 'SECURITY.md', 'LICENSE.md'}
+    
+    try:
+        for root, dirs, files in os.walk(target_dir, followlinks=False):
+            dirs[:] = [d for d in dirs if d not in {'.git', 'node_modules', '__pycache__'}]
+            dept = os.path.basename(root)
+            if dept == "agency-agents":
+                dept = "General"
+            for f in files:
+                if f.endswith('.md') and f not in ignored_files:
+                    raw_id = f.replace('.md', '')
+                    clean_name = raw_id.replace('-', ' ').title()
+                    agents_list.append({
+                        "id": raw_id,
+                        "name": clean_name,
+                        "department": dept,
+                        "status": "idle"
+                    })
+    except Exception as e:
+        return {
+            "total": 0,
+            "agents": [],
+            "status": "error",
+            "directory": target_dir,
+            "error": str(e)
+        }
+        
+    return {
+        "total": len(agents_list),
+        "agents": agents_list,
+        "status": "discovered" if agents_list else "empty",
+        "directory": target_dir,
+        "error": None
+    }
+
+# Thread synchronization locks (RLock for re-entrant thread safety)
+state_lock = threading.RLock()
+budget_lock = threading.RLock()
+settings_lock = threading.RLock()
 
 CONFIG_ALLOWLIST = {
     'provider',
@@ -53,18 +169,9 @@ CONFIG_ALLOWLIST = {
     'openrouter_key'
 }
 
-# Scan available agents count
-try:
-    total_agents = 0
-    if os.path.exists(AGENTS_DIR):
-        for root, dirs, files in os.walk(AGENTS_DIR):
-            if ".git" in root:
-                continue
-            total_agents += len([f for f in files if f.endswith('.md') and f not in ['README.md', 'CONTRIBUTING.md', 'SECURITY.md']])
-    if total_agents == 0:
-        total_agents = 282
-except Exception:
-    total_agents = 282
+# Scan available agents count without fabrication
+initial_agent_inventory = discover_agents()
+total_agents = initial_agent_inventory["total"]
 
 # Global workflow state
 workflow_state = {
@@ -172,9 +279,28 @@ def load_budget():
         if os.path.exists(BUDGET_FILE):
             try:
                 with open(BUDGET_FILE, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except Exception:
-                pass
+                    content = f.read().strip()
+                    if content:
+                        return json.loads(content)
+            except Exception as e:
+                print(f"[ERROR] Corrupt budget file detected: {e}")
+                # Attempt recovery from backup
+                bak_path = BUDGET_FILE + ".bak"
+                if os.path.exists(bak_path):
+                    try:
+                        with open(bak_path, 'r', encoding='utf-8') as bf:
+                            bak_data = json.load(bf)
+                            print("[INFO] Restored budget from backup copy")
+                            return bak_data
+                    except Exception:
+                        pass
+                # Preserve corrupt file for audit rather than silently erasing
+                corrupt_copy = f"{BUDGET_FILE}.corrupt.{int(time.time())}"
+                try:
+                    os.replace(BUDGET_FILE, corrupt_copy)
+                    print(f"[WARN] Preserved corrupted budget as {corrupt_copy}")
+                except Exception:
+                    pass
         return {
             "tokens_used": 0,
             "estimated_cost": 0.0,
@@ -185,37 +311,35 @@ def load_budget():
 def save_budget(data):
     with budget_lock:
         try:
-            with open(BUDGET_FILE, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            # Create backup before atomic write
+            if os.path.exists(BUDGET_FILE):
+                try:
+                    with open(BUDGET_FILE, 'r', encoding='utf-8') as sf, open(BUDGET_FILE + ".bak", 'w', encoding='utf-8') as df:
+                        df.write(sf.read())
+                except Exception:
+                    pass
+            atomic_write_json(BUDGET_FILE, data)
         except Exception as e:
             print(f"[ERROR] Error saving budget: {e}")
 
 def record_token_usage(agent_name, dept_name, task_name, tokens_count, source="provider_reported"):
     """
     Safely record token consumption without race conditions or double-counting.
+    Uses atomic persistence and records unique transaction IDs.
     """
     with budget_lock:
-        budget = {}
-        if os.path.exists(BUDGET_FILE):
-            try:
-                with open(BUDGET_FILE, 'r', encoding='utf-8') as f:
-                    budget = json.load(f)
-            except Exception:
-                pass
-        if not budget:
-            budget = {"tokens_used": 0, "estimated_cost": 0.0, "budget_limit": 50.0, "transactions": []}
-            
+        budget = load_budget()
         tokens_count = max(int(tokens_count), 0)
         budget["tokens_used"] = budget.get("tokens_used", 0) + tokens_count
         
-        # Gemini Flash token pricing: ~$0.15 per 1M tokens
+        # Gemini Flash token pricing estimate: ~$0.15 per 1M tokens
         cost = round((tokens_count / 1_000_000.0) * 0.15, 4)
         if cost == 0 and tokens_count > 0:
             cost = 0.0001
         budget["estimated_cost"] = round(budget.get("estimated_cost", 0.0) + cost, 4)
         
         tx = {
-            "id": int(time.time() * 1000),
+            "id": int(time.time() * 1000) + len(budget.get("transactions", [])),
             "time": time.strftime("%Y-%m-%d %H:%M:%S"),
             "agent": agent_name,
             "department": dept_name,
@@ -228,12 +352,7 @@ def record_token_usage(agent_name, dept_name, task_name, tokens_count, source="p
         tx_list.insert(0, tx)
         budget["transactions"] = tx_list[:60]
         
-        try:
-            with open(BUDGET_FILE, 'w', encoding='utf-8') as f:
-                json.dump(budget, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"[ERROR] Saving budget failed: {e}")
-            
+        save_budget(budget)
         return budget
 
 # --- Filesystem Safety Helpers ---
@@ -583,6 +702,74 @@ def run_workflow(task_desc):
         update_stats()
         add_feed("النظام", "System", "red", "ERR", f"توقف سير العمل: {str(e)}")
 
+def run_qa_checks(app_html, app_css="", app_js=""):
+    """
+    Production QA Gate Entry Point:
+    Directly testable structural and syntactic verification.
+    Verifies HTML structure, delimiter balance (CSS/JS), absence of fatal errors,
+    and returns a structured report.
+    """
+    errors = []
+    
+    # 1. HTML Verification
+    if not app_html or not isinstance(app_html, str):
+        errors.append("HTML content is missing or empty")
+    elif len(app_html.strip()) < 50:
+        errors.append("HTML document is truncated / too short (under 50 characters)")
+    else:
+        lower_html = app_html.lower()
+        has_doctype = "<!doctype html" in lower_html
+        has_html_tags = ("<html" in lower_html and "</html>" in lower_html)
+        has_body_tags = ("<body" in lower_html and "</body>" in lower_html)
+        has_div_tags = ("<div" in lower_html and "</div>" in lower_html)
+        
+        if not (has_html_tags or (has_doctype and (has_body_tags or has_div_tags))):
+            errors.append("HTML lacks proper document structure or closing tags")
+            
+        fatal_strings = [
+            "فشل الاتصال", "read timed out", "connectionerror", 
+            "traceback (most recent call last)", "500 internal server error",
+            "404 not found"
+        ]
+        for fatal in fatal_strings:
+            if fatal in lower_html:
+                errors.append(f"Fatal error detected in HTML: '{fatal}'")
+                break
+
+    # 2. CSS Verification
+    if app_css and isinstance(app_css, str):
+        if app_css.count('{') != app_css.count('}'):
+            errors.append(f"CSS has unbalanced braces ({{: {app_css.count('{')}, }}: {app_css.count('}')})")
+        if app_css.count('/*') != app_css.count('*/'):
+            errors.append("CSS has unclosed block comments (/* ... */)")
+
+    # 3. JavaScript Verification
+    if app_js and isinstance(app_js, str):
+        if app_js.count('{') != app_js.count('}'):
+            errors.append(f"JavaScript has unbalanced braces ({{: {app_js.count('{')}, }}: {app_js.count('}')})")
+        if app_js.count('(') != app_js.count(')'):
+            errors.append(f"JavaScript has unbalanced parentheses ((: {app_js.count('(')}, ): {app_js.count(')')})")
+        if app_js.count('[') != app_js.count(']'):
+            errors.append(f"JavaScript has unbalanced brackets ([: {app_js.count('[')}, ]: {app_js.count(']')})")
+        if app_js.count('/*') != app_js.count('*/'):
+            errors.append("JavaScript has unclosed block comments")
+
+    passed = len(errors) == 0
+    checks = {
+        "html_extracted": bool(app_html and len(app_html.strip()) >= 50),
+        "html_doctype_or_tags": not any("structure" in e for e in errors),
+        "no_fatal_error_strings": not any("Fatal error" in e for e in errors),
+        "css_syntax_balanced": not any("CSS" in e for e in errors),
+        "js_syntax_balanced": not any("JavaScript" in e for e in errors)
+    }
+    
+    return {
+        "passed": passed,
+        "checks": checks,
+        "errors": errors,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+    }
+
 def continue_workflow(feedback=""):
     with state_lock:
         workflow_state["status"] = "running"
@@ -695,33 +882,13 @@ def continue_workflow(feedback=""):
         anim_js = "\n\n".join([j.strip() for j in anim_js_blocks if j.strip()])
         app_js = anim_js if (anim_js and dev_js in anim_js) else (f"{dev_js}\n\n/* Interactions */\n{anim_js}" if anim_js and dev_js else (anim_js or dev_js))
 
-        # --- Concrete QA Acceptance Criteria Check ---
-        html_has_structure = bool(
-            ("<html" in app_html and "</html>" in app_html) or
-            ("<!DOCTYPE html" in app_html and ("<body" in app_html or "<div" in app_html))
-        )
-        css_balanced = bool(not app_css or (app_css.count('{') == app_css.count('}')))
-        js_balanced = bool(not app_js or (app_js.count('{') == app_js.count('}') and app_js.count('(') == app_js.count(')')))
-        
-        qa_checks = {
-            "html_extracted": bool(app_html and len(app_html) > 50),
-            "html_doctype_or_tags": html_has_structure,
-            "no_fatal_error_strings": bool("فشل الاتصال" not in app_html and "Read timed out" not in app_html and "Traceback" not in app_html),
-            "css_syntax_balanced": css_balanced,
-            "js_syntax_balanced": js_balanced
-        }
-        
-        all_passed = all(qa_checks.values())
+        # --- Run Production QA Gate ---
+        qa_report = run_qa_checks(app_html, app_css, app_js)
         with state_lock:
-            workflow_state["qa_report"] = {
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "checks": qa_checks,
-                "passed": all_passed
-            }
+            workflow_state["qa_report"] = qa_report
             
-        if not all_passed:
-            failed_keys = [k for k, v in qa_checks.items() if not v]
-            err_msg = f"فشل فحص الجودة البرمجية: المعايير غير المستوفاة ({', '.join(failed_keys)})"
+        if not qa_report["passed"]:
+            err_msg = f"فشل فحص الجودة البرمجية: {', '.join(qa_report['errors'])}"
             with state_lock:
                 workflow_state["status"] = "failed"
                 workflow_state["blockers"].append(err_msg)
@@ -936,7 +1103,6 @@ def serve_project_app(project_name, filename='index.html'):
 
 @app.route('/api/agents', methods=['GET'])
 def get_agents():
-    agents_list = []
     with state_lock:
         working_depts = [k.lower() for k, v in workflow_state["departments"].items() if v.get("status") == "active"]
         done_depts = [k.lower() for k, v in workflow_state["departments"].items() if v.get("status") == "done"]
@@ -952,40 +1118,32 @@ def get_agents():
         "seo": ["seo", "content", "search", "metadata"]
     }
     
-    try:
-        if os.path.exists(AGENTS_DIR):
-            for root, dirs, files in os.walk(AGENTS_DIR):
-                if ".git" in root:
-                    continue
-                dept = os.path.basename(root)
-                if dept == "agency-agents":
-                    dept = "General"
-                for f in files:
-                    if f.endswith('.md') and f not in ['README.md', 'CONTRIBUTING.md', 'SECURITY.md']:
-                        raw_id = f.replace('.md', '')
-                        clean_name = raw_id.replace('-', ' ').title()
-                        
-                        status = "idle"
-                        for wd in working_depts:
-                            kw_list = dept_map.get(wd, [wd])
-                            if any(kw in raw_id.lower() or kw in dept.lower() for kw in kw_list):
-                                status = "working"
-                                break
-                        if status == "idle":
-                            for dd in done_depts:
-                                kw_list = dept_map.get(dd, [dd])
-                                if any(kw in raw_id.lower() or kw in dept.lower() for kw in kw_list):
-                                    status = "completed"
-                                    break
-                                    
-                        agents_list.append({
-                            "id": raw_id,
-                            "name": clean_name,
-                            "department": dept,
-                            "status": status
-                        })
-    except Exception:
-        pass
+    inventory = discover_agents()
+    agents_list = []
+    
+    for agent in inventory["agents"]:
+        raw_id = agent["id"]
+        dept = agent["department"]
+        status = "idle"
+        
+        for wd in working_depts:
+            kw_list = dept_map.get(wd, [wd])
+            if any(kw in raw_id.lower() or kw in dept.lower() for kw in kw_list):
+                status = "working"
+                break
+        if status == "idle":
+            for dd in done_depts:
+                kw_list = dept_map.get(dd, [dd])
+                if any(kw in raw_id.lower() or kw in dept.lower() for kw in kw_list):
+                    status = "completed"
+                    break
+                    
+        agents_list.append({
+            "id": raw_id,
+            "name": agent["name"],
+            "department": dept,
+            "status": status
+        })
         
     order = {"working": 0, "completed": 1, "idle": 2}
     agents_list.sort(key=lambda a: (order.get(a["status"], 2), a["name"]))
@@ -1028,8 +1186,7 @@ def manage_settings():
             
         with settings_lock:
             try:
-                with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
-                    json.dump(sanitized, f, indent=2)
+                atomic_write_json(SETTINGS_FILE, sanitized)
             except Exception as e:
                 return jsonify({"error": f"Failed to save settings: {str(e)}"}), 500
                 
