@@ -544,15 +544,16 @@ async function showSection(sectionId, navElement) {
                 const safeName = escapeHtml(proj.name);
                 const safePath = escapeHtml(proj.path);
                 
-                const playBtn = proj.url 
-                    ? `<a href="${encodeURI(proj.url)}" target="_blank" class="btn btn-sm btn-primary" style="display:inline-flex; align-items:center; gap:8px; text-decoration:none;"><i class="fa-solid fa-play"></i> تشغيل / تجربة المشروع في المتصفح</a>`
+                const safeUrl = (proj.url && typeof proj.url === 'string' && proj.url.startsWith('/apps/')) ? encodeURI(proj.url) : '';
+                const playBtn = safeUrl 
+                    ? `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer" class="btn btn-sm btn-primary" style="display:inline-flex; align-items:center; gap:8px; text-decoration:none;"><i class="fa-solid fa-play"></i> تشغيل / تجربة المشروع في المتصفح</a>`
                     : '';
 
-                const openFolderBtn = `<button class="btn btn-sm btn-secondary" onclick="openFolderInExplorer('${safeName}', event)" style="display:inline-flex; align-items:center; gap:8px;"><i class="fa-solid fa-folder-open" style="color:#d29922;"></i> فتح مجلد المشروع في اللاب توب</button>`;
+                const openFolderBtn = `<button type="button" class="btn btn-sm btn-secondary btn-open-folder" style="display:inline-flex; align-items:center; gap:8px;"><i class="fa-solid fa-folder-open" style="color:#d29922;"></i> فتح مجلد المشروع في اللاب توب</button>`;
 
                 let fileLinks = (proj.files || []).map(f => {
                     const safeF = escapeHtml(f);
-                    return `<a href="/apps/${encodeURIComponent(proj.name)}/${encodeURIComponent(f)}" target="_blank" style="display:inline-block; margin-left:8px; margin-top:6px; background:rgba(88,166,255,0.1); border: 1px solid rgba(88,166,255,0.2); padding:5px 12px; border-radius:6px; color:var(--accent-blue); text-decoration:none; font-size:0.85rem;"><i class="fa-solid fa-file-code"></i> ${safeF}</a>`;
+                    return `<a href="/apps/${encodeURIComponent(proj.name)}/${encodeURIComponent(f)}" target="_blank" rel="noopener noreferrer" style="display:inline-block; margin-left:8px; margin-top:6px; background:rgba(88,166,255,0.1); border: 1px solid rgba(88,166,255,0.2); padding:5px 12px; border-radius:6px; color:var(--accent-blue); text-decoration:none; font-size:0.85rem;"><i class="fa-solid fa-file-code"></i> ${safeF}</a>`;
                 }).join('');
                 
                 div.innerHTML = `
@@ -577,6 +578,11 @@ async function showSection(sectionId, navElement) {
                     </div>
                 `;
                 list.appendChild(div);
+                
+                const folderBtn = div.querySelector('.btn-open-folder');
+                if (folderBtn) {
+                    folderBtn.addEventListener('click', (e) => openFolderInExplorer(proj.name, e));
+                }
             });
         } catch (e) {
             list.innerHTML = '<div style="text-align:center; grid-column: 1 / -1; color: red;">فشل في تحميل المشاريع.</div>';

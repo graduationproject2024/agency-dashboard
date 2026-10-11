@@ -9,6 +9,7 @@ import re
 import copy
 import uuid
 import subprocess
+from urllib.parse import urlparse
 
 # Secure Flask initialization: Never expose current working directory as static root
 app = Flask(__name__, static_folder=None)
@@ -18,6 +19,25 @@ SETTINGS_FILE = 'settings.json'
 BUDGET_FILE = 'budget.json'
 GENERATED_APPS_DIR = os.path.abspath("generated_apps")
 os.makedirs(GENERATED_APPS_DIR, exist_ok=True)
+
+# Windows reserved device names that cannot be created or accessed as regular files
+WINDOWS_RESERVED = {'CON', 'PRN', 'AUX', 'NUL'} | {f'COM{i}' for i in range(1, 10)} | {f'LPT{i}' for i in range(1, 10)}
+
+def is_safe_origin(req):
+    """
+    Prevent Cross-Site Request Forgery (CSRF) from malicious third-party websites
+    triggering local server actions via developer's browser.
+    """
+    origin = req.headers.get('Origin')
+    if origin:
+        try:
+            parsed = urlparse(origin)
+            allowed_hosts = ('127.0.0.1', 'localhost', req.host.split(':')[0])
+            if parsed.hostname not in allowed_hosts:
+                return False
+        except Exception:
+            return False
+    return True
 
 # Thread synchronization locks
 state_lock = threading.Lock()
@@ -222,8 +242,13 @@ def safe_resolve_project_dir(project_name):
     """
     Strictly validate that project_name is alphanumeric/safe and resolves
     strictly within GENERATED_APPS_DIR (Prevents path traversal).
+    Also guards against Windows reserved device names (CON, NUL, AUX, PRN, etc.).
     """
     if not project_name:
+        return None
+    # Block Windows reserved device names
+    base_check = project_name.split('.')[0].strip().upper()
+    if base_check in WINDOWS_RESERVED:
         return None
     # Allow alphanumeric, arabic, underscores, hyphens
     if not re.match(r'^[a-zA-Z0-9_\u0600-\u06FF -]{1,100}$', project_name):
@@ -231,7 +256,7 @@ def safe_resolve_project_dir(project_name):
     target_dir = os.path.abspath(os.path.join(GENERATED_APPS_DIR, project_name))
     try:
         common = os.path.commonpath([GENERATED_APPS_DIR, target_dir])
-        if common != GENERATED_APPS_DIR:
+        if common != GENERATED_APPS_DIR or target_dir == GENERATED_APPS_DIR:
             return None
     except ValueError:
         return None
@@ -671,12 +696,19 @@ def continue_workflow(feedback=""):
         app_js = anim_js if (anim_js and dev_js in anim_js) else (f"{dev_js}\n\n/* Interactions */\n{anim_js}" if anim_js and dev_js else (anim_js or dev_js))
 
         # --- Concrete QA Acceptance Criteria Check ---
+        html_has_structure = bool(
+            ("<html" in app_html and "</html>" in app_html) or
+            ("<!DOCTYPE html" in app_html and ("<body" in app_html or "<div" in app_html))
+        )
+        css_balanced = bool(not app_css or (app_css.count('{') == app_css.count('}')))
+        js_balanced = bool(not app_js or (app_js.count('{') == app_js.count('}') and app_js.count('(') == app_js.count(')')))
+        
         qa_checks = {
-            "html_extracted": bool(app_html),
-            "html_doctype_or_tags": bool("<html" in app_html or "<body" in app_html or "<div" in app_html),
-            "no_fatal_error_strings": bool("فشل الاتصال" not in app_html and "Read timed out" not in app_html),
-            "css_present": bool(app_css),
-            "js_present": bool(app_js)
+            "html_extracted": bool(app_html and len(app_html) > 50),
+            "html_doctype_or_tags": html_has_structure,
+            "no_fatal_error_strings": bool("فشل الاتصال" not in app_html and "Read timed out" not in app_html and "Traceback" not in app_html),
+            "css_syntax_balanced": css_balanced,
+            "js_syntax_balanced": js_balanced
         }
         
         all_passed = all(qa_checks.values())
@@ -792,6 +824,8 @@ def get_state():
 
 @app.route('/api/start_task', methods=['POST'])
 def start_task():
+    if not is_safe_origin(request):
+        return jsonify({"error": "Forbidden: Invalid origin"}), 403
     data = request.get_json(silent=True) or {}
     task_desc = data.get('task', '').strip()
     if not task_desc:
@@ -810,6 +844,8 @@ def start_task():
 
 @app.route('/api/approve', methods=['POST'])
 def approve():
+    if not is_safe_origin(request):
+        return jsonify({"error": "Forbidden: Invalid origin"}), 403
     with state_lock:
         if workflow_state["status"] != "approval_needed":
             return jsonify({"error": "No pending approval required"}), 400
@@ -849,6 +885,8 @@ def open_project_folder():
     Secure folder opening endpoint: Strictly constrained to generated_apps children.
     Rejects directory traversal, relative paths escaping base, or arbitrary host paths.
     """
+    if not is_safe_origin(request):
+        return jsonify({"error": "Forbidden: Invalid origin"}), 403
     data = request.get_json(silent=True) or {}
     folder_name = data.get('name')
     folder_path = data.get('path')
@@ -860,7 +898,7 @@ def open_project_folder():
         # Validate that client-provided folder_path resolves strictly inside GENERATED_APPS_DIR
         abs_p = os.path.abspath(folder_path)
         try:
-            if os.path.commonpath([GENERATED_APPS_DIR, abs_p]) == GENERATED_APPS_DIR:
+            if os.path.commonpath([GENERATED_APPS_DIR, abs_p]) == GENERATED_APPS_DIR and abs_p != GENERATED_APPS_DIR:
                 target_dir = abs_p
         except ValueError:
             target_dir = None
@@ -960,6 +998,8 @@ def get_budget():
 @app.route('/api/settings', methods=['GET', 'POST'])
 def manage_settings():
     if request.method == 'POST':
+        if not is_safe_origin(request):
+            return jsonify({"error": "Forbidden: Invalid origin"}), 403
         data = request.get_json(silent=True)
         if not isinstance(data, dict):
             return jsonify({"error": "Invalid request body, expected JSON object"}), 400
@@ -967,16 +1007,21 @@ def manage_settings():
         current = load_settings()
         sanitized = {}
         
-        # Enforce strict allowlist of permitted fields
+        # Enforce strict allowlist of permitted fields and type checks
         for field in CONFIG_ALLOWLIST:
             if field in data:
-                sanitized[field] = data[field]
+                val = data[field]
+                if not isinstance(val, str):
+                    return jsonify({"error": f"Field '{field}' must be a string"}), 400
+                if len(val) > 2048:
+                    return jsonify({"error": f"Field '{field}' exceeds max length"}), 400
+                sanitized[field] = val
             elif field in current:
                 sanitized[field] = current[field]
                 
         # Protect existing key: never overwrite with masked/preview string
         new_key = data.get('openrouter_key', '')
-        if new_key and not ('...' in new_key or '***' in new_key):
+        if isinstance(new_key, str) and new_key and not ('...' in new_key or '***' in new_key):
             sanitized['openrouter_key'] = new_key.strip()
         else:
             sanitized['openrouter_key'] = current.get('openrouter_key', '')

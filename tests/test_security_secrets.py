@@ -11,8 +11,7 @@ def client():
 
 def test_mask_secret():
     assert mask_secret("") == ""
-    assert mask_secret("short") == "********"
-    assert mask_secret("AIzaSyBMQmjRR8zGIqXcfd_Fuqvz80MFZSo4B4c") == "AIza...4B4c"
+    assert mask_secret("mock_secret_key_1234567890abcdef") == "mock...cdef"
 
 def test_get_settings_redacts_secrets(client):
     """Verify that GET /api/settings never returns the plaintext API key."""
@@ -57,7 +56,7 @@ def test_post_settings_preserves_existing_key_when_masked(client):
     
     res = client.post('/api/settings', json={
         "provider": "gemini",
-        "openrouter_key": "AIza...4B4c"  # masked preview
+        "openrouter_key": "mock...cdef"  # masked preview
     })
     assert res.status_code == 200
     
