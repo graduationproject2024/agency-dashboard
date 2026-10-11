@@ -14,55 +14,100 @@ const projectTitle = document.getElementById('project-title');
 let lastFeedId = 0;
 let globalOutputs = {};
 
+// --- Security Utilities: XSS Sanitization & HTML Escaping ---
+
+function escapeHtml(str) {
+    if (str === null || str === undefined) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+}
+
+function sanitizeHtml(dirtyHtml) {
+    if (!dirtyHtml) return '';
+    if (typeof DOMPurify !== 'undefined' && DOMPurify.sanitize) {
+        return DOMPurify.sanitize(dirtyHtml, {
+            ALLOWED_TAGS: [
+                'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'b', 'i', 'strong', 'em', 'strike',
+                'code', 'pre', 'ul', 'ol', 'li', 'blockquote', 'hr', 'table', 'thead', 'tbody',
+                'tr', 'th', 'td', 'br', 'span', 'div'
+            ],
+            ALLOWED_ATTR: ['class', 'style']
+        });
+    }
+    // Fallback sanitizer if DOMPurify is unavailable: strip script, iframe, and inline handlers
+    return String(dirtyHtml)
+        .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
+        .replace(/<iframe\b[^<]*(?:(?!<\/iframe>)<[^<]*)*<\/iframe>/gi, '')
+        .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, '')
+        .replace(/\son\w+="[^"]*"/gi, '')
+        .replace(/\son\w+='[^']*'/gi, '')
+        .replace(/javascript:[^"']*/gi, '');
+}
+
 function updateNodeState(nodeId, status) {
     const node = document.getElementById('node-' + nodeId);
     if (!node) return;
-    node.classList.remove('active', 'done');
+    node.classList.remove('active', 'done', 'failed');
     if (status === 'active') node.classList.add('active');
     if (status === 'done') node.classList.add('done');
+    if (status === 'failed') node.classList.add('failed');
 }
 
 function createFeedItem(feed) {
     const div = document.createElement('div');
     div.className = 'feed-item';
+    const safeInitial = escapeHtml(feed.initial);
+    const safeName = escapeHtml(feed.name);
+    const safeRole = escapeHtml(feed.role);
+    const safeText = escapeHtml(feed.text);
+    const safeTime = escapeHtml(feed.time);
+    const safeColor = escapeHtml(feed.color || 'var(--accent-blue)');
+
     div.innerHTML = `
-        <div class="feed-avatar" style="background: ${feed.color}">${feed.initial}</div>
+        <div class="feed-avatar" style="background: ${safeColor}">${safeInitial}</div>
         <div class="feed-content">
-            <h4>${feed.name} <span>${feed.role}</span></h4>
-            <p>${feed.text}</p>
-            <span class="feed-time">${feed.time}</span>
+            <h4>${safeName} <span>${safeRole}</span></h4>
+            <p>${safeText}</p>
+            <span class="feed-time">${safeTime}</span>
         </div>
     `;
     return div;
 }
 
 function updateDepartmentUI(element, data) {
-    const icon = element.querySelector('.dept-icon');
+    if (!element) return;
     const textEl = element.querySelector('.status');
-    
     element.className = 'dept-item';
-    textEl.textContent = data.text;
+    if (textEl) textEl.textContent = data.text;
     
     if (data.status === 'active') {
         element.classList.add('active-dept');
-        textEl.className = 'status text-blue';
+        if (textEl) textEl.className = 'status text-blue';
     } else if (data.status === 'done') {
-        textEl.className = 'status text-green';
+        if (textEl) textEl.className = 'status text-green';
+    } else if (data.status === 'failed') {
+        element.classList.add('failed-dept');
+        if (textEl) textEl.className = 'status text-red';
     } else if (data.status === 'waiting') {
         element.classList.add('waiting-dept');
-        textEl.className = 'status text-gray';
+        if (textEl) textEl.className = 'status text-gray';
     } else {
-        textEl.className = 'status text-gray';
+        if (textEl) textEl.className = 'status text-gray';
     }
 }
 
 async function fetchState() {
     try {
         const res = await fetch('/api/state');
+        if (!res.ok) return;
         const state = await res.json();
         
-        // Update Title
-        if (state.current_task) {
+        // Update Title safely
+        if (state.current_task && projectTitle) {
             projectTitle.textContent = state.current_task;
         }
 
@@ -70,7 +115,7 @@ async function fetchState() {
             globalOutputs = state.outputs;
         }
 
-        // Update Departments & Nodes
+        // Update Departments & Pipeline Nodes
         const depts = ['strategy', 'product', 'engineering', 'design', 'development', 'qa', 'animation', 'seo'];
         const elements = {
             strategy: deptStrategy, product: deptProduct, engineering: deptEngineering,
@@ -79,25 +124,27 @@ async function fetchState() {
         };
 
         depts.forEach(d => {
-            if (state.departments[d]) {
+            if (state.departments && state.departments[d]) {
                 updateDepartmentUI(elements[d], state.departments[d]);
                 updateNodeState(d, state.departments[d].status);
             }
         });
 
-        // Update Feed
-        const newFeeds = state.feed.filter(f => f.id > lastFeedId);
-        if (newFeeds.length > 0) {
-            // newFeeds is from newest to oldest based on API
-            // we should prepend them
-            newFeeds.reverse().forEach(feed => {
-                const item = createFeedItem(feed);
-                feedContainer.insertBefore(item, feedContainer.firstChild);
-            });
-            lastFeedId = state.feed[0].id;
+        // Update Feed safely
+        if (state.feed && state.feed.length > 0) {
+            const newFeeds = state.feed.filter(f => f.id > lastFeedId);
+            if (newFeeds.length > 0) {
+                newFeeds.reverse().forEach(feed => {
+                    const item = createFeedItem(feed);
+                    if (feedContainer) {
+                        feedContainer.insertBefore(item, feedContainer.firstChild);
+                    }
+                });
+                lastFeedId = state.feed[0].id;
+            }
         }
 
-        // Update Approval in Overview & Approvals Section
+        // Update Approval Box
         if (state.status === 'approval_needed' && state.approval_request) {
             if (approvalBox) {
                 approvalBox.style.display = 'block';
@@ -114,13 +161,15 @@ async function fetchState() {
             renderPendingApprovalSection(state);
         }
 
-        // Update Stats
+        // Update Stats Counters
         if (state.stats) {
-            document.getElementById('stat-total-agents').textContent = state.stats.total_agents;
-            document.getElementById('stat-active-agents').textContent = state.stats.active_agents;
-            document.getElementById('stat-pending-approvals').textContent = state.stats.pending_approvals;
+            const totalEl = document.getElementById('stat-total-agents');
+            const activeEl = document.getElementById('stat-active-agents');
+            const pendingEl = document.getElementById('stat-pending-approvals');
+            if (totalEl) totalEl.textContent = state.stats.total_agents;
+            if (activeEl) activeEl.textContent = state.stats.active_agents;
+            if (pendingEl) pendingEl.textContent = state.stats.pending_approvals;
             
-            // Update sidebar badge
             const badge = document.getElementById('sidebar-badge');
             if (badge) {
                 badge.textContent = state.stats.pending_approvals;
@@ -128,48 +177,65 @@ async function fetchState() {
             }
         }
 
-        // Update Live Budget
+        // Update Live Budget Metrics
         if (state.budget) {
             updateBudgetUI(state.budget);
         }
 
-        // Calculate and update Progress
+        // Calculate and update Progress bar honestly
         let progress = 0;
-        if (state.status === 'finished') {
+        const progressTextEl = document.getElementById('project-progress-text');
+        const progressBarEl = document.getElementById('project-progress');
+        
+        if (state.status === 'completed' || state.status === 'finished') {
             progress = 100;
-        } else if (state.status !== 'idle') {
-            const depts = Object.values(state.departments);
-            const doneCount = depts.filter(d => d.status === 'done').length;
-            progress = Math.min(95, doneCount * 20 + (state.status === 'approval_needed' ? 10 : 0));
+            if (progressTextEl) progressTextEl.textContent = '100% مكتمل ومفحوص';
+        } else if (state.status === 'failed') {
+            if (progressTextEl) progressTextEl.textContent = 'تعثر سير العمل (فشل الفحص)';
+            if (progressBarEl) progressBarEl.style.background = 'var(--accent-red)';
+        } else if (state.status !== 'idle' && state.departments) {
+            const deptsList = Object.values(state.departments);
+            const doneCount = deptsList.filter(d => d.status === 'done').length;
+            progress = Math.min(95, doneCount * 12 + (state.status === 'approval_needed' ? 10 : 0));
+            if (progressTextEl) progressTextEl.textContent = progress + '% جاري التنفيذ';
+            if (progressBarEl) progressBarEl.style.background = 'linear-gradient(90deg, var(--accent-blue), #8a2be2)';
+        } else {
+            if (progressTextEl) progressTextEl.textContent = '0% في انتظار البدء';
         }
         
-        document.getElementById('project-progress').style.width = progress + '%';
-        document.getElementById('project-progress-text').textContent = progress + '% مكتمل';
+        if (progressBarEl && state.status !== 'failed') {
+            progressBarEl.style.width = progress + '%';
+        }
 
     } catch (e) {
         console.error("Error fetching state:", e);
     }
 }
 
-setInterval(fetchState, 1000);
+setInterval(fetchState, 1500);
 
 function renderPendingApprovalSection(state) {
     const pendingContainer = document.getElementById('section-approvals-pending');
     if (!pendingContainer) return;
     
     if (state.status === 'approval_needed' && state.approval_request) {
+        const safeRole = escapeHtml(state.approval_request.role || 'مدير المنتج');
+        const safeTitle = escapeHtml(state.approval_request.title);
+        const safeTask = escapeHtml(state.current_task || 'المشروع الحالي');
+        const safeMessage = escapeHtml(state.approval_request.message);
+
         pendingContainer.innerHTML = `
             <div class="approval-card-large">
                 <div class="approval-card-header">
                     <div class="approval-badge-urgent"><i class="fa-solid fa-triangle-exclamation"></i> مطلوب قرارك الآن</div>
-                    <span class="approval-role-badge"><i class="fa-solid fa-user-tie"></i> ${state.approval_request.role || 'مدير المنتج'}</span>
+                    <span class="approval-role-badge"><i class="fa-solid fa-user-tie"></i> ${safeRole}</span>
                 </div>
-                <h2 style="margin: 10px 0 8px 0; color: #fff; font-size: 1.35rem;">${state.approval_request.title}</h2>
+                <h2 style="margin: 10px 0 8px 0; color: #fff; font-size: 1.35rem;">${safeTitle}</h2>
                 <p style="color: var(--accent-blue); font-size: 0.95rem; margin-bottom: 12px;">
-                    <i class="fa-solid fa-folder-open"></i> المشروع قيد التنفيذ: <strong>${state.current_task || 'المشروع الحالي'}</strong>
+                    <i class="fa-solid fa-folder-open"></i> المشروع قيد التنفيذ: <strong>${safeTask}</strong>
                 </p>
                 <div class="approval-desc-box">
-                    <p style="margin: 0; line-height: 1.6;">${state.approval_request.message}</p>
+                    <p style="margin: 0; line-height: 1.6;">${safeMessage}</p>
                 </div>
                 <div class="approval-docs-row">
                     <h4 style="margin-bottom: 12px; font-size: 0.95rem; color: #fff;"><i class="fa-solid fa-book-open text-blue"></i> تقارير ومخرجات الفريق للاعتماد:</h4>
@@ -195,8 +261,8 @@ function renderPendingApprovalSection(state) {
         `;
     } else {
         pendingContainer.innerHTML = `
-            <div class="glass-panel empty-state">
-                <div class="icon-wrapper green" style="margin: 0 auto 15px auto;"><i class="fa-solid fa-check-double"></i></div>
+            <div class="glass-panel" style="text-align: center; padding: 40px; color: var(--text-muted);">
+                <i class="fa-solid fa-circle-check" style="font-size: 3rem; color: var(--accent-green); margin-bottom: 15px; display: block;"></i>
                 <h3>لا توجد موافقات معلقة حالياً</h3>
                 <p>جميع خطط وسير عمل الفريق تسير بشكل آلي ومستمر، وسيظهر لك تنبيه هنا فور وصول دورك لاعتماد أي خطوة.</p>
             </div>
@@ -205,24 +271,32 @@ function renderPendingApprovalSection(state) {
 }
 
 function openModal() {
-    taskModal.style.display = 'flex';
+    if (taskModal) taskModal.style.display = 'flex';
 }
 
 async function startTask() {
-    const taskInput = document.getElementById('task-input').value;
+    const taskInputEl = document.getElementById('task-input');
+    const taskInput = taskInputEl ? taskInputEl.value.trim() : '';
     if (!taskInput) return;
     
-    await fetch('/api/start_task', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ task: taskInput })
-    });
-    closeModal('taskModal');
-    document.getElementById('task-input').value = '';
-    
-    // Clear feed UI on new task
-    feedContainer.innerHTML = '';
-    lastFeedId = 0;
+    try {
+        const res = await fetch('/api/start_task', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ task: taskInput })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+            alert(data.error || 'تعذر بدء المهمة');
+            return;
+        }
+        closeModal('taskModal');
+        if (taskInputEl) taskInputEl.value = '';
+        if (feedContainer) feedContainer.innerHTML = '';
+        lastFeedId = 0;
+    } catch(err) {
+        alert('فشل الاتصال بالخادم');
+    }
 }
 
 async function approveTask(feedbackInputId = 'approval-feedback') {
@@ -236,22 +310,26 @@ async function approveTask(feedbackInputId = 'approval-feedback') {
     });
     
     try {
-        await fetch('/api/approve', { 
+        const res = await fetch('/api/approve', { 
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ feedback: feedback })
         });
-        
-        saveApprovalToHistory({
-            date: new Date().toLocaleDateString('ar-EG', { year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }),
-            title: document.getElementById('approval-title')?.textContent || 'اعتماد المتطلبات والمواصفات',
-            department: 'إدارة المنتجات والهندسة',
-            status: 'تم الاعتماد'
-        });
-        
-        if (feedbackEl) feedbackEl.value = '';
+        const data = await res.json();
+        if (res.ok) {
+            saveApprovalToHistory({
+                date: new Date().toLocaleDateString('ar-EG', { year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }),
+                title: document.getElementById('approval-title')?.textContent || 'اعتماد المتطلبات والمواصفات',
+                department: 'إدارة المنتجات والهندسة',
+                status: 'تم الاعتماد'
+            });
+            if (feedbackEl) feedbackEl.value = '';
+        } else {
+            alert(data.error || 'تعذر اعتماد الخطوة');
+        }
     } catch (e) {
         console.error("Error in approveTask:", e);
+        alert('حدث خطأ أثناء إرسال الاعتماد');
     }
     
     submitBtns.forEach(b => {
@@ -299,12 +377,12 @@ function viewOutput(dept) {
         if (bodyEl) {
             if (typeof marked !== 'undefined' && marked.parse) {
                 try {
-                    bodyEl.innerHTML = marked.parse(rawOutput);
+                    bodyEl.innerHTML = sanitizeHtml(marked.parse(rawOutput));
                 } catch(err) {
-                    bodyEl.innerHTML = formatMarkdownFallback(rawOutput);
+                    bodyEl.innerHTML = sanitizeHtml(formatMarkdownFallback(rawOutput));
                 }
             } else {
-                bodyEl.innerHTML = formatMarkdownFallback(rawOutput);
+                bodyEl.innerHTML = sanitizeHtml(formatMarkdownFallback(rawOutput));
             }
         }
     }
@@ -314,10 +392,7 @@ function viewOutput(dept) {
 
 function formatMarkdownFallback(text) {
     if (!text) return '';
-    let escaped = text
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
+    let escaped = escapeHtml(text);
     
     // Code blocks
     escaped = escaped.replace(/```([a-zA-Z0-9]*)\n([\s\S]*?)```/g, '<pre><code class="$1">$2</code></pre>');
@@ -346,9 +421,7 @@ function copyModalOutput() {
         if (btn) {
             const originalHtml = btn.innerHTML;
             btn.innerHTML = `<i class="fa-solid fa-check text-green"></i> تم النسخ!`;
-            setTimeout(() => {
-                btn.innerHTML = originalHtml;
-            }, 2000);
+            setTimeout(() => { btn.innerHTML = originalHtml; }, 2000);
         }
     }).catch(err => {
         console.error("Copy failed:", err);
@@ -362,9 +435,7 @@ function loadApprovalHistory() {
     let history = [];
     try {
         const stored = localStorage.getItem('agency_approvals_history');
-        if (stored) {
-            history = JSON.parse(stored);
-        }
+        if (stored) history = JSON.parse(stored);
     } catch(e) {}
     
     if (history.length === 0) {
@@ -381,10 +452,10 @@ function loadApprovalHistory() {
     
     historyTbody.innerHTML = history.map(item => `
         <tr style="border-bottom: 1px solid rgba(255,255,255,0.05);">
-            <td style="padding: 12px 10px; color: var(--text-muted); font-size: 0.9rem;">${item.date}</td>
-            <td style="padding: 12px 10px; font-weight: 600; color: #fff;">${item.title}</td>
-            <td style="padding: 12px 10px;"><span style="background: rgba(88,166,255,0.1); color: var(--accent-blue); padding: 3px 8px; border-radius: 6px; font-size: 0.85rem;">${item.department}</span></td>
-            <td style="padding: 12px 10px; color: var(--accent-green); font-weight: 600;"><i class="fa-solid fa-circle-check"></i> ${item.status}</td>
+            <td style="padding: 12px 10px; color: var(--text-muted); font-size: 0.9rem;">${escapeHtml(item.date)}</td>
+            <td style="padding: 12px 10px; font-weight: 600; color: #fff;">${escapeHtml(item.title)}</td>
+            <td style="padding: 12px 10px;"><span style="background: rgba(88,166,255,0.1); color: var(--accent-blue); padding: 3px 8px; border-radius: 6px; font-size: 0.85rem;">${escapeHtml(item.department)}</span></td>
+            <td style="padding: 12px 10px; color: var(--accent-green); font-weight: 600;"><i class="fa-solid fa-circle-check"></i> ${escapeHtml(item.status)}</td>
         </tr>
     `).join('');
 }
@@ -456,6 +527,7 @@ async function showSection(sectionId, navElement) {
         loadAgents();
     } else if (sectionId === 'projects') {
         const list = document.getElementById('projects-container');
+        if (!list) return;
         list.innerHTML = '<div style="text-align:center; grid-column: 1 / -1;"><i class="fa-solid fa-spinner fa-spin"></i> جاري جلب المشاريع...</div>';
         try {
             const res = await fetch('/api/projects');
@@ -469,13 +541,19 @@ async function showSection(sectionId, navElement) {
                 const div = document.createElement('div');
                 div.style.cssText = 'background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); padding: 20px; border-radius: 12px; margin-bottom: 18px;';
                 
+                const safeName = escapeHtml(proj.name);
+                const safePath = escapeHtml(proj.path);
+                
                 const playBtn = proj.url 
-                    ? `<a href="${proj.url}" target="_blank" class="btn btn-sm btn-primary" style="display:inline-flex; align-items:center; gap:8px; text-decoration:none;"><i class="fa-solid fa-play"></i> تشغيل / تجربة المشروع في المتصفح</a>`
+                    ? `<a href="${encodeURI(proj.url)}" target="_blank" class="btn btn-sm btn-primary" style="display:inline-flex; align-items:center; gap:8px; text-decoration:none;"><i class="fa-solid fa-play"></i> تشغيل / تجربة المشروع في المتصفح</a>`
                     : '';
 
-                const openFolderBtn = `<button class="btn btn-sm btn-secondary" onclick="openFolderInExplorer('${proj.name}', event)" style="display:inline-flex; align-items:center; gap:8px;"><i class="fa-solid fa-folder-open" style="color:#d29922;"></i> فتح مجلد المشروع في اللاب توب</button>`;
+                const openFolderBtn = `<button class="btn btn-sm btn-secondary" onclick="openFolderInExplorer('${safeName}', event)" style="display:inline-flex; align-items:center; gap:8px;"><i class="fa-solid fa-folder-open" style="color:#d29922;"></i> فتح مجلد المشروع في اللاب توب</button>`;
 
-                let fileLinks = proj.files.map(f => `<a href="/apps/${proj.name}/${f}" target="_blank" style="display:inline-block; margin-left:8px; margin-top:6px; background:rgba(88,166,255,0.1); border: 1px solid rgba(88,166,255,0.2); padding:5px 12px; border-radius:6px; color:var(--accent-blue); text-decoration:none; font-size:0.85rem;"><i class="fa-solid fa-file-code"></i> ${f}</a>`).join('');
+                let fileLinks = (proj.files || []).map(f => {
+                    const safeF = escapeHtml(f);
+                    return `<a href="/apps/${encodeURIComponent(proj.name)}/${encodeURIComponent(f)}" target="_blank" style="display:inline-block; margin-left:8px; margin-top:6px; background:rgba(88,166,255,0.1); border: 1px solid rgba(88,166,255,0.2); padding:5px 12px; border-radius:6px; color:var(--accent-blue); text-decoration:none; font-size:0.85rem;"><i class="fa-solid fa-file-code"></i> ${safeF}</a>`;
+                }).join('');
                 
                 div.innerHTML = `
                     <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:12px;">
@@ -484,8 +562,8 @@ async function showSection(sectionId, navElement) {
                                 <i class="fa-solid fa-laptop-code"></i>
                             </div>
                             <div>
-                                <h3 style="margin:0; font-size:1.15rem; color:#fff;">${proj.name}</h3>
-                                <span style="font-size:0.8rem; color:#8b949e; direction:ltr; text-align:right; display:block;">📁 ${proj.path}</span>
+                                <h3 style="margin:0; font-size:1.15rem; color:#fff;">${safeName}</h3>
+                                <span style="font-size:0.8rem; color:#8b949e; direction:ltr; text-align:right; display:block;">📁 ${safePath}</span>
                             </div>
                         </div>
                         <div style="display:flex; gap:10px; flex-wrap:wrap;">
@@ -509,9 +587,23 @@ async function showSection(sectionId, navElement) {
         try {
             const res = await fetch('/api/settings');
             const settings = await res.json();
-            if (settings.openrouter_key) document.getElementById('openrouter-key').value = settings.openrouter_key;
-            if (settings.openrouter_model) document.getElementById('openrouter-model').value = settings.openrouter_model;
-            if (settings.provider) document.getElementById('api-provider').value = settings.provider;
+            const keyInput = document.getElementById('openrouter-key');
+            if (keyInput) {
+                if (settings.has_key) {
+                    keyInput.placeholder = "المفتاح مسجل ومحمي (" + (settings.key_masked || "محمي") + ") - اتركه فارغاً للاحتفاظ به";
+                    keyInput.value = "";
+                } else {
+                    keyInput.placeholder = "AIzaSy... أو sk-or-v1-...";
+                    keyInput.value = "";
+                }
+            }
+            if (settings.openrouter_model && document.getElementById('openrouter-model')) {
+                document.getElementById('openrouter-model').value = settings.openrouter_model;
+            }
+            if (settings.provider && document.getElementById('api-provider')) {
+                document.getElementById('api-provider').value = settings.provider;
+                toggleProvider();
+            }
         } catch (e) {}
     }
 }
@@ -527,69 +619,96 @@ async function openFolderInExplorer(folderName, evt) {
             body: JSON.stringify({ name: folderName })
         });
         const data = await res.json();
-        if (btn) {
-            btn.innerHTML = '<i class="fa-solid fa-check text-green"></i> تم الفتح في اللاب!';
-            setTimeout(() => { btn.innerHTML = origHtml; }, 2500);
+        if (res.ok) {
+            if (btn) {
+                btn.innerHTML = '<i class="fa-solid fa-check text-green"></i> تم الفتح في اللاب!';
+                setTimeout(() => { btn.innerHTML = origHtml; }, 2500);
+            }
+        } else {
+            if (btn) btn.innerHTML = origHtml;
+            alert(data.error || 'تعذر فتح المجلد على جهازك');
         }
     } catch (e) {
         if (btn) btn.innerHTML = origHtml;
-        alert('تعذر فتح المجلد على جهازك');
+        alert('تعذر الاتصال بالخادم لفتح المجلد');
     }
 }
 
 async function saveSettings() {
-    const key = document.getElementById('openrouter-key').value;
-    const model = document.getElementById('openrouter-model').value;
-    const provider = document.getElementById('api-provider').value;
-    const opencodeAiProvider = document.getElementById('opencode-ai-provider').value;
-    const opencodeModel = document.getElementById('opencode-model-id').value;
+    const rawKey = (document.getElementById('openrouter-key')?.value || '').trim();
+    const model = (document.getElementById('openrouter-model')?.value || '').trim();
+    const provider = document.getElementById('api-provider')?.value || 'gemini';
+    const opencodeAiProvider = document.getElementById('opencode-ai-provider')?.value || 'anthropic';
+    const opencodeModel = (document.getElementById('opencode-model-id')?.value || '').trim();
     const btn = document.getElementById('save-settings-btn');
     const msg = document.getElementById('settings-msg');
     
-    btn.disabled = true;
-    btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> جاري الحفظ...';
+    if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> جاري الحفظ...';
+    }
     
-    await fetch('/api/settings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-            openrouter_key: key, 
-            openrouter_model: model, 
-            provider: provider,
-            opencode_url: 'http://127.0.0.1:4096',
-            opencode_ai_provider: opencodeAiProvider,
-            opencode_model: opencodeModel
-        })
-    });
+    const payload = {
+        openrouter_model: model,
+        provider: provider,
+        opencode_url: 'http://127.0.0.1:4096',
+        opencode_ai_provider: opencodeAiProvider,
+        opencode_model: opencodeModel
+    };
     
-    btn.disabled = false;
-    btn.innerHTML = 'حفظ الإعدادات';
-    msg.style.display = 'block';
-    setTimeout(() => msg.style.display = 'none', 3000);
+    // Only send the key if the user entered a fresh, unmasked string
+    if (rawKey && !rawKey.includes('...') && !rawKey.includes('***')) {
+        payload.openrouter_key = rawKey;
+    }
+    
+    try {
+        const res = await fetch('/api/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (btn) {
+            btn.disabled = false;
+            btn.innerHTML = 'حفظ الإعدادات';
+        }
+        if (msg) {
+            msg.textContent = data.message || 'تم حفظ الإعدادات بأمان!';
+            msg.style.display = 'block';
+            setTimeout(() => { msg.style.display = 'none'; }, 3000);
+        }
+        // Refresh settings view
+        showSection('settings');
+    } catch(err) {
+        if (btn) {
+            btn.disabled = false;
+            btn.innerHTML = 'حفظ الإعدادات';
+        }
+        alert('فشل حفظ الإعدادات');
+    }
 }
 
 function toggleProvider() {
-    const provider = document.getElementById('api-provider').value;
-    const keyDiv = document.getElementById('lbl-api-key').parentElement;
-    const modelDiv = document.getElementById('openrouter-model').parentElement;
+    const providerEl = document.getElementById('api-provider');
+    if (!providerEl) return;
+    const provider = providerEl.value;
+    const keyDiv = document.getElementById('lbl-api-key')?.parentElement;
+    const modelDiv = document.getElementById('openrouter-model')?.parentElement;
     const opencodeDiv = document.getElementById('opencode-settings');
     
     if (provider === 'opencode') {
-        keyDiv.style.display = 'none';
-        modelDiv.style.display = 'none';
-        opencodeDiv.style.display = 'block';
+        if (keyDiv) keyDiv.style.display = 'none';
+        if (modelDiv) modelDiv.style.display = 'none';
+        if (opencodeDiv) opencodeDiv.style.display = 'block';
     } else {
-        keyDiv.style.display = 'block';
-        modelDiv.style.display = 'block';
-        opencodeDiv.style.display = 'none';
+        if (keyDiv) keyDiv.style.display = 'block';
+        if (modelDiv) modelDiv.style.display = 'block';
+        if (opencodeDiv) opencodeDiv.style.display = 'none';
+        const lbl = document.getElementById('lbl-api-key');
         if (provider === 'gemini') {
-            document.getElementById('lbl-api-key').innerText = "مفتاح Gemini API";
-            document.getElementById('openrouter-key').placeholder = "AIzaSy...";
-            document.getElementById('openrouter-model').value = "gemini-3.5-flash-lite";
+            if (lbl) lbl.innerText = "مفتاح Gemini API";
         } else {
-            document.getElementById('lbl-api-key').innerText = "مفتاح OpenRouter API";
-            document.getElementById('openrouter-key').placeholder = "sk-or-v1-...";
-            document.getElementById('openrouter-model').value = "openai/gpt-4o-mini";
+            if (lbl) lbl.innerText = "مفتاح OpenRouter API";
         }
     }
 }
@@ -607,18 +726,17 @@ let currentStatusFilter = 'all';
 
 async function loadAgents() {
     const list = document.getElementById('agents-list');
+    if (!list) return;
     list.innerHTML = '<div style="text-align:center; grid-column: 1 / -1;"><i class="fa-solid fa-spinner fa-spin"></i> جاري جلب قائمة الموظفين...</div>';
     try {
         const res = await fetch('/api/agents');
         allAgentsData = await res.json();
         
-        // Calculate status counts
         const workingCount = allAgentsData.filter(a => a.status === 'working').length;
         const completedCount = allAgentsData.filter(a => a.status === 'completed').length;
         const idleCount = allAgentsData.filter(a => a.status === 'idle').length;
         const totalCount = allAgentsData.length;
 
-        // Update counter elements
         const countDisplay = document.getElementById('agents-count-display');
         if (countDisplay) countDisplay.textContent = totalCount;
         const totalEl = document.getElementById('agents-total-count');
@@ -652,11 +770,7 @@ function setStatusFilter(status) {
     tabs.forEach(tab => {
         const btn = document.getElementById(`filter-btn-${tab}`);
         if (btn) {
-            if (tab === status) {
-                btn.className = 'btn btn-sm btn-primary';
-            } else {
-                btn.className = 'btn btn-sm btn-secondary';
-            }
+            btn.className = (tab === status) ? 'btn btn-sm btn-primary' : 'btn btn-sm btn-secondary';
         }
     });
     renderAgentsList();
@@ -667,13 +781,13 @@ function renderDivisionFilters() {
     if (!filterContainer) return;
     
     const depts = Array.from(new Set(allAgentsData.map(a => a.department))).filter(Boolean);
-    
     let html = `<button class="btn btn-sm ${currentAgentDivision === 'all' ? 'btn-primary' : 'btn-secondary'}" onclick="setAgentDivision('all')">كل الأقسام (${allAgentsData.length})</button>`;
     
     depts.forEach(d => {
         const count = allAgentsData.filter(a => a.department === d).length;
         const activeClass = currentAgentDivision === d ? 'btn-primary' : 'btn-secondary';
-        html += `<button class="btn btn-sm ${activeClass}" onclick="setAgentDivision('${d}')">${d} (${count})</button>`;
+        const safeDept = escapeHtml(d);
+        html += `<button class="btn btn-sm ${activeClass}" onclick="setAgentDivision('${safeDept}')">${safeDept} (${count})</button>`;
     });
     
     filterContainer.innerHTML = html;
@@ -694,20 +808,14 @@ function renderAgentsList() {
     if (!list) return;
     
     const query = (document.getElementById('agents-search-input')?.value || '').trim().toLowerCase();
-    
     let filtered = allAgentsData;
     
-    // Status Filter
     if (currentStatusFilter !== 'all') {
         filtered = filtered.filter(a => a.status === currentStatusFilter);
     }
-
-    // Department Filter
     if (currentAgentDivision !== 'all') {
         filtered = filtered.filter(a => a.department === currentAgentDivision);
     }
-
-    // Search Query
     if (query) {
         filtered = filtered.filter(a => a.name.toLowerCase().includes(query) || a.department.toLowerCase().includes(query));
     }
@@ -722,12 +830,10 @@ function renderAgentsList() {
         const card = document.createElement('div');
         const status = agent.status || 'idle';
         card.className = `agent-card status-${status}`;
-        card.style.cssText = `
-            padding: 18px 16px; 
-            border-radius: 14px; 
-            text-align: center;
-            position: relative;
-        `;
+        card.style.cssText = 'padding: 18px 16px; border-radius: 14px; text-align: center; position: relative;';
+        
+        const safeName = escapeHtml(agent.name);
+        const safeDept = escapeHtml(agent.department);
         
         let badgeHtml = '';
         let iconColor = 'var(--accent-blue)';
@@ -736,11 +842,11 @@ function renderAgentsList() {
         if (status === 'working') {
             badgeHtml = `<span style="position: absolute; top: 12px; right: 12px; font-size: 0.72rem; background: rgba(46, 160, 67, 0.25); border: 1px solid #3fb950; color: #3fb950; padding: 3px 8px; border-radius: 20px; font-weight: bold; display: flex; align-items: center;"><span class="pulse-dot"></span> شغال الآن</span>`;
             iconColor = '#3fb950';
-            statusSubtext = `<div style="font-size: 0.78rem; color: #7ee787; margin-top: 8px; font-weight: 600;"><i class="fa-solid fa-gear fa-spin"></i> ينفذ مهام ${agent.department}</div>`;
+            statusSubtext = `<div style="font-size: 0.78rem; color: #7ee787; margin-top: 8px; font-weight: 600;"><i class="fa-solid fa-gear fa-spin"></i> ينفذ مهام ${safeDept}</div>`;
         } else if (status === 'completed') {
             badgeHtml = `<span style="position: absolute; top: 12px; right: 12px; font-size: 0.72rem; background: rgba(56, 139, 253, 0.2); border: 1px solid #58a6ff; color: #58a6ff; padding: 3px 8px; border-radius: 20px; font-weight: bold;"><i class="fa-solid fa-check"></i> أنجز مهمته</span>`;
             iconColor = '#58a6ff';
-            statusSubtext = `<div style="font-size: 0.78rem; color: #a5d6ff; margin-top: 8px;"><i class="fa-solid fa-circle-check"></i> أتم مخرجات ${agent.department}</div>`;
+            statusSubtext = `<div style="font-size: 0.78rem; color: #a5d6ff; margin-top: 8px;"><i class="fa-solid fa-circle-check"></i> أتم مخرجات ${safeDept}</div>`;
         } else {
             badgeHtml = `<span style="position: absolute; top: 12px; right: 12px; font-size: 0.72rem; background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255,255,255,0.1); color: #8b949e; padding: 3px 8px; border-radius: 20px; font-weight: 500;">⚪ وضع الاستعداد</span>`;
             iconColor = 'var(--text-muted)';
@@ -752,8 +858,8 @@ function renderAgentsList() {
             <div style="font-size: 2.2rem; margin-top: 10px; margin-bottom: 12px; color: ${iconColor};">
                 <i class="fa-solid fa-user-gear"></i>
             </div>
-            <h4 style="margin-bottom: 6px; font-size: 1rem; color: #fff; font-weight: 700;">${agent.name}</h4>
-            <span style="font-size: 0.75rem; background: rgba(88,166,255,0.12); color: var(--accent-blue); padding: 3px 10px; border-radius: 10px; display: inline-block;">${agent.department}</span>
+            <h4 style="margin-bottom: 6px; font-size: 1rem; color: #fff; font-weight: 700;">${safeName}</h4>
+            <span style="font-size: 0.75rem; background: rgba(88,166,255,0.12); color: var(--accent-blue); padding: 3px 10px; border-radius: 10px; display: inline-block;">${safeDept}</span>
             ${statusSubtext}
         `;
         list.appendChild(card);
@@ -784,19 +890,24 @@ function updateBudgetUI(budget) {
         limitEl.textContent = '$' + remaining.toFixed(2);
     }
     
-    // Render transactions table
     const tableBody = document.getElementById('budget-transactions');
     if (tableBody && budget.transactions && budget.transactions.length > 0) {
         tableBody.innerHTML = '';
         budget.transactions.forEach(tx => {
             const tr = document.createElement('tr');
             tr.style.cssText = 'border-bottom: 1px solid rgba(255,255,255,0.05);';
+            const safeTime = escapeHtml(tx.time);
+            const safeTask = escapeHtml(tx.task);
+            const safeAgent = escapeHtml(tx.agent);
+            const safeDept = escapeHtml(tx.department);
+            const safeSource = escapeHtml(tx.source || 'estimated');
+            
             tr.innerHTML = `
-                <td style="padding: 12px 10px; font-size: 0.85rem; color: var(--text-muted);">${tx.time}</td>
-                <td style="padding: 12px 10px; font-weight: 500; color: #fff;">${tx.task}</td>
-                <td style="padding: 12px 10px; color: var(--accent-blue);"><i class="fa-solid fa-robot"></i> ${tx.agent}</td>
-                <td style="padding: 12px 10px;"><span style="font-size: 0.8rem; background: rgba(255,255,255,0.08); padding: 3px 8px; border-radius: 6px;">${tx.department}</span></td>
-                <td style="padding: 12px 10px; font-weight: bold; color: #e6edf3;">${(tx.tokens || 0).toLocaleString()}</td>
+                <td style="padding: 12px 10px; font-size: 0.85rem; color: var(--text-muted);">${safeTime}</td>
+                <td style="padding: 12px 10px; font-weight: 500; color: #fff;">${safeTask}</td>
+                <td style="padding: 12px 10px; color: var(--accent-blue);"><i class="fa-solid fa-robot"></i> ${safeAgent}</td>
+                <td style="padding: 12px 10px;"><span style="font-size: 0.8rem; background: rgba(255,255,255,0.08); padding: 3px 8px; border-radius: 6px;">${safeDept}</span></td>
+                <td style="padding: 12px 10px; font-weight: bold; color: #e6edf3;">${(tx.tokens || 0).toLocaleString()} <span style="font-size: 0.7rem; color: #8b949e;">(${safeSource})</span></td>
                 <td style="padding: 12px 10px; font-weight: bold; color: #3fb950;">$${(tx.cost || 0).toFixed(4)}</td>
             `;
             tableBody.appendChild(tr);

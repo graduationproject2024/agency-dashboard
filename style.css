@@ -354,6 +354,8 @@ textarea {
 .text-green { color: var(--accent-green); }
 .text-blue { color: var(--accent-blue); }
 .text-gray { color: var(--text-muted); }
+.text-red { color: var(--accent-red); }
+.dept-item.failed-dept { border-color: rgba(248, 81, 73, 0.4); background: rgba(248, 81, 73, 0.08); }
 
 .dept-item .btn-sm {
     background: rgba(255, 255, 255, 0.05);

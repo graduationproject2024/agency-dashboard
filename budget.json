@@ -1,8 +1,228 @@
 {
-  "tokens_used": 418534,
-  "estimated_cost": 0.0629,
+  "tokens_used": 448534,
+  "estimated_cost": 0.0679,
   "budget_limit": 50.0,
   "transactions": [
+    {
+      "id": 1791739831585,
+      "time": "2026-10-11 20:30:31",
+      "agent": "Worker",
+      "department": "DEV",
+      "task": "Concurrent Test",
+      "tokens": 500,
+      "cost": 0.0001,
+      "source": "estimated"
+    },
+    {
+      "id": 1791739831575,
+      "time": "2026-10-11 20:30:31",
+      "agent": "Worker",
+      "department": "DEV",
+      "task": "Concurrent Test",
+      "tokens": 500,
+      "cost": 0.0001,
+      "source": "estimated"
+    },
+    {
+      "id": 1791739831567,
+      "time": "2026-10-11 20:30:31",
+      "agent": "Worker",
+      "department": "DEV",
+      "task": "Concurrent Test",
+      "tokens": 500,
+      "cost": 0.0001,
+      "source": "estimated"
+    },
+    {
+      "id": 1791739831560,
+      "time": "2026-10-11 20:30:31",
+      "agent": "Worker",
+      "department": "DEV",
+      "task": "Concurrent Test",
+      "tokens": 500,
+      "cost": 0.0001,
+      "source": "estimated"
+    },
+    {
+      "id": 1791739831550,
+      "time": "2026-10-11 20:30:31",
+      "agent": "Worker",
+      "department": "DEV",
+      "task": "Concurrent Test",
+      "tokens": 500,
+      "cost": 0.0001,
+      "source": "estimated"
+    },
+    {
+      "id": 1791739831544,
+      "time": "2026-10-11 20:30:31",
+      "agent": "Worker",
+      "department": "DEV",
+      "task": "Concurrent Test",
+      "tokens": 500,
+      "cost": 0.0001,
+      "source": "estimated"
+    },
+    {
+      "id": 1791739831536,
+      "time": "2026-10-11 20:30:31",
+      "agent": "Worker",
+      "department": "DEV",
+      "task": "Concurrent Test",
+      "tokens": 500,
+      "cost": 0.0001,
+      "source": "estimated"
+    },
+    {
+      "id": 1791739831528,
+      "time": "2026-10-11 20:30:31",
+      "agent": "Worker",
+      "department": "DEV",
+      "task": "Concurrent Test",
+      "tokens": 500,
+      "cost": 0.0001,
+      "source": "estimated"
+    },
+    {
+      "id": 1791739831520,
+      "time": "2026-10-11 20:30:31",
+      "agent": "Worker",
+      "department": "DEV",
+      "task": "Concurrent Test",
+      "tokens": 500,
+      "cost": 0.0001,
+      "source": "estimated"
+    },
+    {
+      "id": 1791739831512,
+      "time": "2026-10-11 20:30:31",
+      "agent": "Worker",
+      "department": "DEV",
+      "task": "Concurrent Test",
+      "tokens": 500,
+      "cost": 0.0001,
+      "source": "estimated"
+    },
+    {
+      "id": 1791739831502,
+      "time": "2026-10-11 20:30:31",
+      "agent": "اختبار الوكيل",
+      "department": "البرمجة",
+      "task": "مهمة اختبار",
+      "tokens": 10000,
+      "cost": 0.0015,
+      "source": "provider_reported"
+    },
+    {
+      "id": 1791739783135,
+      "time": "2026-10-11 20:29:43",
+      "agent": "Worker",
+      "department": "DEV",
+      "task": "Concurrent Test",
+      "tokens": 500,
+      "cost": 0.0001,
+      "source": "estimated"
+    },
+    {
+      "id": 1791739783126,
+      "time": "2026-10-11 20:29:43",
+      "agent": "Worker",
+      "department": "DEV",
+      "task": "Concurrent Test",
+      "tokens": 500,
+      "cost": 0.0001,
+      "source": "estimated"
+    },
+    {
+      "id": 1791739783119,
+      "time": "2026-10-11 20:29:43",
+      "agent": "Worker",
+      "department": "DEV",
+      "task": "Concurrent Test",
+      "tokens": 500,
+      "cost": 0.0001,
+      "source": "estimated"
+    },
+    {
+      "id": 1791739783112,
+      "time": "2026-10-11 20:29:43",
+      "agent": "Worker",
+      "department": "DEV",
+      "task": "Concurrent Test",
+      "tokens": 500,
+      "cost": 0.0001,
+      "source": "estimated"
+    },
+    {
+      "id": 1791739783104,
+      "time": "2026-10-11 20:29:43",
+      "agent": "Worker",
+      "department": "DEV",
+      "task": "Concurrent Test",
+      "tokens": 500,
+      "cost": 0.0001,
+      "source": "estimated"
+    },
+    {
+      "id": 1791739783095,
+      "time": "2026-10-11 20:29:43",
+      "agent": "Worker",
+      "department": "DEV",
+      "task": "Concurrent Test",
+      "tokens": 500,
+      "cost": 0.0001,
+      "source": "estimated"
+    },
+    {
+      "id": 1791739783075,
+      "time": "2026-10-11 20:29:43",
+      "agent": "Worker",
+      "department": "DEV",
+      "task": "Concurrent Test",
+      "tokens": 500,
+      "cost": 0.0001,
+      "source": "estimated"
+    },
+    {
+      "id": 1791739783056,
+      "time": "2026-10-11 20:29:43",
+      "agent": "Worker",
+      "department": "DEV",
+      "task": "Concurrent Test",
+      "tokens": 500,
+      "cost": 0.0001,
+      "source": "estimated"
+    },
+    {
+      "id": 1791739783056,
+      "time": "2026-10-11 20:29:43",
+      "agent": "Worker",
+      "department": "DEV",
+      "task": "Concurrent Test",
+      "tokens": 500,
+      "cost": 0.0001,
+      "source": "estimated"
+    },
+    {
+      "id": 1791739783052,
+      "time": "2026-10-11 20:29:43",
+      "agent": "Worker",
+      "department": "DEV",
+      "task": "Concurrent Test",
+      "tokens": 500,
+      "cost": 0.0001,
+      "source": "estimated"
+    },
+    {
+      "id": 1791739783042,
+      "time": "2026-10-11 20:29:43",
+      "agent": "اختبار الوكيل",
+      "department": "البرمجة",
+      "task": "مهمة اختبار",
+      "tokens": 10000,
+      "cost": 0.0015,
+      "source": "provider_reported"
+    },
     {
       "id": 1791734316159,
       "time": "2026-10-11 18:58:36",
