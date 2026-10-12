@@ -126,7 +126,7 @@ def atomic_write_json(filepath, data):
     os.makedirs(dir_name, exist_ok=True)
     tmp_path = os.path.join(dir_name, f".{os.path.basename(filepath)}.{uuid.uuid4().hex}.tmp")
     try:
-        with open(tmp_path, 'w', encoding='utf-8') as f:
+        with open(tmp_path, 'w', encoding='utf-8', newline='') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
             f.flush()
             try:
@@ -146,13 +146,14 @@ def atomic_write_file(filepath, content, encoding="utf-8"):
     """
     Safely write arbitrary text content atomically via temporary file + atomic rename.
     Ensures that unexpected termination or write failures never leave a corrupted file.
+    Uses newline='' to preserve explicit byte encoding without platform newline translation.
     Cleans up temporary file upon error.
     """
     dir_name = os.path.dirname(os.path.abspath(filepath)) or '.'
     os.makedirs(dir_name, exist_ok=True)
     tmp_path = os.path.join(dir_name, f".{os.path.basename(filepath)}.{uuid.uuid4().hex}.tmp")
     try:
-        with open(tmp_path, 'w', encoding=encoding) as f:
+        with open(tmp_path, 'w', encoding=encoding, newline='') as f:
             f.write(content)
             f.flush()
             try:
@@ -1104,21 +1105,74 @@ def run_qa_checks(app_html, app_css="", app_js=""):
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
     }
 
+def _strip_html_comments(html):
+    """Remove HTML comments to prevent commented-out tags from satisfying detection."""
+    if not html:
+        return ""
+    return re.sub(r'<!--.*?-->', '', html, flags=re.DOTALL)
+
+
+def _has_valid_stylesheet_link(html):
+    """
+    Check if HTML contains an active, valid <link rel="stylesheet"> targeting the stylesheet.
+    Rejects:
+    - Commented-out references: <!-- <link ...> -->
+    - Other tags: <a href="style.css">, <div data-href="style.css">
+    - Similar filenames: not-style.css, old-style.css
+    - Non-stylesheet rel values: <link rel="preload" href="style.css">
+    """
+    stripped = _strip_html_comments(html)
+    valid_css_paths = {'style.css', './style.css', 'css/style.css', '/css/style.css', '/style.css'}
+
+    for tag_match in re.finditer(r'<link\b([^>]*?)/?>', stripped, re.IGNORECASE):
+        tag_attrs = tag_match.group(1)
+        rel_match = re.search(r'\brel\s*=\s*[\'"]?([^\'"\s>]+)', tag_attrs, re.IGNORECASE)
+        href_match = re.search(r'\bhref\s*=\s*[\'"]?([^\'"\s>]+)', tag_attrs, re.IGNORECASE)
+        if rel_match and href_match:
+            rel_val = rel_match.group(1).lower().strip('\'"')
+            if 'stylesheet' in rel_val:
+                href_raw = href_match.group(1).strip('\'"')
+                clean_href = href_raw.split('?')[0].split('#')[0].strip()
+                if clean_href in valid_css_paths:
+                    return True
+    return False
+
+
+def _has_valid_script_reference(html):
+    """
+    Check if HTML contains an active, valid <script src="..."> targeting the script.
+    Rejects:
+    - Commented-out references: <!-- <script src="script.js"></script> -->
+    - Other tags: <a href="script.js">, <img src="script.js">
+    - Similar filenames: not-script.js, old-script.js
+    """
+    stripped = _strip_html_comments(html)
+    valid_js_paths = {'script.js', './script.js', 'js/script.js', '/js/script.js', '/script.js'}
+
+    for tag_match in re.finditer(r'<script\b([^>]*?)>', stripped, re.IGNORECASE):
+        tag_attrs = tag_match.group(1)
+        src_match = re.search(r'\bsrc\s*=\s*[\'"]?([^\'"\s>]+)', tag_attrs, re.IGNORECASE)
+        if src_match:
+            src_raw = src_match.group(1).strip('\'"')
+            clean_src = src_raw.split('?')[0].split('#')[0].strip()
+            if clean_src in valid_js_paths:
+                return True
+    return False
+
+
 def inject_asset_links(html, css_content, js_content):
     """
     Inject CSS stylesheet and JS script links into HTML document.
     - Case-insensitive tag matching for </head> and </body> with optional whitespace.
-    - Idempotent: skips injection if link/script already present (regex matches attribute variations).
+    - Idempotent and precise: uses _has_valid_stylesheet_link and _has_valid_script_reference
+      to ensure active, non-commented, strictly matched asset references.
     - Preserves unrelated document content.
     """
     if not html:
         return html
 
-    lower = html.lower()
-
     # Inject CSS link if CSS exists and not already referenced
-    has_css_link = bool(re.search(r'href\s*=\s*[\'"][^\'"]*style\.css[\'"]', lower))
-    if css_content and not has_css_link:
+    if css_content and not _has_valid_stylesheet_link(html):
         head_end = re.search(r'</\s*head\s*>', html, re.IGNORECASE)
         if head_end:
             insert_pos = head_end.start()
@@ -1127,8 +1181,7 @@ def inject_asset_links(html, css_content, js_content):
             html = '<link rel="stylesheet" href="style.css">\n' + html
 
     # Inject JS script if JS exists and not already referenced
-    has_js_script = bool(re.search(r'src\s*=\s*[\'"][^\'"]*script\.js[\'"]', lower))
-    if js_content and not has_js_script:
+    if js_content and not _has_valid_script_reference(html):
         body_end = re.search(r'</\s*body\s*>', html, re.IGNORECASE)
         if body_end:
             insert_pos = body_end.start()
@@ -1286,11 +1339,14 @@ def continue_workflow(feedback=""):
         os.makedirs(os.path.join(app_dir, "js"), exist_ok=True)
         
         written_files = []
+        expected_artifacts = {}  # target_path -> expected_bytes
         # Track pre-existing files so rollback restores rather than deletes them
         pre_existing_backups = {}  # path -> backup_path
         try:
             def _stage_write_file(target_path, content, encoding="utf-8"):
-                """Write with pre-existing file backup for safe rollback."""
+                """Write with pre-existing file backup and expected bytes registration."""
+                content_bytes = content.encode(encoding)
+                expected_artifacts[target_path] = content_bytes
                 if os.path.exists(target_path):
                     bak = target_path + f".pre_{uuid.uuid4().hex[:8]}.bak"
                     import shutil
@@ -1300,7 +1356,10 @@ def continue_workflow(feedback=""):
                 written_files.append(target_path)
 
             def _stage_write_json(target_path, data):
-                """Write JSON with pre-existing file backup for safe rollback."""
+                """Write JSON with pre-existing file backup and expected bytes registration."""
+                content = json.dumps(data, indent=2, ensure_ascii=False)
+                content_bytes = content.encode("utf-8")
+                expected_artifacts[target_path] = content_bytes
                 if os.path.exists(target_path):
                     bak = target_path + f".pre_{uuid.uuid4().hex[:8]}.bak"
                     import shutil
@@ -1341,19 +1400,20 @@ def continue_workflow(feedback=""):
             qa_json_path = os.path.join(app_dir, "qa_report.json")
             _stage_write_json(qa_json_path, qa_report)
 
-            # Post-write verification: every required output exists, is non-empty,
-            # and HTML content matches the validated candidate exactly
-            for fpath in written_files:
-                if not os.path.exists(fpath) or os.path.getsize(fpath) == 0:
-                    raise IOError(f"Deliverable file verification failed: {os.path.basename(fpath)} is missing or empty")
-
-            # Identity check: persisted HTML must match the QA-validated candidate
-            with open(html_path, 'r', encoding='utf-8') as f:
-                persisted_html = f.read()
-            if persisted_html != validated_html:
-                raise IOError("Persisted HTML artifact does not match the QA-validated candidate")
+            # Post-write verification: every published deliverable (including duplicate copies)
+            # exists, is non-empty, and is byte-for-byte identical to the validated candidate.
+            for fpath, expected_bytes in expected_artifacts.items():
+                if not os.path.exists(fpath):
+                    raise IOError(f"Deliverable file verification failed: {os.path.basename(fpath)} is missing")
+                if os.path.getsize(fpath) == 0:
+                    raise IOError(f"Deliverable file verification failed: {os.path.basename(fpath)} is empty")
+                with open(fpath, 'rb') as f:
+                    persisted_bytes = f.read()
+                if persisted_bytes != expected_bytes:
+                    raise IOError(f"Persisted artifact {os.path.basename(fpath)} does not match the QA-validated candidate (byte mismatch)")
 
         except Exception as persist_err:
+            rollback_failures = []
             # Rollback: restore pre-existing files, delete newly created files
             for fpath in written_files:
                 try:
@@ -1362,8 +1422,8 @@ def continue_workflow(feedback=""):
                         os.replace(pre_existing_backups[fpath], fpath)
                     elif os.path.exists(fpath):
                         os.remove(fpath)
-                except OSError:
-                    pass
+                except Exception as rb_err:
+                    rollback_failures.append(f"Failed to rollback {os.path.basename(fpath)}: {rb_err}")
             # Clean up any remaining backup files
             for bak_path in pre_existing_backups.values():
                 try:
@@ -1371,6 +1431,8 @@ def continue_workflow(feedback=""):
                         os.remove(bak_path)
                 except OSError:
                     pass
+            if rollback_failures:
+                raise IOError(f"Persistence error: {persist_err}; Rollback errors: {'; '.join(rollback_failures)}") from persist_err
             raise persist_err
 
         # Clean up backup files on success

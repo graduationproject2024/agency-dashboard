@@ -436,3 +436,478 @@ def test_workflow_validates_and_persists_html_with_injected_assets(tmp_path, moc
         persisted_content = f.read()
 
     assert persisted_content == validated_html
+
+
+def test_persisted_css_primary_identity_mismatch_triggers_rollback(tmp_path, mock_agent_responses, monkeypatch):
+    """
+    Workstream A & C: Proves that altering primary style.css post-write causes
+    byte-identity verification failure and triggers rollback.
+    """
+    test_gen_dir = str(tmp_path / "generated_apps")
+    os.makedirs(test_gen_dir, exist_ok=True)
+    monkeypatch.setattr("app.GENERATED_APPS_DIR", test_gen_dir)
+
+    task_name = "فحص تماثل ملف السي إس إس الرئيسي"
+    with state_lock:
+        workflow_state["status"] = "running"
+        workflow_state["current_task"] = task_name
+        workflow_state["outputs"] = {"strategy": "test", "product": "test"}
+        workflow_state["blockers"] = []
+
+    def fake_call_agent(agent_file, role_name, short_name, *args, **kwargs):
+        if short_name == "DEV":
+            return mock_agent_responses["development"]
+        return "مخرج تجريبي"
+
+    from app import atomic_write_file
+    real_atomic_write = atomic_write_file
+
+    def tampered_atomic_write(filepath, content, encoding="utf-8"):
+        norm = os.path.normpath(filepath)
+        # Target primary style.css (not css/style.css)
+        if norm.endswith(os.path.normpath("style.css")) and "css" not in os.path.basename(os.path.dirname(norm)):
+            content = content + "\n/* unauthorized CSS corruption */"
+        return real_atomic_write(filepath, content, encoding)
+
+    with patch("app.call_agent", side_effect=fake_call_agent), \
+         patch("app.atomic_write_file", side_effect=tampered_atomic_write):
+        continue_workflow(feedback="معتمد")
+
+    with state_lock:
+        status = workflow_state["status"]
+        blockers = list(workflow_state["blockers"])
+
+    assert status == "failed"
+    assert any("Persisted artifact style.css does not match the QA-validated candidate" in b for b in blockers)
+
+    # Rollback must remove all newly written files
+    app_dir, _ = get_project_folder_name(task_name)
+    assert not os.path.exists(os.path.join(app_dir, "index.html"))
+    assert not os.path.exists(os.path.join(app_dir, "style.css"))
+
+
+def test_persisted_duplicate_css_identity_mismatch_triggers_rollback(tmp_path, mock_agent_responses, monkeypatch):
+    """
+    Workstream A & C: Proves that altering duplicate css/style.css post-write causes
+    byte-identity verification failure and triggers rollback.
+    """
+    test_gen_dir = str(tmp_path / "generated_apps")
+    os.makedirs(test_gen_dir, exist_ok=True)
+    monkeypatch.setattr("app.GENERATED_APPS_DIR", test_gen_dir)
+
+    task_name = "فحص تماثل ملف السي إس إس المكرر"
+    with state_lock:
+        workflow_state["status"] = "running"
+        workflow_state["current_task"] = task_name
+        workflow_state["outputs"] = {"strategy": "test", "product": "test"}
+        workflow_state["blockers"] = []
+
+    def fake_call_agent(agent_file, role_name, short_name, *args, **kwargs):
+        if short_name == "DEV":
+            return mock_agent_responses["development"]
+        return "مخرج تجريبي"
+
+    from app import atomic_write_file
+    real_atomic_write = atomic_write_file
+
+    def tampered_atomic_write(filepath, content, encoding="utf-8"):
+        norm = os.path.normpath(filepath)
+        # Target duplicate css/style.css
+        if norm.endswith(os.path.normpath("css/style.css")):
+            content = content + "\n/* duplicate CSS corruption */"
+        return real_atomic_write(filepath, content, encoding)
+
+    with patch("app.call_agent", side_effect=fake_call_agent), \
+         patch("app.atomic_write_file", side_effect=tampered_atomic_write):
+        continue_workflow(feedback="معتمد")
+
+    with state_lock:
+        status = workflow_state["status"]
+        blockers = list(workflow_state["blockers"])
+
+    assert status == "failed"
+    assert any("Persisted artifact style.css does not match the QA-validated candidate" in b for b in blockers)
+
+
+def test_persisted_js_primary_identity_mismatch_triggers_rollback(tmp_path, mock_agent_responses, monkeypatch):
+    """
+    Workstream A & C: Proves that altering primary script.js post-write causes
+    byte-identity verification failure and triggers rollback.
+    """
+    test_gen_dir = str(tmp_path / "generated_apps")
+    os.makedirs(test_gen_dir, exist_ok=True)
+    monkeypatch.setattr("app.GENERATED_APPS_DIR", test_gen_dir)
+
+    task_name = "فحص تماثل ملف الجافاسكريبت الرئيسي"
+    with state_lock:
+        workflow_state["status"] = "running"
+        workflow_state["current_task"] = task_name
+        workflow_state["outputs"] = {"strategy": "test", "product": "test"}
+        workflow_state["blockers"] = []
+
+    def fake_call_agent(agent_file, role_name, short_name, *args, **kwargs):
+        if short_name == "DEV":
+            return mock_agent_responses["development"]
+        return "مخرج تجريبي"
+
+    from app import atomic_write_file
+    real_atomic_write = atomic_write_file
+
+    def tampered_atomic_write(filepath, content, encoding="utf-8"):
+        norm = os.path.normpath(filepath)
+        if norm.endswith(os.path.normpath("script.js")) and "js" not in os.path.basename(os.path.dirname(norm)):
+            content = content + "\n// unauthorized JS corruption"
+        return real_atomic_write(filepath, content, encoding)
+
+    with patch("app.call_agent", side_effect=fake_call_agent), \
+         patch("app.atomic_write_file", side_effect=tampered_atomic_write):
+        continue_workflow(feedback="معتمد")
+
+    with state_lock:
+        status = workflow_state["status"]
+        blockers = list(workflow_state["blockers"])
+
+    assert status == "failed"
+    assert any("Persisted artifact script.js does not match the QA-validated candidate" in b for b in blockers)
+
+
+def test_persisted_duplicate_js_identity_mismatch_triggers_rollback(tmp_path, mock_agent_responses, monkeypatch):
+    """
+    Workstream A & C: Proves that altering duplicate js/script.js post-write causes
+    byte-identity verification failure and triggers rollback.
+    """
+    test_gen_dir = str(tmp_path / "generated_apps")
+    os.makedirs(test_gen_dir, exist_ok=True)
+    monkeypatch.setattr("app.GENERATED_APPS_DIR", test_gen_dir)
+
+    task_name = "فحص تماثل ملف الجافاسكريبت المكرر"
+    with state_lock:
+        workflow_state["status"] = "running"
+        workflow_state["current_task"] = task_name
+        workflow_state["outputs"] = {"strategy": "test", "product": "test"}
+        workflow_state["blockers"] = []
+
+    def fake_call_agent(agent_file, role_name, short_name, *args, **kwargs):
+        if short_name == "DEV":
+            return mock_agent_responses["development"]
+        return "مخرج تجريبي"
+
+    from app import atomic_write_file
+    real_atomic_write = atomic_write_file
+
+    def tampered_atomic_write(filepath, content, encoding="utf-8"):
+        norm = os.path.normpath(filepath)
+        if norm.endswith(os.path.normpath("js/script.js")):
+            content = content + "\n// duplicate JS corruption"
+        return real_atomic_write(filepath, content, encoding)
+
+    with patch("app.call_agent", side_effect=fake_call_agent), \
+         patch("app.atomic_write_file", side_effect=tampered_atomic_write):
+        continue_workflow(feedback="معتمد")
+
+    with state_lock:
+        status = workflow_state["status"]
+        blockers = list(workflow_state["blockers"])
+
+    assert status == "failed"
+    assert any("Persisted artifact script.js does not match the QA-validated candidate" in b for b in blockers)
+
+
+def test_missing_deliverable_post_write_triggers_rollback(tmp_path, mock_agent_responses, monkeypatch):
+    """
+    Workstream A & C: Proves that if a deliverable file is missing post-write,
+    verification fails and triggers rollback.
+    """
+    test_gen_dir = str(tmp_path / "generated_apps")
+    os.makedirs(test_gen_dir, exist_ok=True)
+    monkeypatch.setattr("app.GENERATED_APPS_DIR", test_gen_dir)
+
+    task_name = "فحص غياب ملف مخرج"
+    with state_lock:
+        workflow_state["status"] = "running"
+        workflow_state["current_task"] = task_name
+        workflow_state["outputs"] = {"strategy": "test", "product": "test"}
+        workflow_state["blockers"] = []
+
+    def fake_call_agent(agent_file, role_name, short_name, *args, **kwargs):
+        if short_name == "DEV":
+            return mock_agent_responses["development"]
+        return "مخرج تجريبي"
+
+    from app import atomic_write_file
+    real_atomic_write = atomic_write_file
+
+    def deleting_atomic_write(filepath, content, encoding="utf-8"):
+        res = real_atomic_write(filepath, content, encoding)
+        norm = os.path.normpath(filepath)
+        # Delete primary style.css right after writing
+        if norm.endswith(os.path.normpath("style.css")) and "css" not in os.path.basename(os.path.dirname(norm)):
+            os.remove(filepath)
+        return res
+
+    with patch("app.call_agent", side_effect=fake_call_agent), \
+         patch("app.atomic_write_file", side_effect=deleting_atomic_write):
+        continue_workflow(feedback="معتمد")
+
+    with state_lock:
+        status = workflow_state["status"]
+        blockers = list(workflow_state["blockers"])
+
+    assert status == "failed"
+    assert any("Deliverable file verification failed: style.css is missing" in b for b in blockers)
+
+
+def test_empty_deliverable_post_write_triggers_rollback(tmp_path, mock_agent_responses, monkeypatch):
+    """
+    Workstream A & C: Proves that if a deliverable file is empty post-write,
+    verification fails and triggers rollback.
+    """
+    test_gen_dir = str(tmp_path / "generated_apps")
+    os.makedirs(test_gen_dir, exist_ok=True)
+    monkeypatch.setattr("app.GENERATED_APPS_DIR", test_gen_dir)
+
+    task_name = "فحص ملف مخرج فارغ"
+    with state_lock:
+        workflow_state["status"] = "running"
+        workflow_state["current_task"] = task_name
+        workflow_state["outputs"] = {"strategy": "test", "product": "test"}
+        workflow_state["blockers"] = []
+
+    def fake_call_agent(agent_file, role_name, short_name, *args, **kwargs):
+        if short_name == "DEV":
+            return mock_agent_responses["development"]
+        return "مخرج تجريبي"
+
+    from app import atomic_write_file
+    real_atomic_write = atomic_write_file
+
+    def empty_atomic_write(filepath, content, encoding="utf-8"):
+        norm = os.path.normpath(filepath)
+        if norm.endswith(os.path.normpath("script.js")) and "js" not in os.path.basename(os.path.dirname(norm)):
+            content = ""
+        return real_atomic_write(filepath, content, encoding)
+
+    with patch("app.call_agent", side_effect=fake_call_agent), \
+         patch("app.atomic_write_file", side_effect=empty_atomic_write):
+        continue_workflow(feedback="معتمد")
+
+    with state_lock:
+        status = workflow_state["status"]
+        blockers = list(workflow_state["blockers"])
+
+    assert status == "failed"
+    assert any("Deliverable file verification failed: script.js is empty" in b for b in blockers)
+
+
+def test_failure_during_duplicate_asset_write_triggers_rollback(tmp_path, mock_agent_responses, monkeypatch):
+    """
+    Workstream C: Proves that if writing a duplicate asset copy (css/style.css) fails midway,
+    rollback cleanly deletes earlier staged files (index.html, primary style.css).
+    """
+    test_gen_dir = str(tmp_path / "generated_apps")
+    os.makedirs(test_gen_dir, exist_ok=True)
+    monkeypatch.setattr("app.GENERATED_APPS_DIR", test_gen_dir)
+
+    task_name = "فشل أثناء كتابة النسخة المكررة"
+    app_dir, _ = get_project_folder_name(task_name)
+
+    with state_lock:
+        workflow_state["status"] = "running"
+        workflow_state["current_task"] = task_name
+        workflow_state["outputs"] = {"strategy": "test", "product": "test"}
+        workflow_state["blockers"] = []
+
+    def fake_call_agent(agent_file, role_name, short_name, *args, **kwargs):
+        if short_name == "DEV":
+            return mock_agent_responses["development"]
+        return "مخرج تجريبي"
+
+    from app import atomic_write_file
+    real_atomic_write = atomic_write_file
+
+    def failing_duplicate_write(filepath, content, encoding="utf-8"):
+        norm = os.path.normpath(filepath)
+        if norm.endswith(os.path.normpath("css/style.css")):
+            raise IOError("Simulated disk error during duplicate CSS write")
+        return real_atomic_write(filepath, content, encoding)
+
+    with patch("app.call_agent", side_effect=fake_call_agent), \
+         patch("app.atomic_write_file", side_effect=failing_duplicate_write):
+        continue_workflow(feedback="معتمد")
+
+    with state_lock:
+        status = workflow_state["status"]
+        blockers = list(workflow_state["blockers"])
+
+    assert status == "failed"
+    assert any("Simulated disk error during duplicate CSS write" in b for b in blockers)
+
+    # Rollback must have removed earlier written index.html and style.css
+    assert not os.path.exists(os.path.join(app_dir, "index.html")), "index.html was not rolled back!"
+    assert not os.path.exists(os.path.join(app_dir, "style.css")), "primary style.css was not rolled back!"
+
+
+def test_rollback_surfaces_restoration_failure_honestly(tmp_path, mock_agent_responses, monkeypatch):
+    """
+    Workstream C: Proves that if restoring a pre-existing file fails during rollback,
+    the rollback failure is explicitly captured and reported in workflow blockers,
+    never swallowed or disguised as success.
+    """
+    test_gen_dir = str(tmp_path / "generated_apps")
+    os.makedirs(test_gen_dir, exist_ok=True)
+    monkeypatch.setattr("app.GENERATED_APPS_DIR", test_gen_dir)
+
+    task_name = "فحص شفافية فشل الاسترجاع"
+    app_dir, _ = get_project_folder_name(task_name)
+    os.makedirs(app_dir, exist_ok=True)
+
+    # Create pre-existing index.html
+    pre_existing_file = os.path.join(app_dir, "index.html")
+    with open(pre_existing_file, "w", encoding="utf-8") as f:
+        f.write("<!-- original pre-existing -->")
+
+    with state_lock:
+        workflow_state["status"] = "running"
+        workflow_state["current_task"] = task_name
+        workflow_state["outputs"] = {"strategy": "test", "product": "test"}
+        workflow_state["blockers"] = []
+
+    def fake_call_agent(agent_file, role_name, short_name, *args, **kwargs):
+        if short_name == "DEV":
+            return mock_agent_responses["development"]
+        return "مخرج تجريبي"
+
+    # Trigger a write failure on plan.md, and simultaneously simulate os.replace failure in rollback
+    from app import atomic_write_file
+    real_atomic_write = atomic_write_file
+    real_os_replace = os.replace
+
+    def failing_write_file(filepath, content, encoding="utf-8"):
+        if filepath.endswith("plan.md"):
+            raise IOError("Simulated failure writing plan.md")
+        return real_atomic_write(filepath, content, encoding)
+
+    def failing_os_replace(src, dst):
+        if src.endswith(".bak") and dst.endswith("index.html"):
+            raise PermissionError("Access denied restoring pre-existing index.html")
+        return real_os_replace(src, dst)
+
+    with patch("app.call_agent", side_effect=fake_call_agent), \
+         patch("app.get_project_folder_name", return_value=(app_dir, "clean_folder")), \
+         patch("app.atomic_write_file", side_effect=failing_write_file), \
+         patch("os.replace", side_effect=failing_os_replace):
+        continue_workflow(feedback="معتمد")
+
+    with state_lock:
+        status = workflow_state["status"]
+        blockers = list(workflow_state["blockers"])
+
+    assert status == "failed"
+    # Verify rollback error is surfaced honestly
+    assert any("Rollback errors: Failed to rollback index.html" in b for b in blockers)
+
+
+def test_rollback_surfaces_cleanup_failure_honestly(tmp_path, mock_agent_responses, monkeypatch):
+    """
+    Workstream C: Proves that if cleaning up a newly created file fails during rollback,
+    the rollback failure is explicitly captured and reported in workflow blockers.
+    """
+    test_gen_dir = str(tmp_path / "generated_apps")
+    os.makedirs(test_gen_dir, exist_ok=True)
+    monkeypatch.setattr("app.GENERATED_APPS_DIR", test_gen_dir)
+
+    task_name = "فحص شفافية فشل التنظيف"
+    with state_lock:
+        workflow_state["status"] = "running"
+        workflow_state["current_task"] = task_name
+        workflow_state["outputs"] = {"strategy": "test", "product": "test"}
+        workflow_state["blockers"] = []
+
+    def fake_call_agent(agent_file, role_name, short_name, *args, **kwargs):
+        if short_name == "DEV":
+            return mock_agent_responses["development"]
+        return "مخرج تجريبي"
+
+    from app import atomic_write_file
+    real_atomic_write = atomic_write_file
+    real_os_remove = os.remove
+
+    def failing_write_file(filepath, content, encoding="utf-8"):
+        if filepath.endswith("plan.md"):
+            raise IOError("Simulated failure writing plan.md")
+        return real_atomic_write(filepath, content, encoding)
+
+    def failing_os_remove(path):
+        if path.endswith("index.html"):
+            raise PermissionError("Permission denied removing index.html")
+        return real_os_remove(path)
+
+    with patch("app.call_agent", side_effect=fake_call_agent), \
+         patch("app.atomic_write_file", side_effect=failing_write_file), \
+         patch("os.remove", side_effect=failing_os_remove):
+        continue_workflow(feedback="معتمد")
+
+    with state_lock:
+        status = workflow_state["status"]
+        blockers = list(workflow_state["blockers"])
+
+    assert status == "failed"
+    assert any("Rollback errors: Failed to rollback index.html" in b for b in blockers)
+
+
+def test_all_published_deliverables_byte_identical_across_primary_and_duplicates(tmp_path, mock_agent_responses, monkeypatch):
+    """
+    Workstream A: Proves that in a normal successful run, every published file
+    (index.html, primary & duplicate CSS, primary & duplicate JS, plan.md, qa_report.json)
+    is byte-for-byte identical to the exact approved artifact.
+    """
+    test_gen_dir = str(tmp_path / "generated_apps")
+    os.makedirs(test_gen_dir, exist_ok=True)
+    monkeypatch.setattr("app.GENERATED_APPS_DIR", test_gen_dir)
+
+    task_name = "فحص التطابق البايتي الشامل لجميع المخرجات"
+    with state_lock:
+        workflow_state["status"] = "running"
+        workflow_state["current_task"] = task_name
+        workflow_state["outputs"] = {"strategy": "استراتيجية", "product": "متطلبات"}
+        workflow_state["blockers"] = []
+
+    def fake_call_agent(agent_file, role_name, short_name, *args, **kwargs):
+        if short_name == "DEV":
+            return mock_agent_responses["development"]
+        return "مخرج تجريبي"
+
+    with patch("app.call_agent", side_effect=fake_call_agent):
+        continue_workflow(feedback="معتمد")
+
+    with state_lock:
+        status = workflow_state["status"]
+
+    assert status == "completed"
+
+    created_folders = [f for f in os.listdir(test_gen_dir) if os.path.isdir(os.path.join(test_gen_dir, f))]
+    assert len(created_folders) >= 1
+    app_dir = os.path.join(test_gen_dir, created_folders[0])
+
+    # 1. CSS primary and duplicate must be byte-for-byte identical
+    with open(os.path.join(app_dir, "style.css"), "rb") as f:
+        primary_css = f.read()
+    with open(os.path.join(app_dir, "css", "style.css"), "rb") as f:
+        dup_css = f.read()
+    assert primary_css == dup_css
+    assert len(primary_css) > 0
+
+    # 2. JS primary and duplicate must be byte-for-byte identical
+    with open(os.path.join(app_dir, "script.js"), "rb") as f:
+        primary_js = f.read()
+    with open(os.path.join(app_dir, "js", "script.js"), "rb") as f:
+        dup_js = f.read()
+    assert primary_js == dup_js
+    assert len(primary_js) > 0
+
+    # 3. HTML must exist and be non-empty
+    with open(os.path.join(app_dir, "index.html"), "rb") as f:
+        html_bytes = f.read()
+    assert len(html_bytes) > 0
+    assert b'<link rel="stylesheet" href="style.css">' in html_bytes
+    assert b'<script src="script.js"></script>' in html_bytes

@@ -532,3 +532,86 @@ def test_css_validation_comprehensive_cases():
     # 6. Verify end-to-end in run_qa_checks
     qa_res = run_qa_checks(valid_html, media_css, valid_js)
     assert qa_res["passed"] is True
+
+
+def test_asset_link_detection_adversarial_and_safe_cases():
+    """
+    Workstream B: Regression tests covering exact asset-link detection requirements:
+    1. Correct relative stylesheet & script references (style.css, ./style.css, css/style.css, script.js, ./script.js, js/script.js).
+    2. Single- and double-quoted attributes.
+    3. Repeated injection remaining idempotent.
+    4. Adversarial filenames: not-style.css and not-script.js must NOT satisfy detection.
+    5. References inside HTML comments must NOT satisfy detection.
+    6. References in unrelated tags (<a href="style.css">, <img src="script.js">, <div data-file="style.css">) must NOT satisfy detection.
+    7. Non-stylesheet link tags (<link rel="preload" href="style.css">) must NOT satisfy detection.
+    """
+    from app import inject_asset_links, _has_valid_stylesheet_link, _has_valid_script_reference
+
+    css_content = "body { color: black; }"
+    js_content = "console.log('init');"
+
+    # 1. Adversarial CSS bypass attempts that MUST trigger injection
+    adversarial_css_htmls = [
+        # Similar filename not-style.css
+        '<!DOCTYPE html><html><head><link rel="stylesheet" href="not-style.css"></head><body></body></html>',
+        # Similar filename old-style.css
+        '<!DOCTYPE html><html><head><link rel="stylesheet" href="old-style.css"></head><body></body></html>',
+        # Commented out link
+        '<!DOCTYPE html><html><head><!-- <link rel="stylesheet" href="style.css"> --></head><body></body></html>',
+        # Unrelated <a> tag
+        '<!DOCTYPE html><html><head></head><body><a href="style.css">Download CSS</a></body></html>',
+        # Unrelated <div data-file="..."> tag
+        '<!DOCTYPE html><html><head></head><body><div data-file="style.css">Block</div></body></html>',
+        # Non-stylesheet link (preload)
+        '<!DOCTYPE html><html><head><link rel="preload" href="style.css" as="style"></head><body></body></html>',
+    ]
+
+    for adv_html in adversarial_css_htmls:
+        assert not _has_valid_stylesheet_link(adv_html), f"Falsely accepted adversarial CSS reference in: {adv_html}"
+        res = inject_asset_links(adv_html, css_content, "")
+        assert '<link rel="stylesheet" href="style.css">' in res, f"Failed to inject required stylesheet into: {adv_html}"
+
+    # 2. Adversarial JS bypass attempts that MUST trigger injection
+    adversarial_js_htmls = [
+        # Similar filename not-script.js
+        '<!DOCTYPE html><html><head></head><body><script src="not-script.js"></script></body></html>',
+        # Similar filename old-script.js
+        '<!DOCTYPE html><html><head></head><body><script src="old-script.js"></script></body></html>',
+        # Commented out script
+        '<!DOCTYPE html><html><head></head><body><!-- <script src="script.js"></script> --></body></html>',
+        # Unrelated <a> tag
+        '<!DOCTYPE html><html><head></head><body><a href="script.js">Download Script</a></body></html>',
+        # Unrelated <img> tag
+        '<!DOCTYPE html><html><head></head><body><img src="script.js" alt="Fake"></body></html>',
+    ]
+
+    for adv_html in adversarial_js_htmls:
+        assert not _has_valid_script_reference(adv_html), f"Falsely accepted adversarial JS reference in: {adv_html}"
+        res = inject_asset_links(adv_html, "", js_content)
+        assert '<script src="script.js"></script>' in res, f"Failed to inject required script into: {adv_html}"
+
+    # 3. Legitimate references that MUST be recognized and NOT duplicated (idempotency)
+    legit_css_cases = [
+        '<link rel="stylesheet" href="style.css">',
+        '<link rel="stylesheet" href="./style.css">',
+        '<link rel="stylesheet" href="css/style.css">',
+        "<link rel='stylesheet' href='style.css'>",
+        '<link href="style.css" rel="stylesheet">',
+    ]
+    for legit in legit_css_cases:
+        doc = f"<!DOCTYPE html><html><head>{legit}</head><body></body></html>"
+        assert _has_valid_stylesheet_link(doc), f"Failed to recognize valid stylesheet: {legit}"
+        res = inject_asset_links(doc, css_content, "")
+        assert res.count("style.css") == 1, f"Duplicated CSS link for: {legit}"
+
+    legit_js_cases = [
+        '<script src="script.js"></script>',
+        '<script src="./script.js"></script>',
+        '<script src="js/script.js"></script>',
+        "<script src='script.js'></script>",
+    ]
+    for legit in legit_js_cases:
+        doc = f"<!DOCTYPE html><html><head></head><body>{legit}</body></html>"
+        assert _has_valid_script_reference(doc), f"Failed to recognize valid script: {legit}"
+        res = inject_asset_links(doc, "", js_content)
+        assert res.count("script.js") == 1, f"Duplicated script tag for: {legit}"
