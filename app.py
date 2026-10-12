@@ -169,6 +169,31 @@ def atomic_write_file(filepath, content, encoding="utf-8"):
                 pass
         raise
 
+def cleanup_backups(backups_dict, failed_restorations=None):
+    """
+    Safely clean up obsolete backup files (.bak) created during workflow staging.
+    CRITICAL SAFETY INVARIANT:
+    Never delete a backup file whose restoration failed, as it is the only surviving
+    copy of pre-existing user data.
+    Returns a list of cleanup error strings (if any).
+    """
+    failed = failed_restorations or {}
+    cleanup_errors = []
+    if not backups_dict:
+        return cleanup_errors
+
+    for fpath, bak_path in backups_dict.items():
+        if fpath in failed:
+            # Retain recovery backup - MUST NOT delete!
+            continue
+        try:
+            if os.path.exists(bak_path):
+                os.remove(bak_path)
+        except OSError as e:
+            cleanup_errors.append(f"Failed to clean up obsolete backup {os.path.basename(bak_path)}: {e}")
+
+    return cleanup_errors
+
 def discover_agents(agents_dir=None):
     """
     Discover available agent markdown definitions in target directory safely.
@@ -1347,26 +1372,28 @@ def continue_workflow(feedback=""):
                 """Write with pre-existing file backup and expected bytes registration."""
                 content_bytes = content.encode(encoding)
                 expected_artifacts[target_path] = content_bytes
-                if os.path.exists(target_path):
+                if target_path not in written_files:
+                    written_files.append(target_path)
+                if os.path.exists(target_path) and target_path not in pre_existing_backups:
                     bak = target_path + f".pre_{uuid.uuid4().hex[:8]}.bak"
                     import shutil
                     shutil.copy2(target_path, bak)
                     pre_existing_backups[target_path] = bak
                 atomic_write_file(target_path, content, encoding)
-                written_files.append(target_path)
 
             def _stage_write_json(target_path, data):
                 """Write JSON with pre-existing file backup and expected bytes registration."""
                 content = json.dumps(data, indent=2, ensure_ascii=False)
                 content_bytes = content.encode("utf-8")
                 expected_artifacts[target_path] = content_bytes
-                if os.path.exists(target_path):
+                if target_path not in written_files:
+                    written_files.append(target_path)
+                if os.path.exists(target_path) and target_path not in pre_existing_backups:
                     bak = target_path + f".pre_{uuid.uuid4().hex[:8]}.bak"
                     import shutil
                     shutil.copy2(target_path, bak)
                     pre_existing_backups[target_path] = bak
                 atomic_write_json(target_path, data)
-                written_files.append(target_path)
 
             # 1. index.html
             html_path = os.path.join(app_dir, "index.html")
@@ -1414,34 +1441,43 @@ def continue_workflow(feedback=""):
 
         except Exception as persist_err:
             rollback_failures = []
+            failed_restorations = {}
+
+            # Ensure all attempted writes and all backed-up files are processed during rollback
+            all_rollback_targets = list(written_files)
+            for p in pre_existing_backups:
+                if p not in all_rollback_targets:
+                    all_rollback_targets.append(p)
+
             # Rollback: restore pre-existing files, delete newly created files
-            for fpath in written_files:
+            for fpath in all_rollback_targets:
                 try:
                     if fpath in pre_existing_backups:
-                        # Restore the original file
-                        os.replace(pre_existing_backups[fpath], fpath)
+                        bak_path = pre_existing_backups[fpath]
+                        os.replace(bak_path, fpath)
                     elif os.path.exists(fpath):
                         os.remove(fpath)
                 except Exception as rb_err:
-                    rollback_failures.append(f"Failed to rollback {os.path.basename(fpath)}: {rb_err}")
-            # Clean up any remaining backup files
-            for bak_path in pre_existing_backups.values():
-                try:
-                    if os.path.exists(bak_path):
-                        os.remove(bak_path)
-                except OSError:
-                    pass
+                    if fpath in pre_existing_backups:
+                        bak_path = pre_existing_backups[fpath]
+                        failed_restorations[fpath] = (bak_path, str(rb_err))
+                        rollback_failures.append(
+                            f"Failed to rollback {os.path.basename(fpath)} (restoration failed, retained recovery backup at {bak_path}): {rb_err}"
+                        )
+                    else:
+                        rollback_failures.append(f"Failed to rollback {os.path.basename(fpath)}: {rb_err}")
+
+            # Clean up obsolete backups ONLY if restoration did not fail for that file.
+            # CRITICAL SAFETY INVARIANT: If restoration failed, the backup is the ONLY surviving copy of user data. NEVER delete it!
+            clean_errs = cleanup_backups(pre_existing_backups, failed_restorations)
+            rollback_failures.extend(clean_errs)
+
             if rollback_failures:
                 raise IOError(f"Persistence error: {persist_err}; Rollback errors: {'; '.join(rollback_failures)}") from persist_err
             raise persist_err
 
         # Clean up backup files on success
-        for bak_path in pre_existing_backups.values():
-            try:
-                if os.path.exists(bak_path):
-                    os.remove(bak_path)
-            except OSError:
-                pass
+        cleanup_backups(pre_existing_backups)
 
         add_feed("مدير المشروع", "Project Manager", "linear-gradient(135deg, #f6d365, #fda085)", "PM", f"تم اكتمال المشروع وتجاوز فحص الجودة بنجاح! 🚀 المجلد: `{clean_folder_name}`")
         
