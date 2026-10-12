@@ -179,3 +179,94 @@ def test_persistence_exception_results_in_honest_failed_state(tmp_path, mock_age
 
     assert status == "failed"
     assert any("Read-only filesystem simulated" in b for b in blockers)
+
+def test_persistence_failure_at_plan_md_cleans_up_and_fails_honestly(tmp_path, mock_agent_responses, monkeypatch):
+    """
+    Finding 4: Verify that if atomic write fails at an intermediate deliverable (plan.md),
+    all previously written files (index.html, style.css, script.js) are cleanly rolled back,
+    no partial deliverable remains, and the workflow transitions to 'failed'.
+    """
+    test_gen_dir = str(tmp_path / "generated_apps")
+    os.makedirs(test_gen_dir, exist_ok=True)
+    monkeypatch.setattr("app.GENERATED_APPS_DIR", test_gen_dir)
+
+    with state_lock:
+        workflow_state["status"] = "running"
+        workflow_state["current_task"] = "تطبيق فحص التراجع عند فشل التوثيق"
+        workflow_state["outputs"] = {"strategy": "test", "product": "test"}
+        workflow_state["blockers"] = []
+
+    def fake_call_agent(agent_file, role_name, short_name, *args, **kwargs):
+        if short_name == "DEV":
+            return mock_agent_responses["development"]
+        return "مخرج تجريبي"
+
+    from app import atomic_write_file
+    real_atomic_write_file = atomic_write_file
+
+    def mock_write_file(filepath, content, encoding="utf-8"):
+        if filepath.endswith("plan.md"):
+            raise IOError("Simulated disk error while persisting plan.md")
+        return real_atomic_write_file(filepath, content, encoding)
+
+    with patch("app.call_agent", side_effect=fake_call_agent), \
+         patch("app.atomic_write_file", side_effect=mock_write_file):
+        continue_workflow(feedback="معتمد")
+
+    with state_lock:
+        status = workflow_state["status"]
+        blockers = list(workflow_state["blockers"])
+
+    assert status == "failed"
+    assert any("Simulated disk error while persisting plan.md" in b for b in blockers)
+
+    # Check project directory: ensure partial index.html, style.css were cleaned up
+    created_folders = [f for f in os.listdir(test_gen_dir) if os.path.isdir(os.path.join(test_gen_dir, f))]
+    if created_folders:
+        app_dir = os.path.join(test_gen_dir, created_folders[0])
+        assert not os.path.exists(os.path.join(app_dir, "index.html")), "index.html was not cleaned up after persistence failure!"
+        assert not os.path.exists(os.path.join(app_dir, "style.css")), "style.css was not cleaned up after persistence failure!"
+        assert not os.path.exists(os.path.join(app_dir, "plan.md")), "plan.md was unexpectedly found!"
+
+def test_persistence_failure_at_qa_report_json_cleans_up_and_fails_honestly(tmp_path, mock_agent_responses, monkeypatch):
+    """
+    Finding 4: Verify that if atomic write fails at the final audit report (qa_report.json),
+    the workflow cleanly rolls back all deliverables and transitions to 'failed'.
+    """
+    test_gen_dir = str(tmp_path / "generated_apps")
+    os.makedirs(test_gen_dir, exist_ok=True)
+    monkeypatch.setattr("app.GENERATED_APPS_DIR", test_gen_dir)
+
+    with state_lock:
+        workflow_state["status"] = "running"
+        workflow_state["current_task"] = "تطبيق فحص فشل تقرير الجودة"
+        workflow_state["outputs"] = {"strategy": "test", "product": "test"}
+        workflow_state["blockers"] = []
+
+    def fake_call_agent(agent_file, role_name, short_name, *args, **kwargs):
+        if short_name == "DEV":
+            return mock_agent_responses["development"]
+        return "مخرج تجريبي"
+
+    def mock_write_json(filepath, data):
+        if filepath.endswith("qa_report.json"):
+            raise OSError("Permission denied simulated for qa_report.json")
+        from app import atomic_write_json
+        return atomic_write_json(filepath, data)
+
+    with patch("app.call_agent", side_effect=fake_call_agent), \
+         patch("app.atomic_write_json", side_effect=mock_write_json):
+        continue_workflow(feedback="معتمد")
+
+    with state_lock:
+        status = workflow_state["status"]
+        blockers = list(workflow_state["blockers"])
+
+    assert status == "failed"
+    assert any("Permission denied simulated for qa_report.json" in b for b in blockers)
+
+    created_folders = [f for f in os.listdir(test_gen_dir) if os.path.isdir(os.path.join(test_gen_dir, f))]
+    if created_folders:
+        app_dir = os.path.join(test_gen_dir, created_folders[0])
+        assert not os.path.exists(os.path.join(app_dir, "index.html")), "index.html was not cleaned up after json write failure!"
+        assert not os.path.exists(os.path.join(app_dir, "qa_report.json")), "qa_report.json was unexpectedly found!"

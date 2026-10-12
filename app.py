@@ -17,9 +17,23 @@ app = Flask(__name__, static_folder=None)
 
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_AGENTS_DIR = os.path.abspath(os.path.join(REPO_DIR, "..", "agency-agents"))
-AGENTS_DIR = os.environ.get('AGENTS_DIR') or (
-    DEFAULT_AGENTS_DIR if os.path.exists(DEFAULT_AGENTS_DIR) else os.path.abspath(os.path.join(REPO_DIR, "agency-agents"))
-)
+
+def get_agents_dir():
+    """
+    Resolve agents directory path dynamically at runtime.
+    Precedence:
+    1. AGENTS_DIR environment variable
+    2. Sibling directory '../agency-agents'
+    3. Nested directory './agency-agents'
+    """
+    env_path = os.environ.get('AGENTS_DIR')
+    if env_path:
+        return os.path.abspath(env_path)
+    if os.path.exists(DEFAULT_AGENTS_DIR):
+        return DEFAULT_AGENTS_DIR
+    return os.path.abspath(os.path.join(REPO_DIR, "agency-agents"))
+
+AGENTS_DIR = get_agents_dir()
 SETTINGS_FILE = 'settings.json'
 BUDGET_FILE = 'budget.json'
 GENERATED_APPS_DIR = os.path.abspath("generated_apps")
@@ -105,18 +119,53 @@ def atomic_write_json(filepath, data):
     """
     Safely write JSON file atomically via temporary file + atomic rename.
     Ensures that unexpected termination never leaves a corrupt or empty file.
+    Cleans up temporary file upon error.
     """
     dir_name = os.path.dirname(os.path.abspath(filepath)) or '.'
     os.makedirs(dir_name, exist_ok=True)
     tmp_path = os.path.join(dir_name, f".{os.path.basename(filepath)}.{uuid.uuid4().hex}.tmp")
-    with open(tmp_path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.flush()
-        try:
-            os.fsync(f.fileno())
-        except OSError:
-            pass
-    os.replace(tmp_path, filepath)
+    try:
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp_path, filepath)
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise
+
+def atomic_write_file(filepath, content, encoding="utf-8"):
+    """
+    Safely write arbitrary text content atomically via temporary file + atomic rename.
+    Ensures that unexpected termination or write failures never leave a corrupted file.
+    Cleans up temporary file upon error.
+    """
+    dir_name = os.path.dirname(os.path.abspath(filepath)) or '.'
+    os.makedirs(dir_name, exist_ok=True)
+    tmp_path = os.path.join(dir_name, f".{os.path.basename(filepath)}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(tmp_path, 'w', encoding=encoding) as f:
+            f.write(content)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp_path, filepath)
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise
 
 def discover_agents(agents_dir=None):
     """
@@ -124,7 +173,7 @@ def discover_agents(agents_dir=None):
     Distinguishes actual discovered count from missing/empty/error states.
     Never fabricates a count.
     """
-    target_dir = agents_dir or AGENTS_DIR
+    target_dir = agents_dir or get_agents_dir()
     if not target_dir or not os.path.exists(target_dir):
         return {
             "total": 0,
@@ -735,69 +784,194 @@ def run_workflow(task_desc):
         add_feed("النظام", "System", "red", "ERR", f"توقف سير العمل: {str(e)}")
 
 class StrictHTMLStructureValidator(HTMLParser):
+    """
+    Production HTML Structural and Nesting Validator:
+    Tracks opening and closing tags using a LIFO stack.
+    Validates nesting hierarchy, detects mismatched tags, checks for unclosed elements,
+    and enforces required top-level document elements (html, head, body).
+    Correctly recognizes legitimate HTML5 void elements.
+
+    Scope limitation notice:
+    This validator enforces structural nesting and required document elements.
+    It does not claim full HTML5 living standard conformance validation (which requires
+    a full WHATWG compliant parser like html5lib).
+    """
+    VOID_TAGS = {
+        'area', 'base', 'br', 'col', 'embed', 'hr', 'img',
+        'input', 'link', 'meta', 'param', 'source', 'track', 'wbr'
+    }
+
     def __init__(self):
         super().__init__()
-        self.tags = []
+        self.tag_stack = []
         self.has_html = False
-        self.has_body = False
         self.has_head = False
-        self.has_div = False
-        self.parse_error = None
-        self.void_tags = {'meta', 'link', 'img', 'br', 'hr', 'input', 'source', 'area', 'base', 'col', 'embed', 'param', 'track', 'wbr'}
-        
+        self.has_body = False
+        self.head_closed = False
+        self.errors = []
+
     def handle_starttag(self, tag, attrs):
         t = tag.lower()
+        if t in self.VOID_TAGS:
+            return
+
         if t == 'html':
+            if self.has_html:
+                self.errors.append("Multiple <html> root elements detected")
+            if self.tag_stack:
+                self.errors.append(f"<html> element cannot be nested inside <{self.tag_stack[-1]}>")
             self.has_html = True
-        elif t == 'body':
-            self.has_body = True
         elif t == 'head':
+            if self.has_head:
+                self.errors.append("Multiple <head> elements detected")
+            if not self.has_html or 'html' not in self.tag_stack:
+                self.errors.append("<head> element must be nested inside <html>")
+            if self.has_body:
+                self.errors.append("<head> element cannot appear after <body>")
             self.has_head = True
-        elif t == 'div':
-            self.has_div = True
-        if t not in self.void_tags:
-            self.tags.append(t)
-            
+        elif t == 'body':
+            if self.has_body:
+                self.errors.append("Multiple <body> elements detected")
+            if not self.has_html or 'html' not in self.tag_stack:
+                self.errors.append("<body> element must be nested inside <html>")
+            self.has_body = True
+        else:
+            if not self.has_html:
+                self.errors.append(f"Element <{t}> cannot appear outside <html> element")
+
+        self.tag_stack.append(t)
+
+    def handle_startendtag(self, tag, attrs):
+        t = tag.lower()
+        if t not in self.VOID_TAGS:
+            self.errors.append(f"Non-void element '<{t}>' cannot use self-closing XML syntax ('<{t}/>') in HTML")
+
     def handle_endtag(self, tag):
         t = tag.lower()
-        if t in self.void_tags:
+        if t in self.VOID_TAGS:
+            self.errors.append(f"Void element '<{t}>' must not have a closing tag ('</{t}>')")
             return
-        if self.tags and self.tags[-1] == t:
-            self.tags.pop()
-        elif t in self.tags:
-            while self.tags and self.tags[-1] != t:
-                self.tags.pop()
-            if self.tags:
-                self.tags.pop()
+
+        if not self.tag_stack:
+            self.errors.append(f"Unexpected closing tag '</{t}>' with no matching open tag")
+            return
+
+        if self.tag_stack[-1] == t:
+            self.tag_stack.pop()
+            if t == 'head':
+                self.head_closed = True
+        else:
+            expected = self.tag_stack[-1]
+            self.errors.append(f"Mismatched closing tag '</{t}>', expected '</{expected}>'")
+            if t in self.tag_stack:
+                while self.tag_stack and self.tag_stack[-1] != t:
+                    unclosed = self.tag_stack.pop()
+                    self.errors.append(f"Unclosed element '<{unclosed}>' before closing '</{t}>'")
+                if self.tag_stack:
+                    self.tag_stack.pop()
+            else:
+                self.errors.append(f"Closing tag '</{t}>' does not match any open element")
+
+    def close(self):
+        super().close()
+        if self.tag_stack:
+            for unclosed in reversed(self.tag_stack):
+                self.errors.append(f"Unclosed element '<{unclosed}>' at end of document")
+        if not self.has_html:
+            self.errors.append("Missing required document element: <html>")
+        if not self.has_head:
+            self.errors.append("Missing required document element: <head>")
+        if not self.has_body:
+            self.errors.append("Missing required document element: <body>")
 
 def verify_js_syntax(js_code):
     """
-    Check JavaScript syntax using Node.js without executing the code.
-    Falls back to delimiter parsing if Node is unavailable.
+    Validate JavaScript syntax using Node.js vm.Script without executing the code.
+    Compiles the code into a script AST and checks syntax without running it.
+
+    Returns:
+        (status, error_message)
+        status: "valid" | "invalid" | "unavailable"
     """
     if not js_code or not isinstance(js_code, str) or not js_code.strip():
-        return False, "JavaScript code is missing or empty"
+        return "invalid", "JavaScript code is missing or empty"
     try:
         res = subprocess.run(
-            ["node", "-e", "try { new Function(process.argv[1]); process.exit(0); } catch(e) { console.error(e.message); process.exit(1); }", js_code],
+            ["node", "-e", "const vm = require('vm'); try { new vm.Script(process.argv[1]); process.exit(0); } catch(e) { console.error(e.message); process.exit(1); }", js_code],
             capture_output=True,
             text=True,
             timeout=5
         )
         if res.returncode != 0:
             err = res.stderr.strip() or res.stdout.strip() or "Syntax error in JavaScript"
-            return False, err
-        return True, None
-    except Exception:
-        # Fallback to structural checks if node binary cannot be invoked
-        return None, None
+            return "invalid", err
+        return "valid", None
+    except FileNotFoundError:
+        return "unavailable", "Node.js executable ('node') was not found on system PATH"
+    except subprocess.TimeoutExpired:
+        return "unavailable", "JavaScript syntax validation timed out after 5 seconds"
+    except Exception as e:
+        return "unavailable", f"Failed to invoke Node.js syntax validator: {str(e)}"
+
+def validate_css_structure(css_text):
+    """
+    Production CSS Structural and Declaration Validator:
+    Validates structural integrity, brace balance, comment closure, quote closure,
+    and declaration-level key:value syntax within rule blocks.
+    
+    Scope limitation notice:
+    This check validates structural and lexical declarations. It does not perform
+    full CSS3/CSS4 AST grammar parsing (which requires external dependencies).
+    """
+    errors = []
+    if not css_text or not isinstance(css_text, str) or not css_text.strip():
+        return False, ["Required CSS artifact is missing or empty"]
+        
+    if css_text.count('{') != css_text.count('}'):
+        errors.append(f"CSS has unbalanced braces ({{: {css_text.count('{')}, }}: {css_text.count('}')})")
+    if css_text.count('/*') != css_text.count('*/'):
+        errors.append("CSS has unclosed block comments (/* ... */)")
+        
+    stripped = re.sub(r'/\*.*?\*/', '', css_text, flags=re.DOTALL)
+    
+    depth = 0
+    for char in stripped:
+        if char == '{':
+            depth += 1
+        elif char == '}':
+            depth -= 1
+            if depth < 0:
+                errors.append("CSS contains unexpected closing brace '}' before opening brace")
+                break
+    if depth > 0 and not any("unbalanced braces" in e for e in errors):
+        errors.append("CSS contains unclosed rule block")
+
+    # Check for malformed declarations inside blocks
+    blocks = re.findall(r'\{([^}]+)\}', stripped)
+    for block in blocks:
+        decls = block.split(';')
+        for decl in decls:
+            decl_str = decl.strip()
+            if not decl_str:
+                continue
+            if ':' not in decl_str:
+                if not decl_str.startswith('@') and not decl_str.startswith('&'):
+                    errors.append(f"CSS malformed declaration missing colon: '{decl_str}'")
+            else:
+                prop, _, val = decl_str.partition(':')
+                if not prop.strip():
+                    errors.append(f"CSS malformed declaration missing property name: '{decl_str}'")
+                elif not val.strip():
+                    errors.append(f"CSS malformed declaration missing property value: '{decl_str}'")
+
+    return len(errors) == 0, errors
 
 def run_qa_checks(app_html, app_css="", app_js=""):
     """
     Production QA Gate Entry Point:
     Directly testable structural, syntactic, and asset completeness verification.
     Explicitly rejects missing or empty required HTML, CSS, and JS assets.
-    Verifies HTML structure using HTMLParser, validates JS syntax via Node parser,
+    Verifies HTML structure using StrictHTMLStructureValidator, validates JS syntax via Node parser,
     and returns a structured report.
     """
     errors = []
@@ -810,18 +984,16 @@ def run_qa_checks(app_html, app_css="", app_js=""):
     else:
         lower_html = app_html.lower()
         has_doctype = "<!doctype html" in lower_html
+        if not has_doctype:
+            errors.append("HTML document missing <!DOCTYPE html> declaration (invalid document structure)")
         
         validator = StrictHTMLStructureValidator()
         try:
             validator.feed(app_html)
             validator.close()
+            errors.extend(validator.errors)
         except Exception as e:
             errors.append(f"HTML parsing failed with syntax error: {str(e)}")
-            
-        has_structure = (has_doctype and (validator.has_body or validator.has_div or validator.has_html)) or (validator.has_html and (validator.has_body or validator.has_div))
-        has_closing_tags = ("</html>" in lower_html or "</body>" in lower_html or ("</div>" in lower_html and has_doctype))
-        if not has_structure or not has_closing_tags:
-            errors.append("HTML lacks proper document structure or closing tags")
             
         fatal_strings = [
             "فشل الاتصال", "read timed out", "connectionerror", 
@@ -834,17 +1006,14 @@ def run_qa_checks(app_html, app_css="", app_js=""):
                 break
 
     # 2. CSS Verification
-    if not app_css or not isinstance(app_css, str) or not app_css.strip():
-        errors.append("Required CSS artifact is missing or empty")
-    else:
-        if app_css.count('{') != app_css.count('}'):
-            errors.append(f"CSS has unbalanced braces ({{: {app_css.count('{')}, }}: {app_css.count('}')})")
-        if app_css.count('/*') != app_css.count('*/'):
-            errors.append("CSS has unclosed block comments (/* ... */)")
+    css_ok, css_errs = validate_css_structure(app_css)
+    if not css_ok:
+        errors.extend(css_errs)
 
     # 3. JavaScript Verification
     if not app_js or not isinstance(app_js, str) or not app_js.strip():
         errors.append("Required JavaScript artifact is missing or empty")
+        js_status = "invalid"
     else:
         if app_js.count('{') != app_js.count('}'):
             errors.append(f"JavaScript has unbalanced braces ({{: {app_js.count('{')}, }}: {app_js.count('}')})")
@@ -855,18 +1024,23 @@ def run_qa_checks(app_html, app_css="", app_js=""):
         if app_js.count('/*') != app_js.count('*/'):
             errors.append("JavaScript has unclosed block comments")
             
-        # Real Node.js syntax verification
-        js_valid, js_err = verify_js_syntax(app_js)
-        if js_valid is False:
+        # Node.js syntax verification
+        js_status, js_err = verify_js_syntax(app_js)
+        if js_status == "invalid":
             errors.append(f"JavaScript syntax error: {js_err}")
+        elif js_status == "unavailable":
+            errors.append(f"JavaScript syntax validator unavailable: Node.js runtime is required for QA gate verification ({js_err})")
 
     passed = len(errors) == 0
     checks = {
         "html_extracted": bool(app_html and len(app_html.strip()) >= 50),
-        "html_doctype_or_tags": not any("HTML" in e for e in errors),
+        "html_doctype_or_tags": not any("HTML" in e or "<html>" in e or "<head>" in e or "<body>" in e for e in errors),
+        "html_structure_valid": not any("HTML" in e or "tag" in e.lower() or "element" in e.lower() for e in errors),
         "no_fatal_error_strings": not any("Fatal error" in e for e in errors),
-        "css_syntax_balanced": not any("CSS" in e for e in errors),
-        "js_syntax_balanced": not any("JavaScript" in e for e in errors)
+        "css_syntax_balanced": css_ok,
+        "css_structural_validity": css_ok,
+        "js_syntax_balanced": (js_status == "valid") and not any("bracket" in e or "brace" in e or "parenthese" in e for e in errors),
+        "js_syntax_validated": (js_status == "valid")
     }
     
     return {
@@ -1017,7 +1191,7 @@ def continue_workflow(feedback=""):
             else:
                 app_html = app_html + '\n<script src="script.js"></script>'
                 
-        # Safe directory persistence
+        # Safe atomic deliverable persistence with stage-and-verify guarantees
         with state_lock:
             task_title = workflow_state.get('current_task', 'تطبيق_جديد')
         app_dir, clean_folder_name = get_project_folder_name(task_title)
@@ -1026,31 +1200,59 @@ def continue_workflow(feedback=""):
         os.makedirs(os.path.join(app_dir, "css"), exist_ok=True)
         os.makedirs(os.path.join(app_dir, "js"), exist_ok=True)
         
-        with open(os.path.join(app_dir, "index.html"), "w", encoding="utf-8") as f:
-            f.write(app_html)
+        written_files = []
+        try:
+            # 1. index.html
+            html_path = os.path.join(app_dir, "index.html")
+            atomic_write_file(html_path, app_html)
+            written_files.append(html_path)
             
-        if app_css:
-            for c_path in ["style.css", "css/style.css"]:
-                target_p = os.path.join(app_dir, c_path)
-                with open(target_p, "w", encoding="utf-8") as f:
-                    f.write(app_css)
+            # 2. style.css and css/style.css
+            if app_css:
+                for c_path in ["style.css", "css/style.css"]:
+                    target_p = os.path.join(app_dir, c_path)
+                    atomic_write_file(target_p, app_css)
+                    written_files.append(target_p)
                     
-        if app_js:
-            for j_path in ["script.js", "js/script.js"]:
-                target_p = os.path.join(app_dir, j_path)
-                with open(target_p, "w", encoding="utf-8") as f:
-                    f.write(app_js)
+            # 3. script.js and js/script.js
+            if app_js:
+                for j_path in ["script.js", "js/script.js"]:
+                    target_p = os.path.join(app_dir, j_path)
+                    atomic_write_file(target_p, app_js)
+                    written_files.append(target_p)
                     
-        with open(os.path.join(app_dir, "plan.md"), "w", encoding="utf-8") as f:
-            f.write(f"# المنتج النهائي لمشروع: {task_title}\n\n")
-            f.write(f"## 1. دراسة الجدوى (الاستراتيجية)\n{workflow_state['outputs'].get('strategy', '')}\n\n")
-            f.write(f"## 2. وثيقة المتطلبات (PRD)\n{workflow_state['outputs'].get('product', '')}\n\n")
-            f.write(f"## 3. الهيكلة الهندسية (Architecture)\n{workflow_state['outputs'].get('engineering', '')}\n\n")
-            f.write(f"## 4. تصميم الواجهات (UI/UX)\n{workflow_state['outputs'].get('design', '')}\n\n")
-            f.write(f"## 5. تقرير فحص الجودة (QA Report)\n{json.dumps(qa_report, indent=2, ensure_ascii=False)}\n\n")
+            # 4. plan.md
+            plan_content = (
+                f"# المنتج النهائي لمشروع: {task_title}\n\n"
+                f"## 1. دراسة الجدوى (الاستراتيجية)\n{workflow_state['outputs'].get('strategy', '')}\n\n"
+                f"## 2. وثيقة المتطلبات (PRD)\n{workflow_state['outputs'].get('product', '')}\n\n"
+                f"## 3. الهيكلة الهندسية (Architecture)\n{workflow_state['outputs'].get('engineering', '')}\n\n"
+                f"## 4. تصميم الواجهات (UI/UX)\n{workflow_state['outputs'].get('design', '')}\n\n"
+                f"## 5. تقرير فحص الجودة (QA Report)\n{json.dumps(qa_report, indent=2, ensure_ascii=False)}\n\n"
+            )
+            plan_path = os.path.join(app_dir, "plan.md")
+            atomic_write_file(plan_path, plan_content)
+            written_files.append(plan_path)
 
-        with open(os.path.join(app_dir, "qa_report.json"), "w", encoding="utf-8") as f:
-            json.dump(qa_report, f, indent=2, ensure_ascii=False)
+            # 5. qa_report.json
+            qa_json_path = os.path.join(app_dir, "qa_report.json")
+            atomic_write_json(qa_json_path, qa_report)
+            written_files.append(qa_json_path)
+
+            # Verification: Ensure every required output exists and is non-empty
+            for fpath in written_files:
+                if not os.path.exists(fpath) or os.path.getsize(fpath) == 0:
+                    raise IOError(f"Deliverable file verification failed: {os.path.basename(fpath)} is missing or empty")
+
+        except Exception as persist_err:
+            # Clean up partially written deliverable files to prevent corrupt state
+            for fpath in written_files:
+                try:
+                    if os.path.exists(fpath):
+                        os.remove(fpath)
+                except OSError:
+                    pass
+            raise persist_err
 
         add_feed("مدير المشروع", "Project Manager", "linear-gradient(135deg, #f6d365, #fda085)", "PM", f"تم اكتمال المشروع وتجاوز فحص الجودة بنجاح! 🚀 المجلد: `{clean_folder_name}`")
         

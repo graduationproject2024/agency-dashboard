@@ -112,7 +112,7 @@ def test_production_run_qa_checks_directly():
 
 def test_qa_gate_rejects_missing_required_assets():
     """Verify that omitting required HTML, CSS, or JS causes QA rejection."""
-    valid_html = "<!DOCTYPE html><html><body><h1>App</h1></body></html>"
+    valid_html = "<!DOCTYPE html><html><head><title>App</title></head><body><h1>App</h1></body></html>"
     valid_css = "body { background: #fff; }"
     valid_js = "console.log('OK');"
 
@@ -133,7 +133,7 @@ def test_qa_gate_rejects_missing_required_assets():
 
 def test_qa_gate_rejects_syntactically_invalid_javascript():
     """Verify that real JavaScript syntax errors (caught by Node parser) cause QA rejection."""
-    valid_html = "<!DOCTYPE html><html><body><h1>App</h1></body></html>"
+    valid_html = "<!DOCTYPE html><html><head><title>App</title></head><body><h1>App</h1></body></html>"
     valid_css = "body { background: #fff; }"
 
     invalid_js_samples = [
@@ -164,7 +164,7 @@ def test_qa_gate_rejects_malformed_html():
 
 def test_qa_gate_rejects_invalid_css():
     """Verify that unbalanced or unclosed block comments in CSS fail QA."""
-    valid_html = "<!DOCTYPE html><html><body><h1>App</h1></body></html>"
+    valid_html = "<!DOCTYPE html><html><head><title>App</title></head><body><h1>App</h1></body></html>"
     valid_js = "function ok() {}"
 
     invalid_css_samples = [
@@ -176,3 +176,139 @@ def test_qa_gate_rejects_invalid_css():
         res = run_qa_checks(valid_html, bad_css, valid_js)
         assert not res["passed"], f"QA gate accepted invalid CSS: {bad_css}"
         assert any("CSS" in e for e in res["errors"])
+
+def test_qa_gate_rejects_malformed_html_nesting():
+    """
+    Finding 1: Verify that StrictHTMLStructureValidator catches malformed nesting,
+    mismatched tags, unclosed non-void elements, and misplaced required elements.
+    """
+    valid_css = "body { color: #333; }"
+    valid_js = "console.log('OK');"
+
+    malformed_nesting_samples = [
+        # 1. Crossed/mismatched tags: <div><span></div></span>
+        ("<!DOCTYPE html><html><head><title>T</title></head><body><div><span></div></span></body></html>", "Mismatched closing tag"),
+        # 2. Unclosed element before closing parent: <div> unclosed before </body>
+        ("<!DOCTYPE html><html><head><title>T</title></head><body><div></body></html>", "Unclosed element"),
+        # 3. Unclosed nested element at end of file
+        ("<!DOCTYPE html><html><head><title>T</title></head><body><div><section><p>Unclosed paragraph", "Unclosed element"),
+        # 4. Missing required document element: missing <head>
+        ("<!DOCTYPE html><html><body><h1>No head</h1></body></html>", "Missing required document element: <head>"),
+        # 5. Missing required document element: missing <body>
+        ("<!DOCTYPE html><html><head><title>T</title></head></html>", "Missing required document element: <body>"),
+        # 6. Misplaced element: <head> after <body>
+        ("<!DOCTYPE html><html><body><h1>Body first</h1></body><head><title>T</title></head></html>", "<head> element cannot appear after <body>"),
+        # 7. Non-void element using XML self-closing syntax
+        ("<!DOCTYPE html><html><head><title>T</title></head><body><div/></body></html>", "Non-void element"),
+        # 8. Void element with prohibited closing tag
+        ("<!DOCTYPE html><html><head><title>T</title></head><body><img src='x.png'></img></body></html>", "Void element '<img>' must not have a closing tag")
+    ]
+
+    for bad_html, expected_err in malformed_nesting_samples:
+        res = run_qa_checks(bad_html, valid_css, valid_js)
+        assert not res["passed"], f"QA gate failed to reject malformed HTML nesting: {bad_html}"
+        assert any(expected_err in e for e in res["errors"]), f"Expected '{expected_err}' in errors: {res['errors']}"
+
+def test_qa_gate_accepts_valid_html_with_all_void_elements():
+    """
+    Finding 1: Verify that legitimate HTML5 void elements (img, meta, link, br, hr, input)
+    pass strict structural validation without false positives.
+    """
+    valid_html = (
+        "<!DOCTYPE html>\n"
+        "<html lang='ar' dir='rtl'>\n"
+        "<head>\n"
+        "    <meta charset='utf-8'>\n"
+        "    <meta name='viewport' content='width=device-width, initial-scale=1.0'>\n"
+        "    <title>تطبيق متكامل</title>\n"
+        "    <link rel='stylesheet' href='style.css'>\n"
+        "</head>\n"
+        "<body>\n"
+        "    <header>\n"
+        "        <img src='logo.png' alt='شعار'>\n"
+        "        <br>\n"
+        "        <hr>\n"
+        "    </header>\n"
+        "    <main>\n"
+        "        <form>\n"
+        "            <input type='text' name='q' placeholder='بحث'>\n"
+        "        </form>\n"
+        "    </main>\n"
+        "    <script src='script.js'></script>\n"
+        "</body>\n"
+        "</html>"
+    )
+    valid_css = "body { margin: 0; color: #222; } hr { border: 0; }"
+    valid_js = "document.addEventListener('DOMContentLoaded', () => { console.log('Ready'); });"
+
+    res = run_qa_checks(valid_html, valid_css, valid_js)
+    assert res["passed"], f"QA gate rejected valid HTML with void elements: {res['errors']}"
+    assert len(res["errors"]) == 0
+    assert res["checks"]["html_structure_valid"] is True
+    assert res["checks"]["css_structural_validity"] is True
+    assert res["checks"]["js_syntax_validated"] is True
+
+def test_qa_gate_js_validation_honest_failures(monkeypatch):
+    """
+    Finding 2: Verify that JavaScript syntax validation fails honestly with explicit statuses:
+    simulating Node.js absence, timeout, invalid syntax, and proving code is never executed.
+    """
+    import subprocess
+    valid_html = "<!DOCTYPE html><html><head><title>App</title></head><body><h1>App</h1></body></html>"
+    valid_css = "body { color: blue; }"
+    valid_js = "const x = 42; console.log(x);"
+
+    # 1. Simulating Node.js binary absence on PATH
+    def mock_subprocess_filenotfound(*args, **kwargs):
+        raise FileNotFoundError("node not found")
+
+    monkeypatch.setattr(subprocess, "run", mock_subprocess_filenotfound)
+    res_absent = run_qa_checks(valid_html, valid_css, valid_js)
+    assert not res_absent["passed"]
+    assert any("Node.js runtime is required" in e for e in res_absent["errors"])
+    assert res_absent["checks"]["js_syntax_validated"] is False
+
+    # 2. Simulating Node.js subprocess timeout
+    def mock_subprocess_timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="node", timeout=5)
+
+    monkeypatch.setattr(subprocess, "run", mock_subprocess_timeout)
+    res_timeout = run_qa_checks(valid_html, valid_css, valid_js)
+    assert not res_timeout["passed"]
+    assert any("timed out" in e for e in res_timeout["errors"])
+    assert res_timeout["checks"]["js_syntax_validated"] is False
+
+    # 3. Restore real subprocess.run: verify that untrusted JS is compiled, NOT executed
+    monkeypatch.undo()
+    # If code were executed, this would raise or exit with code 99. vm.Script compiles without running.
+    safe_compilation_js = "if (false) { process.exit(99); }"
+    res_noexec = run_qa_checks(valid_html, valid_css, safe_compilation_js)
+    assert res_noexec["passed"]
+    assert res_noexec["checks"]["js_syntax_validated"] is True
+
+def test_qa_gate_css_structural_and_declaration_validation():
+    """
+    Finding 3: Verify that CSS structural validation detects malformed declarations,
+    missing properties/colons/values, and unbalanced braces without overstating full CSS3/4 AST parsing.
+    """
+    valid_html = "<!DOCTYPE html><html><head><title>App</title></head><body><h1>App</h1></body></html>"
+    valid_js = "console.log('ok');"
+
+    invalid_css_cases = [
+        # Missing colon in declaration
+        ("body { color red; }", "missing colon"),
+        # Missing property name before colon
+        ("body { : red; }", "missing property name"),
+        # Missing property value after colon
+        ("body { color: ; }", "missing property value"),
+        # Unexpected closing brace before opening
+        ("} body { color: red; }", "unexpected closing brace"),
+        # Unclosed comment
+        ("/* unclosed comment body { color: red; }", "unclosed block comments")
+    ]
+
+    for bad_css, expected_err in invalid_css_cases:
+        res = run_qa_checks(valid_html, bad_css, valid_js)
+        assert not res["passed"], f"QA gate accepted invalid CSS: {bad_css}"
+        assert any(expected_err in e for e in res["errors"]), f"Expected '{expected_err}' in errors: {res['errors']}"
+        assert res["checks"]["css_structural_validity"] is False

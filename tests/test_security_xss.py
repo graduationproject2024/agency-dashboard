@@ -9,13 +9,16 @@ except ImportError:
 
 INDEX_HTML_PATH = os.path.abspath("index.html")
 
-@pytest.mark.skipif(not PLAYWRIGHT_AVAILABLE, reason="Playwright is required for browser-level XSS verification")
 def test_production_sanitize_html_xss_prevention_in_browser():
     """
     Exercise the actual production sanitizeHtml and escapeHtml functions in a real
     Chromium browser DOM environment. Verifies active payload neutralization and
     fail-closed fallback when DOMPurify is unavailable.
+    
+    Acceptance Policy: Browser acceptance tests are mandatory; missing Playwright fails explicitly.
     """
+    if not PLAYWRIGHT_AVAILABLE:
+        pytest.fail("MANDATORY ACCEPTANCE FAILURE: Playwright is required for browser-level XSS verification but is not installed.")
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()

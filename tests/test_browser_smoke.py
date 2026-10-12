@@ -63,13 +63,17 @@ def live_test_server():
     else:
         os.environ.pop("PORT", None)
 
-@pytest.mark.skipif(not PLAYWRIGHT_AVAILABLE, reason="Playwright is required for browser smoke testing")
 def test_dashboard_browser_smoke_e2e(live_test_server):
     """
     End-to-end browser smoke test against isolated live test server.
     Verifies DOM structure, DOMPurify availability, modal interaction,
     and asserts zero uncaught JavaScript console/page errors.
+    
+    Acceptance Policy: Browser acceptance tests are mandatory; missing Playwright fails explicitly.
     """
+    if not PLAYWRIGHT_AVAILABLE:
+        pytest.fail("MANDATORY ACCEPTANCE FAILURE: Playwright is required for browser smoke testing but is not installed.")
+
     page_errors = []
     console_errors = []
 
@@ -121,13 +125,16 @@ def test_dashboard_browser_smoke_e2e(live_test_server):
 
     assert len(page_errors) == 0, f"Uncaught page JavaScript errors encountered: {page_errors}"
 
-@pytest.mark.skipif(not PLAYWRIGHT_AVAILABLE, reason="Playwright is required for deliverable browser validation")
 def test_isolated_deliverable_browser_render(tmp_path):
     """
     Finding C: Separate isolated browser validation step for generated deliverables.
     Validates that a generated HTML application renders cleanly in an isolated context
     without fatal JavaScript errors or render exceptions.
+    
+    Acceptance Policy: Browser acceptance tests are mandatory; missing Playwright fails explicitly.
     """
+    if not PLAYWRIGHT_AVAILABLE:
+        pytest.fail("MANDATORY ACCEPTANCE FAILURE: Playwright is required for browser render testing but is not installed.")
     app_html = """<!DOCTYPE html>
 <html lang="ar">
 <head>

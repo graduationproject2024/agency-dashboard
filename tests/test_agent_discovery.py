@@ -49,7 +49,6 @@ def test_discover_agents_environment_override(monkeypatch, tmp_path):
     agent_file.write_text("# Senior Developer Agent\nRole: Lead Engineer", encoding="utf-8")
     
     monkeypatch.setenv("AGENTS_DIR", str(env_dir))
-    monkeypatch.setattr("app.AGENTS_DIR", str(env_dir))
     
     result = discover_agents()
     assert result["status"] == "discovered"
