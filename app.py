@@ -482,10 +482,13 @@ def safe_resolve_project_dir(project_name):
         return None
     target_dir = os.path.abspath(os.path.join(GENERATED_APPS_DIR, project_name))
     try:
-        common = os.path.commonpath([GENERATED_APPS_DIR, target_dir])
-        if common != GENERATED_APPS_DIR or target_dir == GENERATED_APPS_DIR:
+        # Canonical containment: resolve symlinks and junctions before comparing
+        canonical_root = os.path.realpath(GENERATED_APPS_DIR)
+        canonical_target = os.path.realpath(target_dir)
+        common = os.path.commonpath([canonical_root, canonical_target])
+        if common != canonical_root or canonical_target == canonical_root:
             return None
-    except ValueError:
+    except (ValueError, OSError):
         return None
     return target_dir
 
