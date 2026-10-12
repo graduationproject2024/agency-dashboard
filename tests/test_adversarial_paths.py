@@ -312,3 +312,223 @@ def test_qa_gate_css_structural_and_declaration_validation():
         assert not res["passed"], f"QA gate accepted invalid CSS: {bad_css}"
         assert any(expected_err in e for e in res["errors"]), f"Expected '{expected_err}' in errors: {res['errors']}"
         assert res["checks"]["css_structural_validity"] is False
+
+
+def test_qa_validates_final_transformed_html_and_asset_injection():
+    """
+    Finding A: Regression test proving:
+    1. inject_asset_links injects links cleanly into candidate HTML.
+    2. QA validates the final transformed HTML.
+    3. Closing tag case-insensitivity works (e.g. </HEAD>, </BODY>).
+    4. Links are not duplicated when already present.
+    5. Document content is preserved.
+    """
+    from app import inject_asset_links, run_qa_checks
+
+    raw_html = (
+        "<!DOCTYPE html>\n"
+        "<HTML lang='ar'>\n"
+        "<HEAD>\n"
+        "    <title>Mixed Case Document</title>\n"
+        "</HEAD>\n"
+        "<BODY>\n"
+        "    <div id='content'>Original Content Preserved</div>\n"
+        "</BODY>\n"
+        "</HTML>"
+    )
+    css = "body { color: #333; }"
+    js = "console.log('ready');"
+
+    injected_html = inject_asset_links(raw_html, css, js)
+    assert '<link rel="stylesheet" href="style.css">' in injected_html
+    assert '<script src="script.js"></script>' in injected_html
+    assert "Original Content Preserved" in injected_html
+    assert "</HEAD>" in injected_html
+    assert "</BODY>" in injected_html
+
+    # Proving idempotency: injecting again does NOT duplicate the links
+    twice_injected = inject_asset_links(injected_html, css, js)
+    assert twice_injected.count('href="style.css"') == 1
+    assert twice_injected.count('src="script.js"') == 1
+
+    # Verify that run_qa_checks accepts the final injected HTML
+    qa_res = run_qa_checks(injected_html, css, js)
+    assert qa_res["passed"] is True, f"QA failed on final candidate: {qa_res['errors']}"
+
+
+def test_invalid_html_introduced_or_unclosed_is_rejected():
+    """
+    Finding A: Proving that if HTML is missing required structure or has malformed tags,
+    it is rejected by QA even after asset link injection attempt.
+    """
+    from app import inject_asset_links, run_qa_checks
+
+    # Missing </head> and <body>, malformed
+    bad_html = "<!DOCTYPE html><html><head><title>Test</title><div>Missing body and unclosed head"
+    css = "body { color: red; }"
+    js = "console.log('test');"
+
+    candidate = inject_asset_links(bad_html, css, js)
+    qa_res = run_qa_checks(candidate, css, js)
+    assert qa_res["passed"] is False
+    assert any("element" in e.lower() or "missing" in e.lower() for e in qa_res["errors"])
+
+
+def test_js_validation_accepts_valid_code_with_unbalanced_delimiters():
+    """
+    Finding B: Regression test proving removal of raw delimiter-count checks.
+    The Node.js vm.Script compiler correctly accepts valid JavaScript that contains
+    unmatched braces/brackets/parentheses inside strings, comments, template literals,
+    and regexes.
+    """
+    from app import verify_js_syntax, run_qa_checks
+
+    valid_html = "<!DOCTYPE html><html><head><title>T</title><link rel='stylesheet' href='style.css'></head><body><div id='app'></div><script src='script.js'></script></body></html>"
+    valid_css = "body { color: green; }"
+
+    valid_js_samples = [
+        # 1. Unmatched delimiter inside string literal
+        'const msg = "{"; const arr = "["; const paren = "(";',
+        # 2. Delimiter inside single-line comment
+        '// Unclosed brace in comment: {\nconst x = 42;',
+        # 3. Delimiter inside multiline block comment
+        '/* Block comment with { and } and (( */\nfunction getAnswer() { return 42; }',
+        # 4. Template literals with expressions and literal delimiters
+        'const name = "World";\nconst str = `Hello ${name}, brace: { paren: ( [`;',
+        # 5. Escaped quotes containing delimiter
+        'const escaped = "Quoted \\" { string \\" with braces";',
+        # 6. Valid complex nested object, functions, arrays, and regex
+        'const re = /\\{([0-9]+)\\}/g;\nconst app = { handlers: [() => ({ ok: true })] };',
+        # 7. Valid multiline real-world script
+        '''
+        class DashboardWidget {
+            constructor(selector) {
+                this.el = document.querySelector(selector);
+                this.prefix = "prefix: {";
+            }
+            render() {
+                if (!this.el) return;
+                const items = [1, 2, 3].map(n => ({ id: n, text: `Item {${n}}` }));
+                this.el.innerHTML = items.map(i => `<div>${i.text}</div>`).join("");
+            }
+        }
+        window.widget = new DashboardWidget("#app");
+        '''
+    ]
+
+    for js_code in valid_js_samples:
+        status, err = verify_js_syntax(js_code)
+        assert status == "valid", f"Node vm.Script rejected valid JS: {err}\nCode: {js_code}"
+        qa_res = run_qa_checks(valid_html, valid_css, js_code)
+        assert qa_res["passed"] is True, f"QA gate rejected valid JS deliverable: {qa_res['errors']}\nCode: {js_code}"
+
+
+def test_js_validation_rejects_genuine_syntax_errors():
+    """
+    Finding B: Regression test verifying that genuine syntax errors are caught
+    by the Node.js compiler and fail the QA gate.
+    """
+    from app import verify_js_syntax, run_qa_checks
+
+    valid_html = "<!DOCTYPE html><html><head><title>T</title></head><body><h1>T</h1></body></html>"
+    valid_css = "body { color: #000; }"
+
+    invalid_js_cases = [
+        "const x = 1 + ;",
+        "function (invalidFunc) { return 1; }",
+        "const obj = { a: 1,, b: 2 };",
+        "for (let i = 0 i < 10; i++) {}",
+        "if (true { console.log('missing paren'); }",
+        "const str = 'unterminated string literal;"
+    ]
+
+    for bad_js in invalid_js_cases:
+        status, err = verify_js_syntax(bad_js)
+        assert status == "invalid", f"Expected syntax error, got status '{status}' for: {bad_js}"
+        qa_res = run_qa_checks(valid_html, valid_css, bad_js)
+        assert qa_res["passed"] is False
+        assert any("JavaScript" in e for e in qa_res["errors"])
+
+
+def test_js_validation_empty_input_policy():
+    """
+    Finding B: Explicitly verifies documented policy for empty JavaScript input.
+    Empty, whitespace, or missing JS must be rejected with an honest error.
+    """
+    from app import verify_js_syntax, run_qa_checks
+
+    valid_html = "<!DOCTYPE html><html><head><title>T</title></head><body><h1>T</h1></body></html>"
+    valid_css = "body { color: #000; }"
+
+    for empty_js in ["", "   ", "\n\t\n", None]:
+        status, err = verify_js_syntax(empty_js)
+        assert status == "invalid"
+        assert "missing or empty" in err
+        qa_res = run_qa_checks(valid_html, valid_css, empty_js)
+        assert qa_res["passed"] is False
+        assert any("Required JavaScript artifact is missing or empty" in e for e in qa_res["errors"])
+
+
+def test_css_validation_comprehensive_cases():
+    """
+    Finding C: Regression test covering all documented CSS validation guarantees and limits:
+    - Unclosed comments rejected
+    - Unbalanced braces rejected
+    - Unterminated quoted strings rejected
+    - Semicolons and braces inside valid quotes accepted without false rejection
+    - Valid @media blocks and @keyframes accepted
+    - Empty CSS rejected per documented policy
+    """
+    from app import validate_css_structure, run_qa_checks
+
+    valid_html = "<!DOCTYPE html><html><head><title>T</title></head><body><h1>T</h1></body></html>"
+    valid_js = "console.log('ready');"
+
+    # 1. Unterminated quoted strings rejected
+    ok1, err1 = validate_css_structure("body { font-family: 'Open Sans; color: red; }")
+    assert not ok1
+    assert any("unterminated quoted string" in e for e in err1)
+
+    # 2. Semicolons and braces inside valid quoted strings correctly accepted
+    css_with_quoted_delimiters = (
+        'body {\n'
+        '    content: ";}";\n'
+        '    font-family: "Segoe UI", sans-serif;\n'
+        '    background-image: url("images/bg;v=1.png");\n'
+        '}'
+    )
+    ok2, err2 = validate_css_structure(css_with_quoted_delimiters)
+    assert ok2 is True, f"Failed on valid CSS containing quoted delimiters: {err2}"
+
+    # 3. Valid nested @media rules accepted
+    media_css = (
+        '@media (min-width: 768px) and (max-width: 1200px) {\n'
+        '    .container { max-width: 960px; margin: 0 auto; }\n'
+        '    .sidebar { display: block; width: 250px; }\n'
+        '}\n'
+        '@media print {\n'
+        '    .no-print { display: none; }\n'
+        '}'
+    )
+    ok3, err3 = validate_css_structure(media_css)
+    assert ok3 is True, f"Failed on valid @media query blocks: {err3}"
+
+    # 4. Valid @keyframes rule accepted
+    keyframes_css = (
+        '@keyframes pulse {\n'
+        '    0% { transform: scale(1); opacity: 1; }\n'
+        '    50% { transform: scale(1.05); opacity: 0.8; }\n'
+        '    100% { transform: scale(1); opacity: 1; }\n'
+        '}'
+    )
+    ok4, err4 = validate_css_structure(keyframes_css)
+    assert ok4 is True, f"Failed on valid @keyframes rule: {err4}"
+
+    # 5. Empty CSS rejected
+    ok5, err5 = validate_css_structure("")
+    assert not ok5
+    assert any("missing or empty" in e for e in err5)
+
+    # 6. Verify end-to-end in run_qa_checks
+    qa_res = run_qa_checks(valid_html, media_css, valid_js)
+    assert qa_res["passed"] is True

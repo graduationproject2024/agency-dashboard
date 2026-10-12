@@ -97,29 +97,36 @@ def test_dashboard_browser_smoke_e2e(live_test_server):
         purify_exists = page.evaluate("typeof window.DOMPurify !== 'undefined'")
         assert purify_exists is True, "DOMPurify is expected to be loaded in the browser environment"
 
-        # Verify sanitizeHtml fails closed safely
-        sanitized_test = page.evaluate("window.sanitizeHtml ? window.sanitizeHtml('<img src=x onerror=alert(1)>') : null")
-        if sanitized_test is not None:
-            assert "onerror" not in sanitized_test
-            assert "alert(1)" not in sanitized_test
+        # Verify sanitizeHtml is defined and fails closed safely
+        sanitize_defined = page.evaluate("typeof window.sanitizeHtml === 'function'")
+        assert sanitize_defined is True, "MANDATORY ACCEPTANCE: window.sanitizeHtml must be defined"
+        sanitized_test = page.evaluate("window.sanitizeHtml('<img src=x onerror=alert(1)>')")
+        assert "onerror" not in sanitized_test
+        assert "alert(1)" not in sanitized_test
 
-        # Verify new task modal opens and closes
+        # Verify new task modal opens and closes (mandatory UI acceptance)
         new_task_btn = page.locator("button:has-text('مهمة جديدة')")
-        if new_task_btn.count() > 0:
-            new_task_btn.click()
-            page.wait_for_selector("#taskModal", state="visible", timeout=3000)
-            cancel_btn = page.locator("button:has-text('إلغاء')")
-            if cancel_btn.count() > 0:
-                cancel_btn.click()
-                page.wait_for_selector("#taskModal", state="hidden", timeout=3000)
+        assert new_task_btn.count() >= 1, "MANDATORY ACCEPTANCE: 'مهمة جديدة' button must exist in DOM"
+        assert new_task_btn.first.is_visible(), "'مهمة جديدة' button must be visible"
+        new_task_btn.first.click()
+        page.wait_for_selector("#taskModal", state="visible", timeout=3000)
 
-        # Verify Navigation switches to Settings section
+        cancel_btn = page.locator("#taskModal button:has-text('إلغاء')")
+        assert cancel_btn.count() >= 1, "MANDATORY ACCEPTANCE: 'إلغاء' button must exist in #taskModal"
+        assert cancel_btn.first.is_visible(), "'إلغاء' button must be visible"
+        cancel_btn.first.click()
+        page.wait_for_selector("#taskModal", state="hidden", timeout=3000)
+
+        # Verify Navigation switches to Settings section and back (mandatory UI acceptance)
         nav_settings = page.locator("#nav-settings")
-        if nav_settings.count() > 0:
-            nav_settings.click()
-            page.wait_for_selector("#section-settings", state="visible", timeout=3000)
-            page.locator("#nav-overview").click()
-            page.wait_for_selector("#section-overview", state="visible", timeout=3000)
+        assert nav_settings.count() >= 1, "MANDATORY ACCEPTANCE: '#nav-settings' link must exist in DOM"
+        nav_settings.click()
+        page.wait_for_selector("#section-settings", state="visible", timeout=3000)
+
+        nav_overview = page.locator("#nav-overview")
+        assert nav_overview.count() >= 1, "MANDATORY ACCEPTANCE: '#nav-overview' link must exist in DOM"
+        nav_overview.click()
+        page.wait_for_selector("#section-overview", state="visible", timeout=3000)
 
         browser.close()
 

@@ -8,6 +8,7 @@ import requests
 import re
 import copy
 import uuid
+import shutil
 import subprocess
 from urllib.parse import urlparse
 from html.parser import HTMLParser
@@ -913,27 +914,85 @@ def verify_js_syntax(js_code):
     except Exception as e:
         return "unavailable", f"Failed to invoke Node.js syntax validator: {str(e)}"
 
+def _strip_css_strings_and_comments(css_text):
+    """
+    Remove block comments and mask quoted strings from CSS text,
+    replacing comments with whitespace and string contents with safe characters
+    to prevent semicolons, braces, and colons from disrupting structural analysis
+    while preserving non-empty value presence. Returns (stripped_text, errors).
+    """
+    errors = []
+    result = []
+    i = 0
+    n = len(css_text)
+    while i < n:
+        # Block comment
+        if css_text[i:i+2] == '/*':
+            end = css_text.find('*/', i + 2)
+            if end == -1:
+                errors.append("CSS has unclosed block comments (/* ... */)")
+                result.append(' ' * (n - i))
+                i = n
+            else:
+                result.append(' ' * (end + 2 - i))
+                i = end + 2
+        # Quoted strings
+        elif css_text[i] in ('"', "'"):
+            quote = css_text[i]
+            j = i + 1
+            closed = False
+            while j < n:
+                if css_text[j] == '\\' and j + 1 < n:
+                    j += 2
+                elif css_text[j] == quote:
+                    j += 1
+                    closed = True
+                    break
+                elif css_text[j] == '\n':
+                    errors.append(f"CSS has unterminated quoted string starting near position {i}")
+                    break
+                else:
+                    j += 1
+            if not closed and not any(f"position {i}" in e for e in errors):
+                errors.append(f"CSS has unterminated quoted string starting near position {i}")
+            if closed:
+                # Keep surrounding quotes, replace contents with 'x' of same length
+                inner_len = max(0, j - i - 2)
+                result.append(quote + ('x' * inner_len) + quote)
+            else:
+                result.append(' ' * (j - i))
+            i = j
+        else:
+            result.append(css_text[i])
+            i += 1
+    return ''.join(result), errors
+
+
 def validate_css_structure(css_text):
     """
     Production CSS Structural and Declaration Validator:
     Validates structural integrity, brace balance, comment closure, quote closure,
-    and declaration-level key:value syntax within rule blocks.
-    
+    and declaration-level key:value syntax within leaf rule blocks.
+
     Scope limitation notice:
-    This check validates structural and lexical declarations. It does not perform
-    full CSS3/CSS4 AST grammar parsing (which requires external dependencies).
+    This check validates structural and lexical declarations after stripping
+    comments and masking quoted strings. It does not perform full CSS3/CSS4 AST grammar
+    parsing (which requires external dependencies). Characters inside quoted
+    strings (e.g. semicolons, braces, colons) are safely masked so they do not
+    interfere with structural or declaration analysis.
     """
     errors = []
     if not css_text or not isinstance(css_text, str) or not css_text.strip():
         return False, ["Required CSS artifact is missing or empty"]
-        
-    if css_text.count('{') != css_text.count('}'):
-        errors.append(f"CSS has unbalanced braces ({{: {css_text.count('{')}, }}: {css_text.count('}')})")
-    if css_text.count('/*') != css_text.count('*/'):
-        errors.append("CSS has unclosed block comments (/* ... */)")
-        
-    stripped = re.sub(r'/\*.*?\*/', '', css_text, flags=re.DOTALL)
-    
+
+    # Strip comments and mask strings first so delimiters inside them don't confuse analysis
+    stripped, strip_errors = _strip_css_strings_and_comments(css_text)
+    errors.extend(strip_errors)
+
+    # Brace balance check on stripped text
+    if stripped.count('{') != stripped.count('}'):
+        errors.append(f"CSS has unbalanced braces ({{: {stripped.count('{')}, }}: {stripped.count('}')})")
+
     depth = 0
     for char in stripped:
         if char == '{':
@@ -946,9 +1005,9 @@ def validate_css_structure(css_text):
     if depth > 0 and not any("unbalanced braces" in e for e in errors):
         errors.append("CSS contains unclosed rule block")
 
-    # Check for malformed declarations inside blocks
-    blocks = re.findall(r'\{([^}]+)\}', stripped)
-    for block in blocks:
+    # Check for malformed declarations inside leaf blocks (blocks containing no nested braces)
+    leaf_blocks = re.findall(r'\{([^{}]+)\}', stripped)
+    for block in leaf_blocks:
         decls = block.split(';')
         for decl in decls:
             decl_str = decl.strip()
@@ -1011,20 +1070,15 @@ def run_qa_checks(app_html, app_css="", app_js=""):
         errors.extend(css_errs)
 
     # 3. JavaScript Verification
+    #    Uses the Node.js vm.Script AST compiler exclusively.
+    #    Raw delimiter counting was removed because characters inside strings,
+    #    comments, template literals and regexes cause false positives
+    #    (e.g. `const msg = "{";` is valid JS with unequal brace counts).
     if not app_js or not isinstance(app_js, str) or not app_js.strip():
         errors.append("Required JavaScript artifact is missing or empty")
         js_status = "invalid"
     else:
-        if app_js.count('{') != app_js.count('}'):
-            errors.append(f"JavaScript has unbalanced braces ({{: {app_js.count('{')}, }}: {app_js.count('}')})")
-        if app_js.count('(') != app_js.count(')'):
-            errors.append(f"JavaScript has unbalanced parentheses ((: {app_js.count('(')}, ): {app_js.count(')')})")
-        if app_js.count('[') != app_js.count(']'):
-            errors.append(f"JavaScript has unbalanced brackets ([: {app_js.count('[')}, ]: {app_js.count(']')})")
-        if app_js.count('/*') != app_js.count('*/'):
-            errors.append("JavaScript has unclosed block comments")
-            
-        # Node.js syntax verification
+        # Node.js syntax verification (sole JS validation gate)
         js_status, js_err = verify_js_syntax(app_js)
         if js_status == "invalid":
             errors.append(f"JavaScript syntax error: {js_err}")
@@ -1049,6 +1103,41 @@ def run_qa_checks(app_html, app_css="", app_js=""):
         "errors": errors,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
     }
+
+def inject_asset_links(html, css_content, js_content):
+    """
+    Inject CSS stylesheet and JS script links into HTML document.
+    - Case-insensitive tag matching for </head> and </body> with optional whitespace.
+    - Idempotent: skips injection if link/script already present (regex matches attribute variations).
+    - Preserves unrelated document content.
+    """
+    if not html:
+        return html
+
+    lower = html.lower()
+
+    # Inject CSS link if CSS exists and not already referenced
+    has_css_link = bool(re.search(r'href\s*=\s*[\'"][^\'"]*style\.css[\'"]', lower))
+    if css_content and not has_css_link:
+        head_end = re.search(r'</\s*head\s*>', html, re.IGNORECASE)
+        if head_end:
+            insert_pos = head_end.start()
+            html = html[:insert_pos] + '  <link rel="stylesheet" href="style.css">\n' + html[insert_pos:]
+        else:
+            html = '<link rel="stylesheet" href="style.css">\n' + html
+
+    # Inject JS script if JS exists and not already referenced
+    has_js_script = bool(re.search(r'src\s*=\s*[\'"][^\'"]*script\.js[\'"]', lower))
+    if js_content and not has_js_script:
+        body_end = re.search(r'</\s*body\s*>', html, re.IGNORECASE)
+        if body_end:
+            insert_pos = body_end.start()
+            html = html[:insert_pos] + '  <script src="script.js"></script>\n' + html[insert_pos:]
+        else:
+            html = html + '\n<script src="script.js"></script>'
+
+    return html
+
 
 def continue_workflow(feedback=""):
     with state_lock:
@@ -1146,7 +1235,7 @@ def continue_workflow(feedback=""):
             workflow_state["departments"]["seo"] = {"status": "done", "text": "تم تحسين محركات البحث."}
         update_stats()
         
-        # --- Code Extraction & Verification ---
+        # --- Code Extraction ---
         html_match = re.search(r"```html(.*?)```", dev_out, re.DOTALL)
         app_html = html_match.group(1).strip() if html_match else ""
         
@@ -1162,7 +1251,11 @@ def continue_workflow(feedback=""):
         anim_js = "\n\n".join([j.strip() for j in anim_js_blocks if j.strip()])
         app_js = anim_js if (anim_js and dev_js in anim_js) else (f"{dev_js}\n\n/* Interactions */\n{anim_js}" if anim_js and dev_js else (anim_js or dev_js))
 
-        # --- Run Production QA Gate ---
+        # --- Apply ALL transformations BEFORE validation ---
+        # Inject CSS/JS asset links into HTML (case-insensitive, idempotent, no duplicates)
+        app_html = inject_asset_links(app_html, app_css, app_js)
+
+        # --- Run Production QA Gate on FINAL transformed artifacts ---
         qa_report = run_qa_checks(app_html, app_css, app_js)
         with state_lock:
             workflow_state["qa_report"] = qa_report
@@ -1178,20 +1271,12 @@ def continue_workflow(feedback=""):
             add_feed("مهندس الجودة", "QA", "red", "QA", err_msg)
             return
 
-        # Link stylesheet and script cleanly
-        if app_css and 'href="style.css"' not in app_html and "href='style.css'" not in app_html:
-            if "</head>" in app_html:
-                app_html = app_html.replace("</head>", '  <link rel="stylesheet" href="style.css">\n</head>')
-            else:
-                app_html = '<link rel="stylesheet" href="style.css">\n' + app_html
+        # Capture the exact validated candidate artifacts for identity verification
+        validated_html = app_html
+        validated_css = app_css
+        validated_js = app_js
                 
-        if app_js and 'src="script.js"' not in app_html and "src='script.js'" not in app_html:
-            if "</body>" in app_html:
-                app_html = app_html.replace("</body>", '  <script src="script.js"></script>\n</body>')
-            else:
-                app_html = app_html + '\n<script src="script.js"></script>'
-                
-        # Safe atomic deliverable persistence with stage-and-verify guarantees
+        # Safe atomic deliverable persistence with staging-and-verify guarantees
         with state_lock:
             task_title = workflow_state.get('current_task', 'تطبيق_جديد')
         app_dir, clean_folder_name = get_project_folder_name(task_title)
@@ -1201,25 +1286,44 @@ def continue_workflow(feedback=""):
         os.makedirs(os.path.join(app_dir, "js"), exist_ok=True)
         
         written_files = []
+        # Track pre-existing files so rollback restores rather than deletes them
+        pre_existing_backups = {}  # path -> backup_path
         try:
+            def _stage_write_file(target_path, content, encoding="utf-8"):
+                """Write with pre-existing file backup for safe rollback."""
+                if os.path.exists(target_path):
+                    bak = target_path + f".pre_{uuid.uuid4().hex[:8]}.bak"
+                    import shutil
+                    shutil.copy2(target_path, bak)
+                    pre_existing_backups[target_path] = bak
+                atomic_write_file(target_path, content, encoding)
+                written_files.append(target_path)
+
+            def _stage_write_json(target_path, data):
+                """Write JSON with pre-existing file backup for safe rollback."""
+                if os.path.exists(target_path):
+                    bak = target_path + f".pre_{uuid.uuid4().hex[:8]}.bak"
+                    import shutil
+                    shutil.copy2(target_path, bak)
+                    pre_existing_backups[target_path] = bak
+                atomic_write_json(target_path, data)
+                written_files.append(target_path)
+
             # 1. index.html
             html_path = os.path.join(app_dir, "index.html")
-            atomic_write_file(html_path, app_html)
-            written_files.append(html_path)
+            _stage_write_file(html_path, validated_html)
             
             # 2. style.css and css/style.css
-            if app_css:
+            if validated_css:
                 for c_path in ["style.css", "css/style.css"]:
                     target_p = os.path.join(app_dir, c_path)
-                    atomic_write_file(target_p, app_css)
-                    written_files.append(target_p)
+                    _stage_write_file(target_p, validated_css)
                     
             # 3. script.js and js/script.js
-            if app_js:
+            if validated_js:
                 for j_path in ["script.js", "js/script.js"]:
                     target_p = os.path.join(app_dir, j_path)
-                    atomic_write_file(target_p, app_js)
-                    written_files.append(target_p)
+                    _stage_write_file(target_p, validated_js)
                     
             # 4. plan.md
             plan_content = (
@@ -1231,28 +1335,51 @@ def continue_workflow(feedback=""):
                 f"## 5. تقرير فحص الجودة (QA Report)\n{json.dumps(qa_report, indent=2, ensure_ascii=False)}\n\n"
             )
             plan_path = os.path.join(app_dir, "plan.md")
-            atomic_write_file(plan_path, plan_content)
-            written_files.append(plan_path)
+            _stage_write_file(plan_path, plan_content)
 
             # 5. qa_report.json
             qa_json_path = os.path.join(app_dir, "qa_report.json")
-            atomic_write_json(qa_json_path, qa_report)
-            written_files.append(qa_json_path)
+            _stage_write_json(qa_json_path, qa_report)
 
-            # Verification: Ensure every required output exists and is non-empty
+            # Post-write verification: every required output exists, is non-empty,
+            # and HTML content matches the validated candidate exactly
             for fpath in written_files:
                 if not os.path.exists(fpath) or os.path.getsize(fpath) == 0:
                     raise IOError(f"Deliverable file verification failed: {os.path.basename(fpath)} is missing or empty")
 
+            # Identity check: persisted HTML must match the QA-validated candidate
+            with open(html_path, 'r', encoding='utf-8') as f:
+                persisted_html = f.read()
+            if persisted_html != validated_html:
+                raise IOError("Persisted HTML artifact does not match the QA-validated candidate")
+
         except Exception as persist_err:
-            # Clean up partially written deliverable files to prevent corrupt state
+            # Rollback: restore pre-existing files, delete newly created files
             for fpath in written_files:
                 try:
-                    if os.path.exists(fpath):
+                    if fpath in pre_existing_backups:
+                        # Restore the original file
+                        os.replace(pre_existing_backups[fpath], fpath)
+                    elif os.path.exists(fpath):
                         os.remove(fpath)
                 except OSError:
                     pass
+            # Clean up any remaining backup files
+            for bak_path in pre_existing_backups.values():
+                try:
+                    if os.path.exists(bak_path):
+                        os.remove(bak_path)
+                except OSError:
+                    pass
             raise persist_err
+
+        # Clean up backup files on success
+        for bak_path in pre_existing_backups.values():
+            try:
+                if os.path.exists(bak_path):
+                    os.remove(bak_path)
+            except OSError:
+                pass
 
         add_feed("مدير المشروع", "Project Manager", "linear-gradient(135deg, #f6d365, #fda085)", "PM", f"تم اكتمال المشروع وتجاوز فحص الجودة بنجاح! 🚀 المجلد: `{clean_folder_name}`")
         
