@@ -1,44 +1,131 @@
-import re
+import os
 import pytest
 
-def test_script_js_contains_xss_protection():
-    """Verify that script.js defines escapeHtml and sanitizeHtml functions."""
-    with open('script.js', 'r', encoding='utf-8') as f:
-        content = f.read()
-        
-    assert 'function escapeHtml(' in content
-    assert 'function sanitizeHtml(' in content
-    # Verify that escapeHtml escapes <, >, ", '
-    assert '&lt;' in content
-    assert '&gt;' in content
-    assert '&quot;' in content
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
 
-def test_index_html_loads_dompurify():
-    """Verify that index.html includes DOMPurify sanitizer library."""
-    with open('index.html', 'r', encoding='utf-8') as f:
-        content = f.read()
-    assert 'dompurify' in content.lower()
+INDEX_HTML_PATH = os.path.abspath("index.html")
 
-def test_markdown_sanitization_policy():
-    """Verify regex-level fallback sanitization handles malicious payloads."""
-    malicious_inputs = [
-        "<script>alert('xss')</script>",
-        "<img src='x' onerror='alert(1)'>",
-        "<iframe src='javascript:alert(1)'></iframe>",
-        "<a href='javascript:alert(1)'>click me</a>"
-    ]
-    
-    # Python equivalent of our sanitizer logic
-    def py_sanitize(text):
-        cleaned = re.sub(r'<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>', '', text, flags=re.IGNORECASE)
-        cleaned = re.sub(r'<iframe\b[^<]*(?:(?!<\/iframe>)<[^<]*)*<\/iframe>', '', cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r'\son\w+="[^"]*"', '', cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r'\son\w+=\'[^\']*\'', '', cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r'javascript:[^"\']*', '', cleaned, flags=re.IGNORECASE)
-        return cleaned
+@pytest.mark.skipif(not PLAYWRIGHT_AVAILABLE, reason="Playwright is required for browser-level XSS verification")
+def test_production_sanitize_html_xss_prevention_in_browser():
+    """
+    Exercise the actual production sanitizeHtml and escapeHtml functions in a real
+    Chromium browser DOM environment. Verifies active payload neutralization and
+    fail-closed fallback when DOMPurify is unavailable.
+    """
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
 
-    for payload in malicious_inputs:
-        safe_output = py_sanitize(payload)
-        assert "<script>" not in safe_output
-        assert "onerror=" not in safe_output
-        assert "javascript:" not in safe_output
+        # Load index.html via file:// so script.js and DOMPurify are fully loaded
+        file_url = f"file:///{INDEX_HTML_PATH.replace(os.sep, '/')}"
+        page.goto(file_url)
+
+        # 1. Verify production sanitizer functions are defined
+        assert page.evaluate("typeof window.escapeHtml === 'function'"), "escapeHtml not defined in script.js"
+        assert page.evaluate("typeof window.sanitizeHtml === 'function'"), "sanitizeHtml not defined in script.js"
+        assert page.evaluate("typeof window.DOMPurify !== 'undefined'"), "DOMPurify must be loaded in index.html"
+
+        # 2. Test <script> injection payload
+        script_payload = "<script>window.__xss_executed = true;</script><p>Clean Text</p>"
+        result = page.evaluate("""(payload) => {
+            const container = document.createElement('div');
+            container.id = 'xss-test-container';
+            container.innerHTML = window.sanitizeHtml(payload);
+            document.body.appendChild(container);
+            return {
+                executed: Boolean(window.__xss_executed),
+                hasScriptTag: container.querySelector('script') !== null,
+                html: container.innerHTML
+            };
+        }""", script_payload)
+        assert result["executed"] is False, "Script tag executed inside sanitized container!"
+        assert result["hasScriptTag"] is False, "Script tag was not stripped by sanitizer!"
+        assert "Clean Text" in result["html"]
+
+        # 3. Test event handler payloads (<img onerror>, <svg onload>)
+        event_payloads = [
+            '<img src="invalid_image.png" onerror="window.__xss_img_executed=true;">',
+            '<svg onload="window.__xss_svg_executed=true;"></svg>',
+            '<button onclick="window.__xss_btn_executed=true;">Click</button>'
+        ]
+        for payload in event_payloads:
+            res = page.evaluate("""(payload) => {
+                const div = document.createElement('div');
+                div.innerHTML = window.sanitizeHtml(payload);
+                document.body.appendChild(div);
+                const el = div.firstElementChild;
+                return {
+                    hasOnerror: el ? el.hasAttribute('onerror') : false,
+                    hasOnload: el ? el.hasAttribute('onload') : false,
+                    hasOnclick: el ? el.hasAttribute('onclick') : false,
+                    imgFlag: Boolean(window.__xss_img_executed),
+                    svgFlag: Boolean(window.__xss_svg_executed),
+                    btnFlag: Boolean(window.__xss_btn_executed)
+                };
+            }""", payload)
+            assert not res["hasOnerror"], f"onerror attribute remained in sanitized output: {payload}"
+            assert not res["hasOnload"], f"onload attribute remained in sanitized output: {payload}"
+            assert not res["hasOnclick"], f"onclick attribute remained in sanitized output: {payload}"
+            assert not res["imgFlag"] and not res["svgFlag"] and not res["btnFlag"]
+
+        # 4. Test dangerous pseudo-protocols (javascript:, data:)
+        dangerous_links = [
+            '<a href="javascript:window.__xss_link_executed=true;">Evil Link</a>',
+            '<a href="vbscript:msgbox(1)">VBScript Link</a>'
+        ]
+        for link in dangerous_links:
+            res = page.evaluate("""(link) => {
+                const div = document.createElement('div');
+                div.innerHTML = window.sanitizeHtml(link);
+                const a = div.querySelector('a');
+                return a ? a.getAttribute('href') : null;
+            }""", link)
+            assert res is None or not res.lower().startswith('javascript:'), f"Dangerous javascript: URI survived: {res}"
+
+        # 5. Test legitimate markup preservation
+        safe_markup = '<p class="lead"><strong>مرحبا</strong> بالجميع <code>code</code></p>'
+        safe_res = page.evaluate("""(markup) => {
+            const div = document.createElement('div');
+            div.innerHTML = window.sanitizeHtml(markup);
+            return {
+                hasP: div.querySelector('p') !== null,
+                hasStrong: div.querySelector('strong') !== null,
+                hasCode: div.querySelector('code') !== null,
+                text: div.textContent.trim()
+            };
+        }""", safe_markup)
+        assert safe_res["hasP"] is True
+        assert safe_res["hasStrong"] is True
+        assert safe_res["hasCode"] is True
+        assert "مرحبا" in safe_res["text"]
+
+        # 6. Test Fail-Closed behavior when DOMPurify is unavailable
+        fallback_res = page.evaluate("""() => {
+            // Temporarily disable DOMPurify
+            const origPurify = window.DOMPurify;
+            window.DOMPurify = undefined;
+            try {
+                const dirty = '<img src=x onerror=alert(1)><b>Hello</b>';
+                const sanitized = window.sanitizeHtml(dirty);
+                const container = document.createElement('div');
+                container.innerHTML = sanitized;
+                return {
+                    sanitizedText: sanitized,
+                    hasImgElement: container.querySelector('img') !== null,
+                    hasBElement: container.querySelector('b') !== null,
+                    textContent: container.textContent
+                };
+            } finally {
+                window.DOMPurify = origPurify;
+            }
+        }""")
+        assert fallback_res["hasImgElement"] is False, "Fallback failed open: rendered active <img> tag!"
+        assert fallback_res["hasBElement"] is False, "Fallback failed open: rendered active <b> tag instead of escaping!"
+        assert "&lt;" in fallback_res["sanitizedText"], "Fallback did not escape HTML entities!"
+        assert "<img src=x onerror=alert(1)><b>Hello</b>" in fallback_res["textContent"]
+
+        browser.close()

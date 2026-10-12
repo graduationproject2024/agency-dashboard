@@ -1,6 +1,7 @@
 import os
 import tempfile
 import pytest
+from unittest.mock import patch
 from app import app, discover_agents
 
 @pytest.fixture
@@ -31,41 +32,74 @@ def test_discover_agents_nonexistent_directory_never_fabricates_count():
     assert result["error"] is not None
     assert result["agents"] == []
 
-def test_discover_agents_empty_directory():
+def test_discover_agents_empty_directory(tmp_path):
     """Verify that an empty directory returns total 0 and status 'empty'."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        result = discover_agents(tmpdir)
-        assert result["total"] == 0
-        assert result["status"] == "empty"
-        assert result["agents"] == []
+    result = discover_agents(str(tmp_path))
+    assert result["total"] == 0
+    assert result["status"] == "empty"
+    assert result["agents"] == []
 
-def test_discover_agents_filters_ignored_files_and_git():
-    """Verify that non-markdown, README, and .git directory contents are excluded."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Create department subfolder
-        dept_dir = os.path.join(tmpdir, "engineering")
-        os.makedirs(dept_dir, exist_ok=True)
+def test_discover_agents_environment_override(monkeypatch, tmp_path):
+    """Verify that AGENTS_DIR environment variable takes precedence."""
+    env_dir = tmp_path / "custom_env_agents"
+    eng_dir = env_dir / "engineering"
+    eng_dir.mkdir(parents=True)
+    
+    agent_file = eng_dir / "senior-dev.md"
+    agent_file.write_text("# Senior Developer Agent\nRole: Lead Engineer", encoding="utf-8")
+    
+    monkeypatch.setenv("AGENTS_DIR", str(env_dir))
+    monkeypatch.setattr("app.AGENTS_DIR", str(env_dir))
+    
+    result = discover_agents()
+    assert result["status"] == "discovered"
+    assert result["total"] == 1
+    assert result["agents"][0]["id"] == "senior-dev"
+    assert result["directory"] == str(env_dir)
+
+def test_discover_agents_prunes_hidden_directories_and_build_folders(tmp_path):
+    """Verify that hidden directories (.git, .github, .agents) and node_modules are pruned."""
+    # Hidden dirs
+    for hidden in [".git", ".github", ".agents", "node_modules", "__pycache__"]:
+        h_dir = tmp_path / hidden
+        h_dir.mkdir()
+        (h_dir / "fake-agent.md").write_text("# Fake Agent Definition in hidden dir", encoding="utf-8")
         
-        # Valid agent
-        with open(os.path.join(dept_dir, "software-architect.md"), "w", encoding="utf-8") as f:
-            f.write("# Architect Agent")
-            
-        # Ignored files
-        with open(os.path.join(dept_dir, "README.md"), "w", encoding="utf-8") as f:
-            f.write("# Readme")
-        with open(os.path.join(dept_dir, "script.py"), "w", encoding="utf-8") as f:
-            f.write("print(1)")
-            
-        # .git folder
-        git_dir = os.path.join(tmpdir, ".git")
-        os.makedirs(git_dir, exist_ok=True)
-        with open(os.path.join(git_dir, "config.md"), "w", encoding="utf-8") as f:
-            f.write("git config")
+    # Legitimate dir
+    valid_dir = tmp_path / "design"
+    valid_dir.mkdir()
+    (valid_dir / "ui-designer.md").write_text("# UI Designer Agent\nPortfolio and spec", encoding="utf-8")
 
-        result = discover_agents(tmpdir)
-        assert result["total"] == 1
-        assert result["agents"][0]["id"] == "software-architect"
-        assert result["agents"][0]["department"] == "engineering"
+    result = discover_agents(str(tmp_path))
+    assert result["total"] == 1
+    assert result["agents"][0]["id"] == "ui-designer"
+
+def test_discover_agents_filters_unrelated_markdown_and_empty_files(tmp_path):
+    """Verify that doc files (README, TODO, CHANGELOG, translations) and empty files are ignored."""
+    dept_dir = tmp_path / "marketing"
+    dept_dir.mkdir()
+
+    # Valid agent
+    (dept_dir / "growth-hacker.md").write_text("# Growth Hacker\nAcquisition experiments", encoding="utf-8")
+
+    # Documentation files that should be ignored
+    for doc in ["README.md", "CONTRIBUTING.md", "LICENSE.md", "CHANGELOG.md", "TODO.md", "agent_zh-CN.md"]:
+        (dept_dir / doc).write_text("# Documentation content", encoding="utf-8")
+
+    # File under 20 bytes (stubs/empty files)
+    (dept_dir / "empty-stub.md").write_text("# Stub", encoding="utf-8")
+
+    result = discover_agents(str(tmp_path))
+    assert result["total"] == 1
+    assert result["agents"][0]["id"] == "growth-hacker"
+
+def test_discover_agents_unreadable_path_returns_error_status(monkeypatch, tmp_path):
+    """Verify that filesystem permission / OS walk errors return status 'error' without crashing."""
+    with patch("os.walk", side_effect=PermissionError("Simulated Access Denied")):
+        result = discover_agents(str(tmp_path))
+        assert result["total"] == 0
+        assert result["status"] == "error"
+        assert "Access Denied" in result["error"]
 
 def test_get_agents_endpoint(client):
     """Verify GET /api/agents returns JSON agent list with mapped statuses."""

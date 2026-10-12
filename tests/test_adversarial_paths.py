@@ -1,6 +1,6 @@
 import os
 import pytest
-from app import app, safe_resolve_project_dir, GENERATED_APPS_DIR, WINDOWS_RESERVED
+from app import app, safe_resolve_project_dir, GENERATED_APPS_DIR, WINDOWS_RESERVED, run_qa_checks
 
 @pytest.fixture
 def client():
@@ -109,3 +109,70 @@ def test_production_run_qa_checks_directly():
     assert res_valid["passed"]
     assert len(res_valid["errors"]) == 0
     assert all(res_valid["checks"].values())
+
+def test_qa_gate_rejects_missing_required_assets():
+    """Verify that omitting required HTML, CSS, or JS causes QA rejection."""
+    valid_html = "<!DOCTYPE html><html><body><h1>App</h1></body></html>"
+    valid_css = "body { background: #fff; }"
+    valid_js = "console.log('OK');"
+
+    # Missing HTML
+    res1 = run_qa_checks("", valid_css, valid_js)
+    assert not res1["passed"]
+    assert any("HTML" in e and "missing" in e for e in res1["errors"])
+
+    # Missing CSS
+    res2 = run_qa_checks(valid_html, "", valid_js)
+    assert not res2["passed"]
+    assert any("CSS" in e and "missing" in e for e in res2["errors"])
+
+    # Missing JavaScript
+    res3 = run_qa_checks(valid_html, valid_css, "")
+    assert not res3["passed"]
+    assert any("JavaScript" in e and "missing" in e for e in res3["errors"])
+
+def test_qa_gate_rejects_syntactically_invalid_javascript():
+    """Verify that real JavaScript syntax errors (caught by Node parser) cause QA rejection."""
+    valid_html = "<!DOCTYPE html><html><body><h1>App</h1></body></html>"
+    valid_css = "body { background: #fff; }"
+
+    invalid_js_samples = [
+        "const x = ;",
+        "function missingParam( { return 1; }",
+        "var obj = { a: 1, , b: 2 };",
+        "for (let i = 0; i < 10 i++) {}"
+    ]
+    for bad_js in invalid_js_samples:
+        res = run_qa_checks(valid_html, valid_css, bad_js)
+        assert not res["passed"], f"QA gate accepted invalid JS: {bad_js}"
+        assert any("JavaScript" in e for e in res["errors"])
+
+def test_qa_gate_rejects_malformed_html():
+    """Verify that malformed or non-HTML strings are rejected."""
+    valid_css = "body { color: blue; }"
+    valid_js = "function ok() {}"
+
+    malformed_samples = [
+        "This is just plain text without any HTML tags at all.",
+        "{ json: 'not html', format: true }",
+        "<<<badly formed tag>>>"
+    ]
+    for bad_html in malformed_samples:
+        res = run_qa_checks(bad_html, valid_css, valid_js)
+        assert not res["passed"], f"QA gate accepted malformed HTML: {bad_html}"
+        assert any("HTML" in e for e in res["errors"])
+
+def test_qa_gate_rejects_invalid_css():
+    """Verify that unbalanced or unclosed block comments in CSS fail QA."""
+    valid_html = "<!DOCTYPE html><html><body><h1>App</h1></body></html>"
+    valid_js = "function ok() {}"
+
+    invalid_css_samples = [
+        "body { color: red; /* unclosed comment",
+        "body { color: red; }}",
+        "h1 { font-size: 20px; { color: blue; }"
+    ]
+    for bad_css in invalid_css_samples:
+        res = run_qa_checks(valid_html, bad_css, valid_js)
+        assert not res["passed"], f"QA gate accepted invalid CSS: {bad_css}"
+        assert any("CSS" in e for e in res["errors"])

@@ -14,49 +14,87 @@ STATE_CHANGING_ENDPOINTS = [
     ('/api/settings', {"provider": "gemini"})
 ]
 
-def test_hostile_origins_rejected_on_all_endpoints(client):
+@pytest.mark.parametrize("endpoint,payload", STATE_CHANGING_ENDPOINTS)
+def test_hostile_origins_rejected_on_all_endpoints(client, endpoint, payload):
     """Verify that every state-changing endpoint rejects foreign browser origins."""
     hostile_headers = {"Origin": "https://malicious-website.com"}
-    for endpoint, payload in STATE_CHANGING_ENDPOINTS:
-        res = client.post(endpoint, json=payload, headers=hostile_headers)
-        assert res.status_code == 403, f"Endpoint {endpoint} allowed foreign origin!"
-        assert "Invalid origin" in res.get_json()["error"]
+    res = client.post(endpoint, json=payload, headers=hostile_headers)
+    assert res.status_code == 403, f"Endpoint {endpoint} allowed foreign origin!"
+    assert "Invalid origin" in res.get_json()["error"]
 
-def test_null_origin_rejected(client):
-    """Verify that Origin: null (from sandboxed iframes or data URIs) is rejected."""
+@pytest.mark.parametrize("endpoint,payload", STATE_CHANGING_ENDPOINTS)
+def test_null_origin_rejected_on_all_endpoints(client, endpoint, payload):
+    """Verify that Origin: null (sandboxed iframes, data URIs) is rejected on all endpoints."""
     headers = {"Origin": "null"}
-    for endpoint, payload in STATE_CHANGING_ENDPOINTS:
+    res = client.post(endpoint, json=payload, headers=headers)
+    assert res.status_code == 403
+    assert "Invalid origin" in res.get_json()["error"]
+
+@pytest.mark.parametrize("endpoint,payload", STATE_CHANGING_ENDPOINTS)
+@pytest.mark.parametrize("bad_port", [3000, 5000, 9000, 80, 443])
+def test_unexpected_ports_on_localhost_rejected(client, endpoint, payload, bad_port):
+    """Verify that localhost/127.0.0.1 origins on unexpected ports are strictly rejected."""
+    for host in ["127.0.0.1", "localhost"]:
+        headers = {"Origin": f"http://{host}:{bad_port}"}
         res = client.post(endpoint, json=payload, headers=headers)
-        assert res.status_code == 403
-        assert "Invalid origin" in res.get_json()["error"]
+        assert res.status_code == 403, f"Endpoint {endpoint} allowed unexpected port {bad_port} on {host}!"
 
-def test_malformed_origin_rejected(client):
-    """Verify that malformed Origin headers (invalid ports, schemes) are rejected."""
-    bad_origins = [
-        "http://attacker.com:999999",
-        "javascript:alert(1)",
-        "ftp://localhost",
-        "http://",
-        "   "
-    ]
-    for bad in bad_origins:
-        res = client.post('/api/settings', json={"provider": "gemini"}, headers={"Origin": bad})
-        assert res.status_code == 403
+@pytest.mark.parametrize("endpoint,payload", STATE_CHANGING_ENDPOINTS)
+@pytest.mark.parametrize("untrusted_host", [
+    "evil.com",
+    "localhost.evil.com",
+    "127.0.0.1.nip.io",
+    "attacker.com",
+    "not-localhost"
+])
+def test_untrusted_hosts_rejected(client, endpoint, payload, untrusted_host):
+    """Verify that non-whitelisted hosts are rejected even on port 8080."""
+    headers = {"Origin": f"http://{untrusted_host}:8080"}
+    res = client.post(endpoint, json=payload, headers=headers)
+    assert res.status_code == 403
 
-def test_sec_fetch_site_cross_site_rejected(client):
-    """Verify that requests flagged as cross-site by browser Fetch Metadata are blocked."""
+@pytest.mark.parametrize("bad_scheme", [
+    "ftp://127.0.0.1:8080",
+    "javascript:alert(1)",
+    "file:///C:/test",
+    "ws://127.0.0.1:8080"
+])
+def test_malformed_and_unsupported_schemes_rejected(client, bad_scheme):
+    """Verify that unsupported URL schemes and malformed origins are rejected."""
+    res = client.post('/api/settings', json={"provider": "gemini"}, headers={"Origin": bad_scheme})
+    assert res.status_code == 403
+
+@pytest.mark.parametrize("endpoint,payload", STATE_CHANGING_ENDPOINTS)
+def test_sec_fetch_site_cross_site_rejected(client, endpoint, payload):
+    """Verify that requests marked cross-site by browser Fetch Metadata are blocked."""
     headers = {
         "Sec-Fetch-Site": "cross-site",
-        "Origin": "http://127.0.0.1:8080"  # Spoofed origin but browser marked cross-site
+        "Origin": "http://127.0.0.1:8080"  # Spoofed origin but browser tagged cross-site
     }
-    res = client.post('/api/settings', json={"provider": "gemini"}, headers=headers)
+    res = client.post(endpoint, json=payload, headers=headers)
     assert res.status_code == 403
 
-def test_foreign_referer_rejected_when_origin_absent(client):
-    """Verify that foreign Referer is rejected when Origin is not provided."""
-    headers = {"Referer": "https://attacker.com/evil_page.html"}
-    res = client.post('/api/settings', json={"provider": "gemini"}, headers=headers)
+@pytest.mark.parametrize("endpoint,payload", STATE_CHANGING_ENDPOINTS)
+@pytest.mark.parametrize("bad_referer", [
+    "https://attacker.com/evil_page.html",
+    "http://localhost:3000/app",
+    "http://127.0.0.1:9999/test",
+    "ftp://localhost:8080/index.html"
+])
+def test_foreign_or_unexpected_port_referer_rejected(client, endpoint, payload, bad_referer):
+    """Verify that foreign or unexpected port Referer is rejected when Origin is absent."""
+    headers = {"Referer": bad_referer}
+    res = client.post(endpoint, json=payload, headers=headers)
     assert res.status_code == 403
+
+@pytest.mark.parametrize("endpoint,payload", STATE_CHANGING_ENDPOINTS)
+def test_valid_referer_accepted_when_origin_absent(client, endpoint, payload):
+    """Verify that valid Referer from 127.0.0.1:8080 is accepted when Origin is absent."""
+    import os
+    os.makedirs(os.path.join("generated_apps", "test_folder"), exist_ok=True)
+    headers = {"Referer": "http://127.0.0.1:8080/index.html"}
+    res = client.post(endpoint, json=payload, headers=headers)
+    assert res.status_code != 403 or "Invalid origin" not in (res.get_json() or {}).get("error", "")
 
 def test_host_header_injection_does_not_bypass_origin_check(client):
     """Verify that spoofing Host: evil.com does NOT authorize Origin: http://evil.com."""
@@ -67,13 +105,17 @@ def test_host_header_injection_does_not_bypass_origin_check(client):
     res = client.post('/api/settings', json={"provider": "gemini"}, headers=headers)
     assert res.status_code == 403
 
-def test_form_submission_without_json_content_type_rejected(client):
-    """Verify that browser form POSTs (non-JSON) without valid origin are rejected."""
-    res = client.post('/api/start_task', data="task=evil_task", content_type="application/x-www-form-urlencoded")
+@pytest.mark.parametrize("content_type", [
+    "application/x-www-form-urlencoded",
+    "multipart/form-data"
+])
+def test_browser_form_submission_without_origin_rejected(client, content_type):
+    """Verify that browser form POSTs without valid origin are rejected."""
+    res = client.post('/api/start_task', data="task=evil_task", content_type=content_type)
     assert res.status_code == 403
 
-def test_valid_localhost_origin_allowed(client):
-    """Verify that requests from legitimate 127.0.0.1 and localhost origins are accepted."""
-    for valid_origin in ["http://127.0.0.1:8080", "http://localhost:8080", "http://127.0.0.1", "http://localhost"]:
+def test_valid_exact_local_origins_allowed(client):
+    """Verify that requests from legitimate exact configured port origins are accepted."""
+    for valid_origin in ["http://127.0.0.1:8080", "http://localhost:8080"]:
         res = client.post('/api/settings', json={"provider": "gemini"}, headers={"Origin": valid_origin})
         assert res.status_code == 200

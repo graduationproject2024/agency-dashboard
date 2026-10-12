@@ -10,13 +10,15 @@ import copy
 import uuid
 import subprocess
 from urllib.parse import urlparse
+from html.parser import HTMLParser
 
 # Secure Flask initialization: Never expose current working directory as static root
 app = Flask(__name__, static_folder=None)
 
-DEFAULT_AGENTS_DIR = os.path.abspath(r"c:\Users\sam20\agency-agents")
+REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_AGENTS_DIR = os.path.abspath(os.path.join(REPO_DIR, "..", "agency-agents"))
 AGENTS_DIR = os.environ.get('AGENTS_DIR') or (
-    DEFAULT_AGENTS_DIR if os.path.exists(DEFAULT_AGENTS_DIR) else os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "agency-agents"))
+    DEFAULT_AGENTS_DIR if os.path.exists(DEFAULT_AGENTS_DIR) else os.path.abspath(os.path.join(REPO_DIR, "agency-agents"))
 )
 SETTINGS_FILE = 'settings.json'
 BUDGET_FILE = 'budget.json'
@@ -27,21 +29,29 @@ os.makedirs(GENERATED_APPS_DIR, exist_ok=True)
 WINDOWS_RESERVED = {'CON', 'PRN', 'AUX', 'NUL'} | {f'COM{i}' for i in range(1, 10)} | {f'LPT{i}' for i in range(1, 10)}
 
 ALLOWED_LOCAL_HOSTS = {'127.0.0.1', 'localhost'}
+ALLOWED_SCHEMES = {'http', 'https'}
+
+def get_allowed_ports():
+    return {int(os.environ.get('PORT', 8080))}
 
 def is_safe_origin(req):
     """
-    Consistent request-validation policy for browser-originated state-changing requests.
-    - Rejects foreign origins, null origins, and malformed origins.
-    - Defends against Fetch Metadata cross-site indications.
-    - Validates Referer if Origin is absent.
-    - Rejects cross-site browser form submissions (urlencoded/multipart) when Origin is absent.
-    - Never blindly trusts attacker-controlled Host headers.
+    Strict request-validation policy for state-changing requests.
+    - Defines explicit trusted-origin policy matching configured host and exact port.
+    - Rejects foreign origins, null origins, unsupported schemes, and unexpected ports.
+    - Never trusts an attacker-controlled Host header.
+    - Rejects cross-site Fetch Metadata indications.
+    - Validates Referer against the exact trusted origin if Origin is absent.
+    - If both Origin and Referer are absent, rejects browser form requests (urlencoded/multipart)
+      and cross-site navigation, allowing only non-browser API clients with Content-Type: application/json.
     """
     # 1. Fetch Metadata defense-in-depth
     sec_fetch_site = req.headers.get('Sec-Fetch-Site')
     if sec_fetch_site == 'cross-site':
         return False
         
+    allowed_ports = get_allowed_ports()
+
     origin_header = req.headers.get('Origin')
     if origin_header is not None:
         origin = origin_header.strip()
@@ -49,12 +59,13 @@ def is_safe_origin(req):
             return False
         try:
             parsed = urlparse(origin)
-            if parsed.scheme.lower() not in ('http', 'https') or not parsed.hostname:
+            if parsed.scheme.lower() not in ALLOWED_SCHEMES or not parsed.hostname:
                 return False
             # Never trust req.host - validate strictly against ALLOWED_LOCAL_HOSTS
             if parsed.hostname.lower() not in ALLOWED_LOCAL_HOSTS:
                 return False
-            if parsed.port is not None and not (1 <= parsed.port <= 65535):
+            effective_port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+            if effective_port not in allowed_ports:
                 return False
         except Exception:
             return False
@@ -66,9 +77,12 @@ def is_safe_origin(req):
         referer = referer.strip()
         try:
             parsed_ref = urlparse(referer)
-            if parsed_ref.scheme.lower() not in ('http', 'https') or not parsed_ref.hostname:
+            if parsed_ref.scheme.lower() not in ALLOWED_SCHEMES or not parsed_ref.hostname:
                 return False
             if parsed_ref.hostname.lower() not in ALLOWED_LOCAL_HOSTS:
+                return False
+            effective_ref_port = parsed_ref.port or (443 if parsed_ref.scheme == 'https' else 80)
+            if effective_ref_port not in allowed_ports:
                 return False
         except Exception:
             return False
@@ -81,6 +95,7 @@ def is_safe_origin(req):
         return False
 
     content_type = (req.content_type or '').lower()
+    # Reject cross-origin browser form submissions (urlencoded/multipart) attempting to strip referrer
     if 'application/x-www-form-urlencoded' in content_type or 'multipart/form-data' in content_type:
         return False
         
@@ -120,16 +135,33 @@ def discover_agents(agents_dir=None):
         }
         
     agents_list = []
-    ignored_files = {'README.md', 'CONTRIBUTING.md', 'SECURITY.md', 'LICENSE.md'}
+    ignored_files = {
+        'README.md', 'CONTRIBUTING.md', 'SECURITY.md', 'LICENSE.md',
+        'CHANGELOG.md', 'INDEX.md', 'TODO.md', 'SUMMARY.md',
+        'PLAN.md', 'REPORT.md', 'CONTEXT.md', 'TEMPLATE.md'
+    }
     
     try:
         for root, dirs, files in os.walk(target_dir, followlinks=False):
-            dirs[:] = [d for d in dirs if d not in {'.git', 'node_modules', '__pycache__'}]
+            # Prune hidden directories, build tools, and non-agent folders
+            dirs[:] = [
+                d for d in dirs 
+                if not d.startswith('.') and d not in {'node_modules', '__pycache__', 'venv', '.venv', 'examples', 'scripts', 'tests'}
+            ]
             dept = os.path.basename(root)
-            if dept == "agency-agents":
+            if dept in ("agency-agents", "agents"):
                 dept = "General"
             for f in files:
-                if f.endswith('.md') and f not in ignored_files:
+                if f.startswith('.'):
+                    continue
+                if f.endswith('.md') and f not in ignored_files and not f.endswith('_zh-CN.md'):
+                    f_path = os.path.join(root, f)
+                    try:
+                        # Genuine agent definition format check: non-empty file
+                        if os.path.getsize(f_path) < 20:
+                            continue
+                    except OSError:
+                        continue
                     raw_id = f.replace('.md', '')
                     clean_name = raw_id.replace('-', ' ').title()
                     agents_list.append({
@@ -702,28 +734,93 @@ def run_workflow(task_desc):
         update_stats()
         add_feed("النظام", "System", "red", "ERR", f"توقف سير العمل: {str(e)}")
 
+class StrictHTMLStructureValidator(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.tags = []
+        self.has_html = False
+        self.has_body = False
+        self.has_head = False
+        self.has_div = False
+        self.parse_error = None
+        self.void_tags = {'meta', 'link', 'img', 'br', 'hr', 'input', 'source', 'area', 'base', 'col', 'embed', 'param', 'track', 'wbr'}
+        
+    def handle_starttag(self, tag, attrs):
+        t = tag.lower()
+        if t == 'html':
+            self.has_html = True
+        elif t == 'body':
+            self.has_body = True
+        elif t == 'head':
+            self.has_head = True
+        elif t == 'div':
+            self.has_div = True
+        if t not in self.void_tags:
+            self.tags.append(t)
+            
+    def handle_endtag(self, tag):
+        t = tag.lower()
+        if t in self.void_tags:
+            return
+        if self.tags and self.tags[-1] == t:
+            self.tags.pop()
+        elif t in self.tags:
+            while self.tags and self.tags[-1] != t:
+                self.tags.pop()
+            if self.tags:
+                self.tags.pop()
+
+def verify_js_syntax(js_code):
+    """
+    Check JavaScript syntax using Node.js without executing the code.
+    Falls back to delimiter parsing if Node is unavailable.
+    """
+    if not js_code or not isinstance(js_code, str) or not js_code.strip():
+        return False, "JavaScript code is missing or empty"
+    try:
+        res = subprocess.run(
+            ["node", "-e", "try { new Function(process.argv[1]); process.exit(0); } catch(e) { console.error(e.message); process.exit(1); }", js_code],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if res.returncode != 0:
+            err = res.stderr.strip() or res.stdout.strip() or "Syntax error in JavaScript"
+            return False, err
+        return True, None
+    except Exception:
+        # Fallback to structural checks if node binary cannot be invoked
+        return None, None
+
 def run_qa_checks(app_html, app_css="", app_js=""):
     """
     Production QA Gate Entry Point:
-    Directly testable structural and syntactic verification.
-    Verifies HTML structure, delimiter balance (CSS/JS), absence of fatal errors,
+    Directly testable structural, syntactic, and asset completeness verification.
+    Explicitly rejects missing or empty required HTML, CSS, and JS assets.
+    Verifies HTML structure using HTMLParser, validates JS syntax via Node parser,
     and returns a structured report.
     """
     errors = []
     
     # 1. HTML Verification
-    if not app_html or not isinstance(app_html, str):
-        errors.append("HTML content is missing or empty")
+    if not app_html or not isinstance(app_html, str) or not app_html.strip():
+        errors.append("Required HTML artifact is missing or empty")
     elif len(app_html.strip()) < 50:
         errors.append("HTML document is truncated / too short (under 50 characters)")
     else:
         lower_html = app_html.lower()
         has_doctype = "<!doctype html" in lower_html
-        has_html_tags = ("<html" in lower_html and "</html>" in lower_html)
-        has_body_tags = ("<body" in lower_html and "</body>" in lower_html)
-        has_div_tags = ("<div" in lower_html and "</div>" in lower_html)
         
-        if not (has_html_tags or (has_doctype and (has_body_tags or has_div_tags))):
+        validator = StrictHTMLStructureValidator()
+        try:
+            validator.feed(app_html)
+            validator.close()
+        except Exception as e:
+            errors.append(f"HTML parsing failed with syntax error: {str(e)}")
+            
+        has_structure = (has_doctype and (validator.has_body or validator.has_div or validator.has_html)) or (validator.has_html and (validator.has_body or validator.has_div))
+        has_closing_tags = ("</html>" in lower_html or "</body>" in lower_html or ("</div>" in lower_html and has_doctype))
+        if not has_structure or not has_closing_tags:
             errors.append("HTML lacks proper document structure or closing tags")
             
         fatal_strings = [
@@ -737,14 +834,18 @@ def run_qa_checks(app_html, app_css="", app_js=""):
                 break
 
     # 2. CSS Verification
-    if app_css and isinstance(app_css, str):
+    if not app_css or not isinstance(app_css, str) or not app_css.strip():
+        errors.append("Required CSS artifact is missing or empty")
+    else:
         if app_css.count('{') != app_css.count('}'):
             errors.append(f"CSS has unbalanced braces ({{: {app_css.count('{')}, }}: {app_css.count('}')})")
         if app_css.count('/*') != app_css.count('*/'):
             errors.append("CSS has unclosed block comments (/* ... */)")
 
     # 3. JavaScript Verification
-    if app_js and isinstance(app_js, str):
+    if not app_js or not isinstance(app_js, str) or not app_js.strip():
+        errors.append("Required JavaScript artifact is missing or empty")
+    else:
         if app_js.count('{') != app_js.count('}'):
             errors.append(f"JavaScript has unbalanced braces ({{: {app_js.count('{')}, }}: {app_js.count('}')})")
         if app_js.count('(') != app_js.count(')'):
@@ -753,11 +854,16 @@ def run_qa_checks(app_html, app_css="", app_js=""):
             errors.append(f"JavaScript has unbalanced brackets ([: {app_js.count('[')}, ]: {app_js.count(']')})")
         if app_js.count('/*') != app_js.count('*/'):
             errors.append("JavaScript has unclosed block comments")
+            
+        # Real Node.js syntax verification
+        js_valid, js_err = verify_js_syntax(app_js)
+        if js_valid is False:
+            errors.append(f"JavaScript syntax error: {js_err}")
 
     passed = len(errors) == 0
     checks = {
         "html_extracted": bool(app_html and len(app_html.strip()) >= 50),
-        "html_doctype_or_tags": not any("structure" in e for e in errors),
+        "html_doctype_or_tags": not any("HTML" in e for e in errors),
         "no_fatal_error_strings": not any("Fatal error" in e for e in errors),
         "css_syntax_balanced": not any("CSS" in e for e in errors),
         "js_syntax_balanced": not any("JavaScript" in e for e in errors)
@@ -939,9 +1045,12 @@ def continue_workflow(feedback=""):
             f.write(f"# المنتج النهائي لمشروع: {task_title}\n\n")
             f.write(f"## 1. دراسة الجدوى (الاستراتيجية)\n{workflow_state['outputs'].get('strategy', '')}\n\n")
             f.write(f"## 2. وثيقة المتطلبات (PRD)\n{workflow_state['outputs'].get('product', '')}\n\n")
-            f.write(f"## 3. الهيكلة الهندسية (Architecture)\n{eng_out}\n\n")
-            f.write(f"## 4. تصميم الواجهات (UI/UX)\n{des_out}\n\n")
-            f.write(f"## 5. تقرير فحص الجودة (QA Report)\n{json.dumps(qa_checks, indent=2)}\n\n")
+            f.write(f"## 3. الهيكلة الهندسية (Architecture)\n{workflow_state['outputs'].get('engineering', '')}\n\n")
+            f.write(f"## 4. تصميم الواجهات (UI/UX)\n{workflow_state['outputs'].get('design', '')}\n\n")
+            f.write(f"## 5. تقرير فحص الجودة (QA Report)\n{json.dumps(qa_report, indent=2, ensure_ascii=False)}\n\n")
+
+        with open(os.path.join(app_dir, "qa_report.json"), "w", encoding="utf-8") as f:
+            json.dump(qa_report, f, indent=2, ensure_ascii=False)
 
         add_feed("مدير المشروع", "Project Manager", "linear-gradient(135deg, #f6d365, #fda085)", "PM", f"تم اكتمال المشروع وتجاوز فحص الجودة بنجاح! 🚀 المجلد: `{clean_folder_name}`")
         
