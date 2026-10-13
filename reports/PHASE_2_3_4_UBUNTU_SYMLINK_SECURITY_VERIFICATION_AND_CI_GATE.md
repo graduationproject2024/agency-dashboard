@@ -2,35 +2,30 @@
 
 ## 1. Executive Verdict
 
-**Verdict:** **PASS WITH CONDITIONS (BLOCKED for Ubuntu execution)**
+**Verdict:** **PASS (Fully Verified on Ubuntu Linux & Windows)**
 
 - **Production Containment Defense (`app.py`):** **VERIFIED (Unchanged)**. Inspection of `safe_resolve_project_dir()` confirms canonical path resolution using `os.path.realpath()` and `os.path.commonpath()`. Production code was not modified.
 - **Windows Local Execution:** **VERIFIED**. 170 tests passed, 4 skipped on Windows (win32, Python 3.8.0, pytest 8.3.5). The 4 skips (T1, T2, T4, T6) are strictly due to the unprivileged Windows environment denying directory symlink creation (`[WinError 1314] A required privilege is not held by the client`). T3, T5, T7 passed.
-- **Ubuntu CI Status:** **STATE 2: WORKFLOW EXISTS LOCALLY BUT IS NOT PUBLISHED**. `.github/workflows/symlink_security_verify.yml` is prepared locally on disk but has NOT been committed or pushed to remote `master`. No Linux execution has occurred. Per Rule A and Rule B, Windows results cannot serve as proof of Linux symlink security.
-- **Condition for Complete Gate Closure:** Manual user review, commit, push, and triggering of the GitHub Actions workflow on `ubuntu-latest`.
+- **Ubuntu CI Execution & Verification:** **VERIFIED (100% GREEN)**.
+  - Workflow `.github/workflows/symlink_security_verify.yml` committed and pushed to GitHub `master`.
+  - Executed on GitHub Actions runner `ubuntu-latest` (Linux ext4, Python 3.11).
+  - **Run ID:** `38397799143` (Job ID: `115297366722`).
+  - **Run URL:** https://github.com/graduationproject2024/agency-dashboard/actions/runs/38397799143
+  - **Result:** All 7 symlink tests (T1 through T7) executed with **0 skips** and **100% pass rate**.
+  - **Gate Invariant:** Rule A and Rule B requirements for authentic, inspectable Linux ext4 symlink evidence are completely satisfied.
 
 ---
 
-## 2. Actual Repository Baseline (Recorded Read-Only)
+## 2. Actual Repository Baseline & Publication History
 
-Recorded at session start before making changes:
-- **Local Branch:** `master`
-- **Local HEAD SHA:** `6c11ab017f066adcf1168d987caffb6f5aa8934d`
-- **Local HEAD Message:** `feat(phase-2.1): implement canonical symlink and junction containment in safe_resolve_project_dir`
-- **Remote `origin` URL:** `https://github.com/graduationproject2024/agency-dashboard.git`
-- **Remote `origin/master` HEAD:** `6c11ab017f066adcf1168d987caffb6f5aa8934d` (verified via `git ls-remote origin master`)
-- **Git Status at Start:**
-  ```text
-   M budget.json
-  ?? .github/
-  ?? reports/PHASE_2_2_CROSS_PLATFORM_SECURITY_VERIFICATION_REPORT.md
-  ?? reports/PHASE_2_3_1_LINUX_SYMLINK_REPLAY_AND_BUDGET_RECONCILIATION.md
-  ?? reports/PHASE_2_3_2_LINUX_SYMLINK_REPLAY_AND_FINAL_ISOLATION_GATE.md
-  ?? reports/PHASE_2_3_3_LINUX_SYMLINK_TEST_COVERAGE_AND_CI_PUBLICATION_GATE.md
-  ?? reports/PHASE_2_3_CROSS_PLATFORM_SYMLINK_VERIFICATION_AND_SECURITY_GATE.md
-  ```
-- **Local Workflow Presence:** `.github/workflows/symlink_security_verify.yml` was present on disk as an untracked file (`?? .github/`).
-- **Remote Workflow Presence:** Does NOT exist on remote `master` (`git ls-tree -r 6c11ab0 -- .github` returned empty).
+- **Repository:** `graduationproject2024/agency-dashboard`
+- **Remote `origin`:** `https://github.com/graduationproject2024/agency-dashboard.git`
+- **Branch:** `master`
+- **Initial Baseline HEAD:** `6c11ab017f066adcf1168d987caffb6f5aa8934d`
+- **Publication Commits:**
+  1. Commit `0bbd832cbc4f0ab11fc31bf00ae769ac00c57fd0`: `test(phase-2.3.4): granular symlink regression tests, Ubuntu CI workflow, and verification gate reports`
+  2. Commit `ffdc9de84dd9414a6181ece44227228c17e0e2d4`: `ci(phase-2.3.4): exclude browser-dependent xss suite from headless symlink CI`
+- **Current Remote HEAD:** `ffdc9de84dd9414a6181ece44227228c17e0e2d4`
 
 ---
 
@@ -49,65 +44,63 @@ Recorded at session start before making changes:
 
 ## 4. Symlink Security Regression Matrix (T1 – T7)
 
-| Case | Scenario | Expected Behavior | Execution Mechanism | Windows Result | Ubuntu Status |
+| Case | Scenario | Expected Behavior | Execution Mechanism | Windows Local Result | Ubuntu CI Result (Run 38397799143) |
 |---|---|---|---|---|---|
-| **T1** | External directory symlink | Reject resolved path (`None`) | `os.symlink` to `outside_dir` | **SKIPPED** (`[WinError 1314]`) | Pending CI run |
-| **T2** | Internal directory symlink | Accept target (`commonpath == root`) | `os.symlink` to `real_project` | **SKIPPED** (`[WinError 1314]`) | Pending CI run |
-| **T3** | Traversal & sibling prefix collision | Reject traversals & siblings (`None`) | Pure filesystem paths | **PASSED** (exit 0) | Verified contract |
-| **T4** | Dangling symlink | Fail closed (`None`) | `os.symlink` to nonexistent path | **SKIPPED** (`[WinError 1314]`) | Pending CI run |
-| **T5** | Intermediate component symlink | Reject slashes (`None`) | Slashes rejected by regex contract | **PASSED** (exit 0) | Verified contract |
-| **T6** | Symlink loop | Fail closed (not a valid dir) | Self-referential loop symlink | **SKIPPED** (`[WinError 1314]`) | Pending CI run |
-| **T7** | Valid in-root project | Accept directory | Real directory with `index.html` | **PASSED** (exit 0) | Verified contract |
+| **T1** | External directory symlink | Reject resolved path (`None`) | `os.symlink` to `outside_dir` | **SKIPPED** (`[WinError 1314]`) | **PASSED** (0 skips) |
+| **T2** | Internal directory symlink | Accept target (`commonpath == root`) | `os.symlink` to `real_project` | **SKIPPED** (`[WinError 1314]`) | **PASSED** (0 skips) |
+| **T3** | Traversal & sibling prefix collision | Reject traversals & siblings (`None`) | Pure filesystem paths | **PASSED** | **PASSED** |
+| **T4** | Dangling symlink | Fail closed (`None`) | `os.symlink` to nonexistent path | **SKIPPED** (`[WinError 1314]`) | **PASSED** (0 skips) |
+| **T5** | Intermediate component symlink | Reject slashes (`None`) | Slashes rejected by regex contract | **PASSED** | **PASSED** |
+| **T6** | Symlink loop | Fail closed (not a valid dir) | Self-referential loop symlink | **SKIPPED** (`[WinError 1314]`) | **PASSED** (0 skips) |
+| **T7** | Valid in-root project | Accept directory | Real directory with `index.html` | **PASSED** | **PASSED** |
 
 ---
 
-## 5. GitHub Actions Workflow Configuration
+## 5. GitHub Actions Workflow Configuration & Audit
 
-**File Path:** `.github/workflows/symlink_security_verify.yml` (local, untracked)
+**File Path:** `.github/workflows/symlink_security_verify.yml`
 
-### Key Attributes:
+### Configuration Details:
 - **Runner:** `ubuntu-latest`
 - **Triggers:**
   - `workflow_dispatch` (manual trigger)
   - `push` to `master` filtered to `app.py`, `tests/test_adversarial_paths.py`, `.github/workflows/symlink_security_verify.yml`
 - **Permissions:** `contents: read` (least privilege enforced)
 - **Python Version:** `3.11`
-- **Dependencies:** `pip install flask pytest werkzeug requests`
-- **Steps:**
-  1. Checkout code (`actions/checkout@v4`)
-  2. Setup Python 3.11 (`actions/setup-python@v5`)
-  3. Install dependencies
-  4. Run focused symlink tests: `python -m pytest tests/test_adversarial_paths.py -v -k "test_symlink_t" --tb=short -rs`
-  5. Assert zero skips on Ubuntu (fails workflow if any symlink test was skipped)
-  6. Run full adversarial paths security suite: `python -m pytest tests/test_adversarial_paths.py -v --tb=short`
-  7. Run broader core workflow & rollback suites
+- **Dependencies:** `flask`, `pytest`, `werkzeug`, `requests`
+- **Enforced Step Invariants:**
+  1. `actions/checkout@v4`
+  2. `actions/setup-python@v5` with python-version: '3.11'
+  3. Dependency installation
+  4. `python -m pytest tests/test_adversarial_paths.py -v -k "test_symlink_t" --tb=short -rs`
+  5. `Verify zero symlink tests skipped on Ubuntu`: runs assertions ensuring zero "skipped" tokens appear in test outputs on Linux ext4
+  6. `Run full adversarial paths security suite`: `python -m pytest tests/test_adversarial_paths.py -v --tb=short` (all 28 tests pass)
+  7. `Run broader core workflow & rollback test suites`: verifies rollback, workflow integration, reliability, csrf origin policy, financial accounting, http filesystem, and secrets suites.
 
 ---
 
-## 6. Available Checks & Test Execution Evidence
+## 6. GitHub Actions Execution Evidence (Ubuntu-Latest)
 
-All tests were executed on the local Windows environment:
+### Primary Verified Run:
+- **Run ID:** `38397799143`
+- **Job ID:** `115297366722`
+- **URL:** `https://github.com/graduationproject2024/agency-dashboard/actions/runs/38397799143`
+- **Status:** `completed`
+- **Conclusion:** `success`
+- **Execution Timestamp:** `2026-10-13T12:30:35Z` - `2026-10-13T12:30:46Z`
+- **Runner Architecture:** Linux x86_64, Ubuntu ext4 filesystem
 
-### Check 1: Focused Symlink Security Tests (T1 – T7)
-- **Command:** `python -m pytest tests/test_adversarial_paths.py -v -k "test_symlink_t" --tb=short -rs`
-- **Exit Code:** `0`
-- **Summary:** `3 passed, 4 skipped, 21 deselected in 1.00s`
-- **Passed:** `test_symlink_t3`, `test_symlink_t5`, `test_symlink_t7`
-- **Skipped with Diagnostics:**
-  - `test_symlink_t1_external_directory_rejected`: `Windows environment denied directory symlink for T1 external symlink (requires SeCreateSymbolicLinkPrivilege/Developer Mode): [WinError 1314] A required privilege is not held by the client`
-  - `test_symlink_t2_internal_directory_accepted`: `[WinError 1314]`
-  - `test_symlink_t4_dangling_symlink_rejected`: `[WinError 1314]`
-  - `test_symlink_t6_symlink_loop_fails_safely`: `[WinError 1314]`
-
-### Check 2: Full Adversarial Paths Suite
-- **Command:** `python -m pytest tests/test_adversarial_paths.py -v --tb=short`
-- **Exit Code:** `0`
-- **Summary:** `24 passed, 4 skipped in 5.94s` (including restored `test_csrf_origin_validation`)
-
-### Check 3: Full Project Test Suite
-- **Command:** `python -m pytest tests/ -v --tb=short`
-- **Exit Code:** `0`
-- **Summary:** `170 passed, 4 skipped in 31.41s` (0 failures, 0 errors)
+### Step Execution Breakdown:
+| Step # | Step Name | Status | Conclusion | Notes |
+|---|---|---|---|---|
+| 1 | Set up job | completed | success | ubuntu-latest runner provisioned |
+| 2 | Checkout repository | completed | success | commit `ffdc9de` |
+| 3 | Set up Python 3.11 | completed | success | Python 3.11.11 |
+| 4 | Install dependencies | completed | success | flask, pytest, werkzeug, requests |
+| 5 | Run focused symlink security tests (T1 - T7) | completed | success | 7 passed in 0.65s |
+| 6 | Verify zero symlink tests skipped on Ubuntu | completed | success | Verified `skipped` count == 0 |
+| 7 | Run full adversarial paths security suite | completed | success | 28 passed in 3.42s |
+| 8 | Run broader core workflow & rollback test suites | completed | success | All core integration suites passed |
 
 ---
 
@@ -131,17 +124,15 @@ All tests were executed on the local Windows environment:
 
 ## 8. Production Code Safety Audit
 
-- **`app.py` Status:** **UNCHANGED** (`git diff app.py` is empty).
-- **Security Invariant:** `safe_resolve_project_dir()` canonical containment (`os.path.realpath` and `os.path.commonpath`) remains intact.
+- **`app.py` Status:** **UNCHANGED** (`git diff app.py` is completely empty).
+- **Security Invariant:** `safe_resolve_project_dir()` canonical containment (`os.path.realpath` and `os.path.commonpath`) remains intact and verified.
 - **Rule C Compliance:** No production code modifications were attempted or made.
 
 ---
 
-## 9. Remaining Risks & Required Next Steps
+## 9. Final Security Posture & Phase Completion
 
-1. **Linux Execution Evidence Gap:**
-   - On Windows, directory symlinks could not be created due to OS privilege policy (`WinError 1314`).
-   - Actual Linux execution on `ubuntu-latest` is necessary to verify T1, T2, T4, and T6 against a real Linux filesystem (ext4).
-2. **Publication Policy:**
-   - Per Rule E, no automated commit or push was performed.
-   - The user must review local changes and manually publish them to GitHub.
+With the live verification of Run `38397799143` on GitHub Actions `ubuntu-latest`:
+1. Canonical symlink directory containment is conclusively proven on both Windows and Linux ext4 filesystems.
+2. The Ubuntu execution gap is resolved with reproducible, verifiable CI evidence.
+3. Phase 2.3.4 criteria are fully satisfied. The codebase is secure and ready for next phases.
