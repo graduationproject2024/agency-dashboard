@@ -18,158 +18,7 @@ def test_safe_resolve_project_dir_blocks_root_generated_apps_dir():
     assert safe_resolve_project_dir(".") is None
     assert safe_resolve_project_dir("") is None
 
-def test_safe_resolve_project_dir_canonical_symlink_defense(tmp_path, monkeypatch):
-    """
-    Phase 2.1 adversarial: symlink defense via canonical path containment.
-    T1 — Outside-target directory symlink (rejected when link created successfully).
-    T2 — Inside-target directory symlink (accepted if inside workspace).
-    T3 — Prefix collision (sibling path rejected).
-    T5 — Intermediate-component symlink escape (rejected).
-    T6 — Broken symlink (fails closed / raises expected error).
-    T7 — Symlink loop (fails safely, not accepted as valid).
-    Creates links only in isolated tmp_path; never touches actual repo workspace.
-    """
-    import uuid
-    import tempfile
-    # Use isolated workspace under tmp_path
-    workspace = str(tmp_path / "generated_apps")
-    os.makedirs(workspace, exist_ok=True)
-    monkeypatch.setattr("app.GENERATED_APPS_DIR", workspace)
-
-    # T1: Outside-target symlink (directory link from workspace -> outside dir)
-    outside_dir = str(tmp_path / "outside_evil")
-    os.makedirs(outside_dir, exist_ok=True)
-    link_target = str(tmp_path / "generated_apps" / "evil_project")
-    symlink_created = False
-    try:
-        # Try directory symlink (may need privileges / Developer Mode on Windows)
-        os.symlink(outside_dir, link_target, target_is_directory=True)
-        symlink_created = True
-    except (OSError, NotImplementedError) as e:
-        # Record platform limitation rather than silently skip
-        pytest.skip(f"Platform cannot create directory symlink for T1 (needs privileges/Developer Mode on Windows): {e}")
-
-    if symlink_created:
-        # Resolve via function: should reject because realpath points outside workspace
-        result = safe_resolve_project_dir("evil_project")
-        assert result is None, f"T1 FAIL: outside-target symlink accepted: {result}"
-        # Cleanup: remove symlink (not the outside dir)
-        try:
-            if os.path.islink(link_target):
-                os.unlink(link_target)
-        except OSError:
-            pass
-
-    # T2: Inside-target symlink (symlink to another directory inside workspace)
-    legit_dir = os.path.join(workspace, "real_project")
-    os.makedirs(legit_dir, exist_ok=True)
-    link_inside = os.path.join(workspace, "linked_project")
-    symlink_inside_created = False
-    try:
-        os.symlink(legit_dir, link_inside, target_is_directory=True)
-        symlink_inside_created = True
-    except (OSError, NotImplementedError) as e:
-        pytest.skip(f"Platform cannot create directory symlink for T2: {e}")
-
-    if symlink_inside_created:
-        result = safe_resolve_project_dir("linked_project")
-        # Should be accepted if it resolves inside workspace (compatible with contract)
-        assert result is not None, "T2 FAIL: inside-target symlink incorrectly rejected"
-        assert os.path.commonpath([os.path.realpath(workspace), os.path.realpath(result)]) == os.path.realpath(workspace)
-        try:
-            if os.path.islink(link_inside):
-                os.unlink(link_inside)
-        except OSError:
-            pass
-
-    # T3: Prefix collision (string starts with root but is sibling)
-    sibling_dir = str(tmp_path / "generated_apps_evil")
-    os.makedirs(sibling_dir, exist_ok=True)
-    # Direct pass of sibling name; should reject even if not symlinked
-    result = safe_resolve_project_dir("../generated_apps_evil")
-    assert result is None, "T3 FAIL: parent-traversal to sibling accepted"
-    # Also test direct sibling directory name when workspace root is resolved
-    # (function uses project_name relative to workspace, so sibling via name alone isn't directly callable — document limitation)
-
-    # T4: Parent traversal via ..
-    result = safe_resolve_project_dir("../outside")
-    assert result is None, "T4 FAIL: parent traversal accepted"
-
-    # T6: Broken symlink (symlink pointing to nonexistent target inside workspace)
-    broken_link = os.path.join(workspace, "broken_project")
-    try:
-        os.symlink("/nonexistent/broken_target_12345", broken_link, target_is_directory=True)
-        broken_created = True
-    except (OSError, NotImplementedError) as e:
-        broken_created = False
-        # If creation fails, record limitation; don't claim failure
-    if broken_created:
-        result = safe_resolve_project_dir("broken_project")
-        # With realpath, broken symlink resolves to nonexistent path; commonpath may raise
-        # Function should return None (fail closed) because containment cannot be established
-        assert result is None, f"T6 FAIL: broken symlink accepted: {result}"
-        try:
-            if os.path.islink(broken_link):
-                os.unlink(broken_link)
-        except OSError:
-            pass
-
-    # T7: Symlink loop (where supported; isolated temp dir)
-    loop_a = str(tmp_path / "loop_a")
-    loop_b = str(tmp_path / "loop_b")
-    loop_created = False
-    try:
-        os.makedirs(loop_a, exist_ok=True)
-        os.symlink(loop_b, str(tmp_path / "loop_a" / "loop_link"))
-        # Complete loop: loop_b points back to loop_a
-        # Note: creating loop requires loop_b exist; build minimal
-        os.makedirs(loop_b, exist_ok=True)
-        os.unlink(str(tmp_path / "loop_a" / "loop_link"))
-        os.symlink(str(tmp_path / "loop_a"), str(tmp_path / "loop_b" / "loop_back"))
-        loop_created = True
-    except (OSError, NotImplementedError) as e:
-        # Loop creation may be unsupported; document
-        pass
-    if loop_created:
-        # Resolve loop path through workspace — should not return valid project
-        # We pass a path inside loop_a that points to loop_b pointing back
-        result = safe_resolve_project_dir("loop_a/loop_link")
-        # With realpath, loop resolves to loop_a (or raises); containment should hold or error
-        # Either None (fail safe) or same-dir (contained) — must not accept outside
-        assert result is None or os.path.commonpath([os.path.realpath(workspace), os.path.realpath(result) if result else workspace]) == os.path.realpath(workspace), f"T7 FAIL: loop produced invalid containment: {result}"
-        # Clean up loop links
-        try:
-            for p in [str(tmp_path / "loop_a" / "loop_link"), str(tmp_path / "loop_b" / "loop_back")]:
-                if os.path.islink(p):
-                    os.unlink(p)
-        except OSError:
-            pass
-
-    # T8: Existing valid project remains accessible (no regression)
-    valid_dir = os.path.join(workspace, "valid_project")
-    os.makedirs(valid_dir, exist_ok=True)
-    with open(os.path.join(valid_dir, "index.html"), "w") as f:
-        f.write("<!DOCTYPE html><html></html>")
-    result = safe_resolve_project_dir("valid_project")
-    assert result is not None and result == valid_dir, f"T8 FAIL: valid project rejected: {result}"
-
-def test_safe_resolve_project_dir_prefix_collision_rejected(tmp_path, monkeypatch):
-    """T3 — Prefix collision and T4 traversal rejected with canonical containment."""
-    workspace = str(tmp_path / "generated_apps")
-    os.makedirs(workspace, exist_ok=True)
-    monkeypatch.setattr("app.GENERATED_APPS_DIR", workspace)
-    # Exact sibling directory exists but is not inside workspace
-    sibling = str(tmp_path / "generated_apps_evil")
-    os.makedirs(sibling, exist_ok=True)
-    # Root itself rejected
-    assert safe_resolve_project_dir(".") is None
-    assert safe_resolve_project_dir("") is None
-    # Parent traversal rejected (no symlink needed — pure path)
-    assert safe_resolve_project_dir("../generated_apps_evil") is None
-    # Valid internal project preserved (T8 regression)
-    valid_dir = os.path.join(workspace, "valid_project")
-    os.makedirs(valid_dir, exist_ok=True)
-    assert safe_resolve_project_dir("valid_project") == valid_dir
+def test_csrf_origin_validation(client):
     """Verify that requests from foreign origins are blocked with 403 Forbidden."""
     untrusted_headers = {"Origin": "https://malicious-attacker.com"}
     trusted_headers = {"Origin": "http://127.0.0.1:8080"}
@@ -768,79 +617,122 @@ def test_asset_link_detection_adversarial_and_safe_cases():
         assert res.count("script.js") == 1, f"Duplicated script tag for: {legit}"
 
 
-def test_safe_resolve_project_dir_canonical_symlink_defense(tmp_path, monkeypatch):
-    """T1-T7 symlink defense with isolated tmp_path; skips if platform denies symlink."""
+# --- Canonical Symlink & Workspace Containment Regression Tests (T1 - T7) ---
+
+def _create_symlink_or_handle(target, link_path, description):
+    """
+    Helper to create directory symlink across platforms.
+    On Windows: if unprivileged (WinError 1314), skips test with exact diagnostic.
+    On Linux/Ubuntu: symlink creation failure MUST fail the test (never skip).
+    """
+    import sys
+    try:
+        os.symlink(target, link_path, target_is_directory=True)
+    except OSError as e:
+        if sys.platform == "win32":
+            pytest.skip(f"Windows environment denied directory symlink for {description} (requires SeCreateSymbolicLinkPrivilege/Developer Mode): {e}")
+        else:
+            pytest.fail(f"Required Linux/Ubuntu directory symlink creation failed for {description}: {e}")
+
+def test_symlink_t1_external_directory_rejected(tmp_path, monkeypatch):
+    """T1 — Directory inside root pointing through symlink to external dir must be rejected."""
     workspace = str(tmp_path / "generated_apps")
     os.makedirs(workspace, exist_ok=True)
     monkeypatch.setattr("app.GENERATED_APPS_DIR", workspace)
-    # T1 — Outside-target symlink
+
     outside_dir = str(tmp_path / "outside_evil")
     os.makedirs(outside_dir, exist_ok=True)
-    link_target = os.path.join(workspace, "evil_project")
-    symlink_created = False
-    try:
-        os.symlink(outside_dir, link_target, target_is_directory=True)
-        symlink_created = True
-    except (OSError, NotImplementedError) as e:
-        pytest.skip(f"Platform denies directory symlink for T1: {e}")
-    if symlink_created:
-        result = safe_resolve_project_dir("evil_project")
-        assert result is None, f"T1 FAIL: outside-target symlink accepted: {result}"
-        try:
-            if os.path.islink(link_target):
-                os.unlink(link_target)
-        except OSError:
-            pass
-    # T2 — Inside-target symlink
+    link_path = os.path.join(workspace, "evil_project")
+
+    _create_symlink_or_handle(outside_dir, link_path, "T1 external symlink")
+
+    result = safe_resolve_project_dir("evil_project")
+    assert result is None, f"T1 FAIL: external symlink accepted: {result}"
+
+def test_symlink_t2_internal_directory_accepted(tmp_path, monkeypatch):
+    """T2 — Symlink resolving to a target that remains inside root must be accepted."""
+    workspace = str(tmp_path / "generated_apps")
+    os.makedirs(workspace, exist_ok=True)
+    monkeypatch.setattr("app.GENERATED_APPS_DIR", workspace)
+
     legit_dir = os.path.join(workspace, "real_project")
     os.makedirs(legit_dir, exist_ok=True)
     link_inside = os.path.join(workspace, "linked_project")
-    try:
-        os.symlink(legit_dir, link_inside, target_is_directory=True)
-        result = safe_resolve_project_dir("linked_project")
-        assert result is not None and os.path.commonpath([os.path.realpath(workspace), os.path.realpath(result)]) == os.path.realpath(workspace)
-        try:
-            if os.path.islink(link_inside):
-                os.unlink(link_inside)
-        except OSError:
-            pass
-    except (OSError, NotImplementedError) as e:
-        pytest.skip(f"Platform denies directory symlink for T2: {e}")
-    # T4 — Parent traversal (pure path, no symlink needed)
-    assert safe_resolve_project_dir("../generated_apps_evil") is None
-    # T6 — Broken symlink
-    broken_link = os.path.join(workspace, "broken_project")
-    broken_created = False
-    try:
-        os.symlink("/nonexistent/broken_target_12345", broken_link, target_is_directory=True)
-        broken_created = True
-    except (OSError, NotImplementedError):
-        pass
-    if broken_created:
-        result = safe_resolve_project_dir("broken_project")
-        assert result is None, f"T6 FAIL: broken symlink accepted: {result}"
-        try:
-            if os.path.islink(broken_link):
-                os.unlink(broken_link)
-        except OSError:
-            pass
-    # T8 — Existing valid project (regression)
-    valid_dir = os.path.join(workspace, "valid_project")
-    os.makedirs(valid_dir, exist_ok=True)
-    with open(os.path.join(valid_dir, "index.html"), "w") as f:
-        f.write("<!DOCTYPE html><html></html>")
-    assert safe_resolve_project_dir("valid_project") == valid_dir
 
-def test_safe_resolve_project_dir_prefix_collision_rejected(tmp_path, monkeypatch):
-    """T3 — Prefix collision + T4 traversal + T8 regression."""
+    _create_symlink_or_handle(legit_dir, link_inside, "T2 internal symlink")
+
+    result = safe_resolve_project_dir("linked_project")
+    assert result is not None, "T2 FAIL: internal symlink incorrectly rejected"
+    assert os.path.commonpath([os.path.realpath(workspace), os.path.realpath(result)]) == os.path.realpath(workspace)
+
+def test_symlink_t3_traversal_and_sibling_prefix_collision(tmp_path, monkeypatch):
+    """T3 — Traversal attempts and sibling directories sharing prefix must be rejected."""
     workspace = str(tmp_path / "generated_apps")
     os.makedirs(workspace, exist_ok=True)
     monkeypatch.setattr("app.GENERATED_APPS_DIR", workspace)
+
     sibling = str(tmp_path / "generated_apps_evil")
     os.makedirs(sibling, exist_ok=True)
+
+    # Path traversal with prefix collision sibling
+    assert safe_resolve_project_dir("../generated_apps_evil") is None
+    # Traversals
+    assert safe_resolve_project_dir("..") is None
     assert safe_resolve_project_dir(".") is None
     assert safe_resolve_project_dir("") is None
-    assert safe_resolve_project_dir("../generated_apps_evil") is None
+    assert safe_resolve_project_dir("../../etc/passwd") is None
+    assert safe_resolve_project_dir("..\\..\\Windows") is None
+
+def test_symlink_t4_dangling_symlink_rejected(tmp_path, monkeypatch):
+    """T4 — Dangling symlink whose target does not exist must fail safely."""
+    workspace = str(tmp_path / "generated_apps")
+    os.makedirs(workspace, exist_ok=True)
+    monkeypatch.setattr("app.GENERATED_APPS_DIR", workspace)
+
+    broken_link = os.path.join(workspace, "broken_project")
+    nonexistent_target = str(tmp_path / "nonexistent_target_12345")
+
+    _create_symlink_or_handle(nonexistent_target, broken_link, "T4 dangling symlink")
+
+    result = safe_resolve_project_dir("broken_project")
+    assert result is None, f"T4 FAIL: dangling symlink accepted: {result}"
+
+def test_symlink_t5_intermediate_component_rejected(tmp_path, monkeypatch):
+    """T5 — Intermediate path components (slashes/nested components) are rejected by contract."""
+    workspace = str(tmp_path / "generated_apps")
+    os.makedirs(workspace, exist_ok=True)
+    monkeypatch.setattr("app.GENERATED_APPS_DIR", workspace)
+
+    # safe_resolve_project_dir contract validates single-component project_name via regex
+    # Slashes and backslashes must be rejected
+    assert safe_resolve_project_dir("nested/component") is None
+    assert safe_resolve_project_dir("nested\\component") is None
+    assert safe_resolve_project_dir("sub/../escape") is None
+    assert safe_resolve_project_dir("a/b/c") is None
+
+def test_symlink_t6_symlink_loop_fails_safely(tmp_path, monkeypatch):
+    """T6 — Recursive symlink loop must fail safely and not resolve to a valid directory."""
+    workspace = str(tmp_path / "generated_apps")
+    os.makedirs(workspace, exist_ok=True)
+    monkeypatch.setattr("app.GENERATED_APPS_DIR", workspace)
+
+    loop_link = os.path.join(workspace, "loop_project")
+    _create_symlink_or_handle(loop_link, loop_link, "T6 symlink loop")
+
+    result = safe_resolve_project_dir("loop_project")
+    # Must fail closed: either None, or an invalid path where isdir is False
+    assert result is None or not os.path.isdir(result), f"T6 FAIL: symlink loop accepted as valid directory: {result}"
+
+def test_symlink_t7_valid_in_root_project_accepted(tmp_path, monkeypatch):
+    """T7 — Valid normal directory in root must continue to be accepted."""
+    workspace = str(tmp_path / "generated_apps")
+    os.makedirs(workspace, exist_ok=True)
+    monkeypatch.setattr("app.GENERATED_APPS_DIR", workspace)
+
     valid_dir = os.path.join(workspace, "valid_project")
     os.makedirs(valid_dir, exist_ok=True)
-    assert safe_resolve_project_dir("valid_project") == valid_dir
+    with open(os.path.join(valid_dir, "index.html"), "w", encoding="utf-8") as f:
+        f.write("<!DOCTYPE html><html></html>")
+
+    result = safe_resolve_project_dir("valid_project")
+    assert result == valid_dir, f"T7 FAIL: valid in-root project rejected: {result}"
