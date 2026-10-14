@@ -3,6 +3,16 @@ import json
 import pytest
 from app import app, load_settings, get_safe_settings_view, mask_secret, get_api_key
 
+@pytest.fixture(autouse=True)
+def isolate_settings_file(monkeypatch, tmp_path):
+    temp_settings = tmp_path / "settings_secrets_test.json"
+    seed_data = {
+        "provider": "gemini",
+        "openrouter_key": "mock_secret_key_1234567890abcdef"
+    }
+    temp_settings.write_text(json.dumps(seed_data), encoding="utf-8")
+    monkeypatch.setattr("app.SETTINGS_FILE", str(temp_settings))
+
 @pytest.fixture
 def client():
     app.config['TESTING'] = True

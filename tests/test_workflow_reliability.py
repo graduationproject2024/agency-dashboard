@@ -7,18 +7,17 @@ def client():
     with app.test_client() as client:
         yield client
 
-def test_missing_api_key_raises_explicit_error(monkeypatch):
+def test_missing_api_key_raises_explicit_error(monkeypatch, tmp_path):
     """Verify that calling an agent with no API key raises an explicit error and does not produce mock success."""
     monkeypatch.delenv('GEMINI_API_KEY', raising=False)
     monkeypatch.delenv('GOOGLE_API_KEY', raising=False)
     monkeypatch.delenv('OPENROUTER_API_KEY', raising=False)
     
-    # Temporarily override settings with empty key
-    from app import settings_lock
+    # Temporarily override settings with empty key in isolated temporary file
     import json
-    with settings_lock:
-        with open('settings.json', 'w', encoding='utf-8') as f:
-            json.dump({"provider": "gemini", "openrouter_key": ""}, f)
+    temp_settings = tmp_path / "settings_test.json"
+    temp_settings.write_text(json.dumps({"provider": "gemini", "openrouter_key": ""}), encoding="utf-8")
+    monkeypatch.setattr("app.SETTINGS_FILE", str(temp_settings))
             
     with pytest.raises(RuntimeError) as exc_info:
         call_agent("specialized/business-strategist.md", "مستشار البزنس", "BS", "blue", "مهمة اختبارية")

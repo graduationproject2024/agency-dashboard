@@ -2,6 +2,13 @@ import os
 import pytest
 from app import app, safe_resolve_project_dir, GENERATED_APPS_DIR, WINDOWS_RESERVED, run_qa_checks
 
+@pytest.fixture(autouse=True)
+def isolate_settings_file(monkeypatch, tmp_path):
+    import json
+    temp_settings = tmp_path / "settings_adv_test.json"
+    temp_settings.write_text(json.dumps({"provider": "gemini"}), encoding="utf-8")
+    monkeypatch.setattr("app.SETTINGS_FILE", str(temp_settings))
+
 @pytest.fixture
 def client():
     app.config['TESTING'] = True

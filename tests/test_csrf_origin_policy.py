@@ -1,5 +1,55 @@
+import copy
+import json
+import os
+import threading
+import types
 import pytest
-from app import app
+import app as app_module
+from app import app, workflow_state, state_lock
+
+class DummyThread:
+    def __init__(self, *args, **kwargs):
+        pass
+    def start(self):
+        pass
+    def join(self, timeout=None):
+        pass
+    def is_alive(self):
+        return False
+
+@pytest.fixture(autouse=True)
+def isolate_csrf_test_environment(monkeypatch, tmp_path):
+    # Redirect GENERATED_APPS_DIR and create test_folder
+    temp_apps = tmp_path / "generated_apps"
+    temp_apps.mkdir(exist_ok=True)
+    (temp_apps / "test_folder").mkdir(exist_ok=True)
+    monkeypatch.setattr("app.GENERATED_APPS_DIR", str(temp_apps))
+
+    # Redirect SETTINGS_FILE
+    temp_settings = tmp_path / "settings_csrf_test.json"
+    temp_settings.write_text(json.dumps({"provider": "gemini"}), encoding="utf-8")
+    monkeypatch.setattr("app.SETTINGS_FILE", str(temp_settings))
+
+    # Mock threading module global
+    mock_threading = types.ModuleType("threading_mock")
+    mock_threading.__dict__.update(threading.__dict__)
+    mock_threading.Thread = DummyThread
+    monkeypatch.setattr("app.threading", mock_threading)
+
+    # Patch GUI / process launches
+    monkeypatch.setattr("os.startfile", lambda path: None, raising=False)
+    monkeypatch.setattr("app.subprocess.Popen", lambda *args, **kwargs: None)
+
+    # Snapshot workflow_state
+    with state_lock:
+        original_state = copy.deepcopy(workflow_state)
+
+    try:
+        yield
+    finally:
+        with state_lock:
+            workflow_state.clear()
+            workflow_state.update(copy.deepcopy(original_state))
 
 @pytest.fixture
 def client():
@@ -91,7 +141,7 @@ def test_foreign_or_unexpected_port_referer_rejected(client, endpoint, payload, 
 def test_valid_referer_accepted_when_origin_absent(client, endpoint, payload):
     """Verify that valid Referer from 127.0.0.1:8080 is accepted when Origin is absent."""
     import os
-    os.makedirs(os.path.join("generated_apps", "test_folder"), exist_ok=True)
+    os.makedirs(os.path.join(app_module.GENERATED_APPS_DIR, "test_folder"), exist_ok=True)
     headers = {"Referer": "http://127.0.0.1:8080/index.html"}
     res = client.post(endpoint, json=payload, headers=headers)
     assert res.status_code != 403 or "Invalid origin" not in (res.get_json() or {}).get("error", "")

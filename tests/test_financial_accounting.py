@@ -4,6 +4,11 @@ import threading
 import pytest
 from app import load_budget, record_token_usage, budget_lock
 
+@pytest.fixture(autouse=True)
+def isolate_budget_file(monkeypatch, tmp_path):
+    temp_budget = str(tmp_path / "budget_accounting_test.json")
+    monkeypatch.setattr("app.BUDGET_FILE", temp_budget)
+
 def test_token_accounting_single_count():
     """Verify that token recording accurately increments tokens without duplication."""
     initial = load_budget()
