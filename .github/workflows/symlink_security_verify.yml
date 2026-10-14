@@ -6,7 +6,7 @@ on:
     branches: [master]
     paths:
       - 'app.py'
-      - 'tests/test_adversarial_paths.py'
+      - 'tests/**'
       - '.github/workflows/symlink_security_verify.yml'
 
 permissions:
@@ -156,7 +156,7 @@ jobs:
           python -m pytest tests/test_adversarial_rollback.py tests/test_workflow_integration.py tests/test_workflow_reliability.py tests/test_csrf_origin_policy.py tests/test_financial_accounting.py tests/test_security_http_filesystem.py tests/test_security_secrets.py -v --tb=short
 
       - name: Verify repository integrity post-test
-        if: success() || failure()
+        if: always()
         env:
           MANIFEST_PATH: ${{ runner.temp }}/pre_test_manifest.json
         run: |
