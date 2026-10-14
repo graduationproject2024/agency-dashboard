@@ -30,6 +30,106 @@ jobs:
           python -m pip install --upgrade pip
           pip install flask pytest werkzeug requests
 
+      - name: Capture pre-test repository integrity manifest
+        env:
+          MANIFEST_PATH: ${{ runner.temp }}/pre_test_manifest.json
+        run: |
+          python - << 'EOF'
+          import os
+          import sys
+          import json
+          import hashlib
+          import subprocess
+
+          manifest_path = os.environ.get("MANIFEST_PATH")
+          if not manifest_path:
+              print("[FATAL] MANIFEST_PATH environment variable not set")
+              sys.exit(1)
+
+          def compute_sha256(filepath):
+              h = hashlib.sha256()
+              with open(filepath, "rb") as f:
+                  while chunk := f.read(65536):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def walk_error(err):
+              raise err
+
+          manifest = {
+              "git_status": "",
+              "protected_files": {},
+              "generated_apps": {}
+          }
+
+          # 1. Capture git status --porcelain
+          try:
+              res = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True, check=True)
+              manifest["git_status"] = res.stdout
+          except Exception as e:
+              print(f"[FATAL] Failed to capture git status: {e}")
+              sys.exit(1)
+
+          # 2. Capture protected files
+          protected_files = ["budget.json", "budget.json.bak", "settings.json"]
+          for pfile in protected_files:
+              if os.path.lexists(pfile):
+                  is_link = os.path.islink(pfile)
+                  size = os.path.getsize(pfile) if not is_link else 0
+                  file_hash = compute_sha256(pfile) if (os.path.isfile(pfile) and not is_link) else None
+                  manifest["protected_files"][pfile] = {
+                      "exists": True,
+                      "is_symlink": is_link,
+                      "size": size,
+                      "sha256": file_hash
+                  }
+              else:
+                  manifest["protected_files"][pfile] = {
+                      "exists": False,
+                      "is_symlink": False,
+                      "size": 0,
+                      "sha256": None
+                  }
+
+          # 3. Inventory generated_apps/
+          gen_dir = "generated_apps"
+          if os.path.exists(gen_dir):
+              for root, dirs, files in os.walk(gen_dir, followlinks=False, onerror=walk_error):
+                  for d in dirs:
+                      d_path = os.path.join(root, d)
+                      rel_d = os.path.relpath(d_path, ".").replace("\\", "/")
+                      is_sym = os.path.islink(d_path)
+                      target = os.readlink(d_path) if is_sym else None
+                      manifest["generated_apps"][rel_d] = {
+                          "type": "symlink_dir" if is_sym else "dir",
+                          "target": target
+                      }
+                  for f in files:
+                      f_path = os.path.join(root, f)
+                      rel_f = os.path.relpath(f_path, ".").replace("\\", "/")
+                      is_sym = os.path.islink(f_path)
+                      if is_sym:
+                          manifest["generated_apps"][rel_f] = {
+                              "type": "symlink_file",
+                              "target": os.readlink(f_path)
+                          }
+                      else:
+                          manifest["generated_apps"][rel_f] = {
+                              "type": "file",
+                              "size": os.path.getsize(f_path),
+                              "sha256": compute_sha256(f_path)
+                          }
+
+          try:
+              os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
+              with open(manifest_path, "w", encoding="utf-8") as f:
+                  json.dump(manifest, f, indent=2)
+              print(f"[INFO] Pre-test integrity manifest captured successfully: {manifest_path}")
+          except Exception as e:
+              print(f"[FATAL] Failed to write manifest: {e}")
+              sys.exit(1)
+          EOF
+
       - name: Run focused symlink security tests (T1 - T7)
         run: |
           echo "=== Running T1 - T7 Symlink Security Regression Tests on Ubuntu ==="
@@ -54,3 +154,135 @@ jobs:
         run: |
           echo "=== Running core integration, rollback, and reliability suites ==="
           python -m pytest tests/test_adversarial_rollback.py tests/test_workflow_integration.py tests/test_workflow_reliability.py tests/test_csrf_origin_policy.py tests/test_financial_accounting.py tests/test_security_http_filesystem.py tests/test_security_secrets.py -v --tb=short
+
+      - name: Verify repository integrity post-test
+        if: success() || failure()
+        env:
+          MANIFEST_PATH: ${{ runner.temp }}/pre_test_manifest.json
+        run: |
+          python - << 'EOF'
+          import os
+          import sys
+          import json
+          import hashlib
+          import subprocess
+
+          manifest_path = os.environ.get("MANIFEST_PATH")
+          if not manifest_path or not os.path.exists(manifest_path):
+              print(f"[FATAL] Pre-test manifest missing or not set: {manifest_path}")
+              sys.exit(1)
+
+          try:
+              with open(manifest_path, "r", encoding="utf-8") as f:
+                  baseline = json.load(f)
+          except Exception as e:
+              print(f"[FATAL] Failed to read or parse pre-test manifest: {e}")
+              sys.exit(1)
+
+          def compute_sha256(filepath):
+              h = hashlib.sha256()
+              with open(filepath, "rb") as f:
+                  while chunk := f.read(65536):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def walk_error(err):
+              raise err
+
+          violations = []
+
+          # 1. Verify git status --porcelain matches baseline
+          try:
+              res = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True, check=True)
+              current_git_status = res.stdout
+              if current_git_status != baseline.get("git_status", ""):
+                  violations.append(
+                      f"Git working tree status changed during test run!\n"
+                      f"--- Baseline ---\n{baseline.get('git_status', '')}\n"
+                      f"--- Current ---\n{current_git_status}"
+                  )
+          except Exception as e:
+              violations.append(f"Failed to check git status post-test: {e}")
+
+          # 2. Verify protected files
+          protected_files = ["budget.json", "budget.json.bak", "settings.json"]
+          for pfile in protected_files:
+              base_info = baseline.get("protected_files", {}).get(pfile, {})
+              curr_exists = os.path.lexists(pfile)
+              if curr_exists != base_info.get("exists", False):
+                  violations.append(f"Protected file '{pfile}' existence changed: before={base_info.get('exists')}, after={curr_exists}")
+                  continue
+
+              if curr_exists:
+                  curr_is_link = os.path.islink(pfile)
+                  if curr_is_link != base_info.get("is_symlink", False):
+                      violations.append(f"Protected file '{pfile}' symlink status changed: before={base_info.get('is_symlink')}, after={curr_is_link}")
+                      continue
+
+                  if not curr_is_link and os.path.isfile(pfile):
+                      curr_size = os.path.getsize(pfile)
+                      curr_hash = compute_sha256(pfile)
+                      if curr_size != base_info.get("size"):
+                          violations.append(f"Protected file '{pfile}' size modified: before={base_info.get('size')}, after={curr_size}")
+                      if curr_hash != base_info.get("sha256"):
+                          violations.append(f"Protected file '{pfile}' SHA-256 modified: before={base_info.get('sha256')}, after={curr_hash}")
+
+          # 3. Verify generated_apps/ inventory
+          curr_inventory = {}
+          gen_dir = "generated_apps"
+          if os.path.exists(gen_dir):
+              for root, dirs, files in os.walk(gen_dir, followlinks=False, onerror=walk_error):
+                  for d in dirs:
+                      d_path = os.path.join(root, d)
+                      rel_d = os.path.relpath(d_path, ".").replace("\\", "/")
+                      is_sym = os.path.islink(d_path)
+                      target = os.readlink(d_path) if is_sym else None
+                      curr_inventory[rel_d] = {
+                          "type": "symlink_dir" if is_sym else "dir",
+                          "target": target
+                      }
+                  for f in files:
+                      f_path = os.path.join(root, f)
+                      rel_f = os.path.relpath(f_path, ".").replace("\\", "/")
+                      is_sym = os.path.islink(f_path)
+                      if is_sym:
+                          curr_inventory[rel_f] = {
+                              "type": "symlink_file",
+                              "target": os.readlink(f_path)
+                          }
+                      else:
+                          curr_inventory[rel_f] = {
+                              "type": "file",
+                              "size": os.path.getsize(f_path),
+                              "sha256": compute_sha256(f_path)
+                          }
+
+          base_inventory = baseline.get("generated_apps", {})
+
+          # Check for added, removed, or modified entries
+          all_keys = set(base_inventory.keys()) | set(curr_inventory.keys())
+          for k in sorted(all_keys):
+              if k not in base_inventory:
+                  violations.append(f"Unmanaged item added to generated_apps: '{k}' ({curr_inventory[k]})")
+              elif k not in curr_inventory:
+                  violations.append(f"Item removed from generated_apps: '{k}'")
+              else:
+                  b_item = base_inventory[k]
+                  c_item = curr_inventory[k]
+                  if b_item.get("type") != c_item.get("type"):
+                      violations.append(f"Item type changed for generated_apps/{k}: before={b_item.get('type')}, after={c_item.get('type')}")
+                  elif b_item.get("target") != c_item.get("target"):
+                      violations.append(f"Symlink target changed for generated_apps/{k}: before={b_item.get('target')}, after={c_item.get('target')}")
+                  elif b_item.get("sha256") != c_item.get("sha256"):
+                      violations.append(f"File content modified in generated_apps/{k}: SHA-256 before={b_item.get('sha256')}, after={c_item.get('sha256')}")
+
+          if violations:
+              print("=" * 60)
+              print("[FATAL] INTEGRITY GATE VIOLATIONS DETECTED POST-TEST:")
+              for v in violations:
+                  print(f"  - {v}")
+              print("=" * 60)
+              sys.exit(1)
+
+          print("[SUCCESS] Integrity gate passed: Zero persistent file or state mutations detected across test run.")
+          EOF
