@@ -24,9 +24,12 @@ def get_db_path(custom_path: Optional[str] = None) -> str:
         return os.path.abspath(env_path)
     return os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), DEFAULT_DB_FILENAME))
 
-def get_db_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
+from contextlib import contextmanager
+
+def get_db_connection(db_path: Optional[str] = None):
     """
     Open thread-isolated SQLite connection with foreign keys and WAL mode.
+    Deterministic closure on exit.
     """
     path = get_db_path(db_path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -34,7 +37,29 @@ def get_db_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.execute("PRAGMA journal_mode = WAL;")
-    return conn
+    return _DbConnectionContext(conn)
+
+class _DbConnectionContext:
+    def __init__(self, conn):
+        self._conn = conn
+    def __enter__(self):
+        return self._conn
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            if exc_type is None:
+                self._conn.commit()
+            else:
+                self._conn.rollback()
+        finally:
+            self._conn.close()
+    def cursor(self):
+        return self._conn.cursor()
+    def execute(self, *args, **kwargs):
+        return self._conn.execute(*args, **kwargs)
+    def commit(self):
+        return self._conn.commit()
+    def close(self):
+        return self._conn.close()
 
 def init_db(db_path: Optional[str] = None):
     """
@@ -431,6 +456,13 @@ def update_task_status(
     started_at = now if status == 'running' else None
     completed_at = now if status in ('completed', 'failed', 'cancelled', 'blocked') else None
     with get_db_connection(db_path) as conn:
+        if status == 'completed':
+            current = conn.execute("SELECT output_text FROM workflow_tasks WHERE task_id = ?;", (task_id,)).fetchone()
+            existing_out = current["output_text"] if current else None
+            effective_out = output_text if output_text is not None else existing_out
+            if not effective_out or not str(effective_out).strip():
+                raise ValueError(f"Cannot mark task {task_id} completed without valid non-empty output_text.")
+
         conn.execute("""
             UPDATE workflow_tasks
             SET status = ?,
@@ -500,11 +532,25 @@ def increment_task_retry(task_id: str, db_path: Optional[str] = None) -> Tuple[i
 def claim_task(task_id: str, db_path: Optional[str] = None) -> bool:
     """
     Atomically claim a task for execution.
-    Transitions status from 'ready' (or 'pending') to 'running'.
-    Returns True if successfully claimed, False if already claimed or finished.
+    Transitions status from 'ready' (or 'pending' with all dependencies satisfied) to 'running'.
+    Returns True if successfully claimed, False if already claimed, unmet dependencies, or finished.
     """
     now = time.time()
     with get_db_connection(db_path) as conn:
+        task = conn.execute("SELECT session_id, status, dependencies_json FROM workflow_tasks WHERE task_id = ?;", (task_id,)).fetchone()
+        if not task or task["status"] not in ('ready', 'pending'):
+            return False
+            
+        deps = json.loads(task["dependencies_json"] or "[]")
+        if deps:
+            placeholders = ",".join(["?"] * len(deps))
+            completed_cnt = conn.execute(
+                f"SELECT COUNT(*) as count FROM workflow_tasks WHERE session_id = ? AND task_id IN ({placeholders}) AND (status = 'completed' OR (status = 'failed' AND task_id LIKE '%_spec_%'));",
+                [task["session_id"]] + deps
+            ).fetchone()["count"]
+            if completed_cnt < len(deps):
+                return False  # Cannot claim before prerequisites are satisfied
+
         cursor = conn.execute("""
             UPDATE workflow_tasks
             SET status = 'running',
@@ -902,6 +948,7 @@ def reconcile_interrupted_sessions(db_path: Optional[str] = None) -> int:
     """
     Called upon server startup to reconcile any sessions left in 'running' state
     due to unexpected server restart or power loss. Never falsely marks them as completed.
+    Safely reconciles interrupted running tasks via bounded retry without duplicating token costs.
     Returns the integer count of reconciled sessions.
     """
     interrupted_ids = []
@@ -916,12 +963,72 @@ def reconcile_interrupted_sessions(db_path: Optional[str] = None) -> int:
                     error_message = 'Interrupted by unexpected process restart. Can be resumed from last checkpoint.'
                 WHERE session_id = ?;
             """, (sid,))
-            # Mark any running tasks as failed
-            conn.execute("""
-                UPDATE workflow_tasks
-                SET status = 'failed',
-                    error_message = 'Interrupted by unexpected process restart.'
+            
+            # Reconcile running tasks for this session
+            running_tasks = conn.execute("""
+                SELECT task_id, retry_count, max_retries, output_text
+                FROM workflow_tasks
                 WHERE session_id = ? AND status = 'running';
-            """, (sid,))
+            """, (sid,)).fetchall()
+            
+            for t in running_tasks:
+                tid = t["task_id"]
+                retries = t["retry_count"]
+                max_retries = t["max_retries"]
+                
+                # Check if an agent_run completed for this task before process termination
+                completed_run = conn.execute("""
+                    SELECT output_preview FROM agent_runs
+                    WHERE task_id = ? AND status = 'completed'
+                    ORDER BY finished_at DESC LIMIT 1;
+                """, (tid,)).fetchone()
+                
+                if completed_run and completed_run["output_preview"]:
+                    # Task completed execution before process shutdown; restore output and mark completed
+                    out = completed_run["output_preview"]
+                    conn.execute("""
+                        UPDATE workflow_tasks
+                        SET status = 'completed',
+                            output_text = COALESCE(output_text, ?),
+                            error_message = NULL,
+                            completed_at = ?
+                        WHERE task_id = ?;
+                    """, (out, time.time(), tid))
+                elif retries < max_retries:
+                    # Bounded retry: reset to ready for safe resumption
+                    conn.execute("""
+                        UPDATE workflow_tasks
+                        SET status = 'ready',
+                            retry_count = retry_count + 1,
+                            error_message = 'Interrupted by unexpected process restart. Queued for retry.',
+                            started_at = NULL
+                        WHERE task_id = ?;
+                    """, (tid,))
+                else:
+                    # Retries exhausted: mark failed
+                    conn.execute("""
+                        UPDATE workflow_tasks
+                        SET status = 'failed',
+                            error_message = 'Interrupted by unexpected process restart. Maximum retries exceeded.'
+                        WHERE task_id = ?;
+                    """, (tid,))
         conn.commit()
     return len(interrupted_ids)
+
+
+def acquire_session_resumption_lock(session_id: str, db_path: Optional[str] = None) -> bool:
+    """
+    Atomically acquire a resumption lock on an interrupted or failed session
+    to prevent multiple concurrent recovery workers from resuming the same session.
+    Returns True if lock acquired, False if already running or not in resumable state.
+    """
+    now = time.time()
+    with get_db_connection(db_path) as conn:
+        cursor = conn.execute("""
+            UPDATE workflow_sessions
+            SET status = 'running', updated_at = ?
+            WHERE session_id = ? AND status IN ('interrupted', 'failed');
+        """, (now, session_id))
+        conn.commit()
+        return cursor.rowcount > 0
+

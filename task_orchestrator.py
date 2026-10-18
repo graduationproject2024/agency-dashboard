@@ -477,6 +477,7 @@ def execute_single_task(
         db.update_task_status(task_id, "completed", output_text=output, db_path=db_path)
         
         # 5. Record agent run
+        tokens_est = max(1, (len(task.get("input_context") or "") + len(full_context or "") + len(output or "")) // 4)
         db.record_agent_run(
             task_id=task_id,
             session_id=session_id,
@@ -485,6 +486,7 @@ def execute_single_task(
             division_id=task["division_id"],
             prompt_file=prompt_file,
             status="completed",
+            tokens_used=tokens_est,
             input_preview=full_context[:400],
             output_preview=output[:400],
             db_path=db_path
@@ -550,6 +552,7 @@ def execute_single_task(
         err_msg = str(e)
         new_retry, can_retry = db.increment_task_retry(task_id, db_path=db_path)
         
+        tokens_est = max(1, (len(task.get("input_context") or "") + len(full_context or "")) // 4)
         db.record_agent_run(
             task_id=task_id,
             session_id=session_id,
@@ -558,6 +561,7 @@ def execute_single_task(
             division_id=task["division_id"],
             prompt_file=prompt_file,
             status="failed",
+            tokens_used=tokens_est,
             input_preview=full_context[:400],
             error_message=err_msg,
             db_path=db_path

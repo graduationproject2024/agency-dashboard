@@ -1593,35 +1593,54 @@ def call_agent(agent_file, role_name, short_name, color, prompt, context_text=""
 
 # --- Autonomous Workflow Execution Engine ---
 
-def run_workflow(task_desc):
-    squad_plan = triage_project_squad(task_desc)
+def run_workflow(task_desc, existing_session_id=None):
+    squad_plan = None
     active_squad = []
-    for spec in squad_plan["specialists"]:
-        active_squad.append({
-            "id": spec["id"],
-            "role_id": spec["id"],
-            "name": spec["name"],
-            "display_name": spec["display_name"],
-            "category": spec["category"],
-            "stage": spec["stage"],
-            "reason": spec["reason"],
-            "status": "selected"
-        })
+
+    if existing_session_id:
+        sess = db_store.get_session(existing_session_id)
+        if sess:
+            meta = sess.get("metadata") or {}
+            squad_plan = meta.get("squad_plan")
+            active_squad = meta.get("active_squad") or []
+            if not task_desc:
+                task_desc = sess.get("task_description", "")
+
+    if not squad_plan:
+        squad_plan = triage_project_squad(task_desc)
+        active_squad = []
+        for spec in squad_plan["specialists"]:
+            active_squad.append({
+                "id": spec["id"],
+                "role_id": spec["id"],
+                "name": spec["name"],
+                "display_name": spec["display_name"],
+                "category": spec["category"],
+                "stage": spec["stage"],
+                "reason": spec["reason"],
+                "status": "selected"
+            })
 
     # Initialize persistent session and build Directed Task Graph
     project_title = task_desc[:40].strip()
-    session_id = None
-    try:
-        session_id = db_store.create_session(
-            project_name=project_title,
-            task_description=task_desc,
-            squad_archetype=squad_plan.get("archetype"),
-            metadata={"squad_plan": squad_plan, "active_squad": active_squad}
-        )
-        db_store.update_session_status(session_id, "running", current_stage="strategy")
-        orch.build_project_task_graph(session_id, project_title, task_desc, squad_plan)
-    except Exception as e:
-        logging.warning("Persistent session creation warning: %s", e)
+    session_id = existing_session_id
+    if not session_id:
+        try:
+            session_id = db_store.create_session(
+                project_name=project_title,
+                task_description=task_desc,
+                squad_archetype=squad_plan.get("archetype"),
+                metadata={"squad_plan": squad_plan, "active_squad": active_squad}
+            )
+            db_store.update_session_status(session_id, "running", current_stage="strategy")
+            orch.build_project_task_graph(session_id, project_title, task_desc, squad_plan)
+        except Exception as e:
+            logging.warning("Persistent session creation warning: %s", e)
+    else:
+        try:
+            db_store.update_session_status(session_id, "running", current_stage="strategy")
+        except Exception as e:
+            logging.warning("Persistent session resume warning: %s", e)
 
     with state_lock:
         workflow_state["session_id"] = session_id
@@ -1645,6 +1664,12 @@ def run_workflow(task_desc):
         }
         
     update_stats()
+
+    if session_id and not existing_session_id:
+        with state_lock:
+            state_snap = copy.deepcopy(workflow_state)
+        db_store.save_session_checkpoint(session_id, "workflow_started", state_snap)
+
     add_feed("النظام", "Squad Triage", "linear-gradient(135deg, #667eea, #764ba2)", "TRI", f"🎯 تم توجيه المشروع إلى تصنيف '{squad_plan['label']}'. تم اختيار الفريق المتخصص: " + "، ".join([s['name'] for s in active_squad]))
     add_feed("مستشار البزنس", "Business Strategist", "linear-gradient(135deg, #FF6B6B, #FF8E53)", "BS", f"بدأت في تحليل جدوى مشروع: {task_desc}")
     
@@ -2153,6 +2178,9 @@ def continue_workflow(feedback=""):
             db_store.update_session_status(session_id, "running", current_stage="engineering")
             if feedback:
                 db_store.add_project_memory(cur_task, session_id, "decision", "PRD_Approval_Feedback", feedback, "human_reviewer")
+            with state_lock:
+                state_snap = copy.deepcopy(workflow_state)
+            db_store.save_session_checkpoint(session_id, "engineering_started", state_snap)
         except Exception as pe:
             logging.warning("Session status update warning: %s", pe)
     else:
@@ -2683,6 +2711,10 @@ def cancel_session(session_id):
         return jsonify({"error": f"Cannot cancel session in '{session['status']}' state"}), 400
     
     db_store.update_session_status(session_id, "cancelled")
+    with db_store.get_db_connection() as conn:
+        conn.execute("UPDATE workflow_tasks SET status = 'cancelled' WHERE session_id = ? AND status IN ('pending', 'ready');", (session_id,))
+        conn.commit()
+        
     with state_lock:
         if workflow_state.get("session_id") == session_id:
             workflow_state["status"] = "cancelled"
@@ -2709,8 +2741,16 @@ def resume_session(session_id):
     cp_step = last_cp.get("step_name")
 
     with state_lock:
-        if workflow_state["status"] == "running":
+        if workflow_state.get("status") == "running" and workflow_state.get("session_id") != session_id:
             return jsonify({"error": "Another workflow is currently running"}), 409
+
+    # Atomically lock session in SQLite if it was interrupted or failed to coordinate workers
+    if session["status"] in ("interrupted", "failed"):
+        locked = db_store.acquire_session_resumption_lock(session_id)
+        if not locked:
+            return jsonify({"error": "Session is already being resumed or running"}), 409
+
+    with state_lock:
         workflow_state.clear()
         workflow_state.update(state_data)
         workflow_state["session_id"] = session_id
@@ -2725,7 +2765,15 @@ def resume_session(session_id):
             "session_id": session_id,
             "resumed_from": cp_step
         })
-    elif cp_step in ("engineering_completed", "engineering_started"):
+    elif cp_step in ("workflow_started", "strategy", "product"):
+        task_desc = state_data.get("current_task") or session.get("task_description", "")
+        threading.Thread(target=run_workflow, args=(task_desc,), kwargs={"existing_session_id": session_id}, daemon=True).start()
+        return jsonify({
+            "message": f"Session resumed successfully from {cp_step}",
+            "session_id": session_id,
+            "resumed_from": cp_step
+        })
+    elif cp_step in ("engineering_completed", "engineering_started", "post_prd_running", "development", "qa", "animation", "seo"):
         data = request.get_json(silent=True) or {}
         feedback = str(data.get('feedback', '')).strip()
         threading.Thread(target=continue_workflow, args=(feedback,), daemon=True).start()
@@ -2761,13 +2809,20 @@ def start_task():
 def approve():
     if not is_safe_origin(request):
         return jsonify({"error": "Forbidden: Invalid origin"}), 403
+    data = request.get_json(silent=True) or {}
+    req_session_id = data.get("session_id")
+
     with state_lock:
         if workflow_state["status"] != "approval_needed":
             return jsonify({"error": "No pending approval required"}), 400
+        if req_session_id and workflow_state.get("session_id") and req_session_id != workflow_state.get("session_id"):
+            return jsonify({"error": "Approval request session mismatch"}), 400
+        workflow_state["status"] = "running"
             
-    data = request.get_json(silent=True) or {}
     feedback = str(data.get('feedback', '')).strip()
     if len(feedback) > 10000:
+        with state_lock:
+            workflow_state["status"] = "approval_needed"
         return jsonify({"error": "Feedback exceeds maximum allowed length"}), 400
         
     threading.Thread(target=continue_workflow, args=(feedback,), daemon=True).start()
