@@ -195,23 +195,209 @@ def cleanup_backups(backups_dict, failed_restorations=None):
 
     return cleanup_errors
 
+# =========================================================================
+# Canonical Agency Divisions Registry (18 Required Divisions)
+# =========================================================================
+
+CANONICAL_DIVISIONS = [
+    {
+        "id": "academic",
+        "name": "Academic",
+        "name_ar": "الشؤون الأكاديمية والعلوم",
+        "icon": "fa-graduation-cap",
+        "description": "Academic research, humanities, statistical modeling, and specialized research mentoring.",
+        "order": 1
+    },
+    {
+        "id": "design",
+        "name": "Design",
+        "name_ar": "التصميم وتجربة المستخدم",
+        "icon": "fa-palette",
+        "description": "UI/UX design, visual systems, whimsy animation, brand identity, and design systems.",
+        "order": 2
+    },
+    {
+        "id": "engineering",
+        "name": "Engineering",
+        "name_ar": "الهندسة والتطوير البرمجي",
+        "icon": "fa-code",
+        "description": "Software architecture, fullstack development, backend systems, databases, and DevOps.",
+        "order": 3
+    },
+    {
+        "id": "finance",
+        "name": "Finance",
+        "name_ar": "المالية والمحاسبة",
+        "icon": "fa-calculator",
+        "description": "Corporate finance, financial modeling, accounting, budget auditing, and investment metrics.",
+        "order": 4
+    },
+    {
+        "id": "game-development",
+        "name": "Game Development",
+        "name_ar": "تطوير الألعاب والمحاكاة",
+        "icon": "fa-gamepad",
+        "description": "Game design, economy balancing, Unity, Unreal Engine, Godot, and Roblox systems.",
+        "order": 5
+    },
+    {
+        "id": "gis",
+        "name": "GIS",
+        "name_ar": "نظم المعلومات الجغرافية",
+        "icon": "fa-map-location-dot",
+        "description": "Geospatial intelligence, mapping, spatial data infrastructure, and cartography.",
+        "order": 6
+    },
+    {
+        "id": "healthcare",
+        "name": "Healthcare",
+        "name_ar": "الرعاية الصحية والطبية",
+        "icon": "fa-notes-medical",
+        "description": "Clinical evidence, healthcare compliance, patient data privacy, and medical workflows.",
+        "order": 7
+    },
+    {
+        "id": "marketing",
+        "name": "Marketing",
+        "name_ar": "التسويق والمحتوى",
+        "icon": "fa-bullhorn",
+        "description": "Content strategy, SEO, brand positioning, growth hacking, and social media.",
+        "order": 8
+    },
+    {
+        "id": "paid-media",
+        "name": "Paid Media",
+        "name_ar": "الإعلانات الممولة والحملات",
+        "icon": "fa-rectangle-ad",
+        "description": "Paid advertising campaigns, ad copy optimization, acquisition bidding, and performance ROAS.",
+        "order": 9
+    },
+    {
+        "id": "product",
+        "name": "Product",
+        "name_ar": "إدارة وتخطيط المنتجات",
+        "icon": "fa-boxes-stacked",
+        "description": "Product management, roadmap definition, PRD authoring, and user stories.",
+        "order": 10
+    },
+    {
+        "id": "project-management",
+        "name": "Project Management",
+        "name_ar": "إدارة المشاريع والتنسيق",
+        "icon": "fa-list-check",
+        "description": "Scrum agile management, sprint planning, delivery coordination, and risk tracking.",
+        "order": 11
+    },
+    {
+        "id": "research",
+        "name": "Research",
+        "name_ar": "البحث واستشراف السوق",
+        "icon": "fa-microscope",
+        "description": "Market research, deep tech investigation, trend analysis, and competitor benchmarking.",
+        "order": 12
+    },
+    {
+        "id": "sales",
+        "name": "Sales",
+        "name_ar": "المبيعات وتطوير الأعمال",
+        "icon": "fa-handshake",
+        "description": "B2B sales strategy, enterprise deal closing, lead qualification, and cold outreach.",
+        "order": 13
+    },
+    {
+        "id": "security",
+        "name": "Security",
+        "name_ar": "الأمن السيبراني والامتثال",
+        "icon": "fa-shield-halved",
+        "description": "Application security, penetration testing, compliance, threat modeling, and cryptography.",
+        "order": 14
+    },
+    {
+        "id": "spatial-computing",
+        "name": "Spatial Computing",
+        "name_ar": "الحوسبة المكانية والواقع الممتد",
+        "icon": "fa-vr-cardboard",
+        "description": "AR/VR/XR spatial applications, 3D world interaction, visionOS, and WebXR.",
+        "order": 15
+    },
+    {
+        "id": "specialized",
+        "name": "Specialized",
+        "name_ar": "الاستشارات والحلول المتخصصة",
+        "icon": "fa-star",
+        "description": "Specialized consultants, business strategists, pricing analysts, and boutique domains.",
+        "order": 16
+    },
+    {
+        "id": "support",
+        "name": "Support",
+        "name_ar": "الدعم الفني وخدمة العملاء",
+        "icon": "fa-headset",
+        "description": "Technical support, customer success, incident triaging, and documentation guidance.",
+        "order": 17
+    },
+    {
+        "id": "testing",
+        "name": "Testing",
+        "name_ar": "فحص البرمجيات وضمان الجودة",
+        "icon": "fa-vial-circle-check",
+        "description": "Automated testing, accessibility compliance, performance benchmarking, and QA audits.",
+        "order": 18
+    }
+]
+
+CANONICAL_DIVISION_MAP = {d["id"]: d for d in CANONICAL_DIVISIONS}
+CANONICAL_NAME_MAP = {d["name"].lower(): d for d in CANONICAL_DIVISIONS}
+
+def parse_agent_frontmatter(content):
+    """
+    Extract structured metadata from agent definition markdown frontmatter.
+    Extracts name, description, division, and department if present.
+    """
+    meta = {}
+    if not content or not content.startswith("---"):
+        return meta
+    parts = content.split("---", 2)
+    if len(parts) >= 3:
+        for line in parts[1].splitlines():
+            if ":" in line:
+                k, v = line.split(":", 1)
+                meta[k.strip().lower()] = v.strip().strip("'\"")
+    return meta
+
 def discover_agents(agents_dir=None):
     """
     Discover available agent markdown definitions in target directory safely.
+    Maps every discovered agent to one of the 18 canonical divisions.
+    Always provides all 18 canonical divisions in 'divisions', even if empty.
     Distinguishes actual discovered count from missing/empty/error states.
-    Never fabricates a count.
+    Never fabricates an agent count.
     """
     target_dir = agents_dir or get_agents_dir()
+    
+    empty_divisions = [
+        {
+            **d,
+            "registered_count": 0,
+            "discovered_count": 0,
+            "agents": []
+        }
+        for d in CANONICAL_DIVISIONS
+    ]
+
     if not target_dir or not os.path.exists(target_dir):
         return {
             "total": 0,
             "agents": [],
+            "divisions": empty_divisions,
+            "unclassified": [],
             "status": "not_found",
             "directory": target_dir,
             "error": "Directory does not exist"
         }
         
     agents_list = []
+    unclassified_list = []
     ignored_files = {
         'README.md', 'CONTRIBUTING.md', 'SECURITY.md', 'LICENSE.md',
         'CHANGELOG.md', 'INDEX.md', 'TODO.md', 'SUMMARY.md',
@@ -223,11 +409,11 @@ def discover_agents(agents_dir=None):
             # Prune hidden directories, build tools, and non-agent folders
             dirs[:] = [
                 d for d in dirs 
-                if not d.startswith('.') and d not in {'node_modules', '__pycache__', 'venv', '.venv', 'examples', 'scripts', 'tests'}
+                if not d.startswith('.') and d not in {'node_modules', '__pycache__', 'venv', '.venv', 'examples', 'scripts', 'tests', 'strategy', 'integrations'}
             ]
-            dept = os.path.basename(root)
-            if dept in ("agency-agents", "agents"):
-                dept = "General"
+            rel_root = os.path.relpath(root, target_dir)
+            top_folder = rel_root.replace('\\', '/').split('/')[0].lower() if rel_root != '.' else ''
+
             for f in files:
                 if f.startswith('.'):
                     continue
@@ -237,28 +423,88 @@ def discover_agents(agents_dir=None):
                         # Genuine agent definition format check: non-empty file
                         if os.path.getsize(f_path) < 20:
                             continue
+                        with open(f_path, 'r', encoding='utf-8', errors='replace') as fp:
+                            content = fp.read(4096)
                     except OSError:
                         continue
+
                     raw_id = f.replace('.md', '')
-                    clean_name = raw_id.replace('-', ' ').title()
-                    agents_list.append({
-                        "id": raw_id,
-                        "name": clean_name,
-                        "department": dept,
-                        "status": "idle"
-                    })
+                    meta = parse_agent_frontmatter(content)
+                    clean_name = meta.get("name") or raw_id.replace('-', ' ').title()
+                    
+                    # Deterministic Division Assignment Strategy:
+                    # 1. Explicit metadata in frontmatter (division / department)
+                    # 2. Top-level relative directory under target_dir
+                    # 3. Fallback: match by relative path components
+                    div_match = None
+                    explicit_div = (meta.get("division") or meta.get("department") or "").lower()
+                    if explicit_div in CANONICAL_DIVISION_MAP:
+                        div_match = CANONICAL_DIVISION_MAP[explicit_div]
+                    elif explicit_div in CANONICAL_NAME_MAP:
+                        div_match = CANONICAL_NAME_MAP[explicit_div]
+                    elif top_folder in CANONICAL_DIVISION_MAP:
+                        div_match = CANONICAL_DIVISION_MAP[top_folder]
+                    elif top_folder in CANONICAL_NAME_MAP:
+                        div_match = CANONICAL_NAME_MAP[top_folder]
+                    else:
+                        # Check any path component in case of custom nested structure
+                        for part in rel_root.replace('\\', '/').split('/'):
+                            p_clean = part.lower()
+                            if p_clean in CANONICAL_DIVISION_MAP:
+                                div_match = CANONICAL_DIVISION_MAP[p_clean]
+                                break
+                            elif p_clean in CANONICAL_NAME_MAP:
+                                div_match = CANONICAL_NAME_MAP[p_clean]
+                                break
+
+                    rel_file = os.path.relpath(f_path, target_dir).replace('\\', '/')
+                    
+                    if div_match:
+                        agents_list.append({
+                            "id": raw_id,
+                            "name": clean_name,
+                            "department": div_match["name"],
+                            "division_id": div_match["id"],
+                            "division_name": div_match["name"],
+                            "division_name_ar": div_match.get("name_ar", div_match["name"]),
+                            "description": meta.get("description", ""),
+                            "relative_path": rel_file,
+                            "status": "idle"
+                        })
+                    else:
+                        unclassified_list.append({
+                            "id": raw_id,
+                            "name": clean_name,
+                            "path": rel_file,
+                            "folder": top_folder
+                        })
     except Exception as e:
         return {
             "total": 0,
             "agents": [],
+            "divisions": empty_divisions,
+            "unclassified": [],
             "status": "error",
             "directory": target_dir,
             "error": str(e)
         }
         
+    # Populate per-division counts and member agent IDs in stable order
+    division_records = []
+    for d in CANONICAL_DIVISIONS:
+        d_agents = [a for a in agents_list if a["division_id"] == d["id"]]
+        division_records.append({
+            **d,
+            "registered_count": len(d_agents),
+            "discovered_count": len(d_agents),
+            "agents": [a["id"] for a in d_agents]
+        })
+
     return {
         "total": len(agents_list),
         "agents": agents_list,
+        "divisions": division_records,
+        "unclassified": unclassified_list,
         "status": "discovered" if agents_list else "empty",
         "directory": target_dir,
         "error": None
@@ -272,14 +518,23 @@ MIN_AGENT_PROMPT_BYTES = 20     # Minimum viable agent definition size
 def safe_resolve_agent_path(agent_rel_path, agents_dir=None):
     """
     Resolve agent prompt file strictly relative to trusted agent root.
-    Rejects:
-    - Non-string or empty paths
-    - Absolute paths or Windows drive letters
-    - Path traversal ('..')
-    - Symlink escapes pointing outside trusted agent root
-    - Non-existent files or directories
+    Security policy:
+    1. Rejects non-string, empty, or whitespace-only paths.
+    2. Rejects absolute paths (Unix '/', Windows '\' or drive letters 'C:').
+    3. Rejects path traversal attempts ('..').
+    4. Canonical containment: Resolves full real canonical paths for both root and target.
+       Guarantees that intermediate directory symlinks AND final symlinks cannot escape
+       the canonical agent directory.
+    5. Internal symlink policy: Symlinks whose canonical destination lies strictly within
+       canonical_base and resolves to a regular .md file are permitted.
+    6. Broken symlinks and non-existent files are rejected with explicit error.
+    7. Directories, device files, and non-regular files are rejected with explicit error.
     """
-    base_dir = os.path.abspath(agents_dir or get_agents_dir())
+    raw_base = agents_dir or get_agents_dir()
+    if not raw_base:
+        return None, "Agents directory not configured"
+    base_dir = os.path.abspath(raw_base)
+    
     if not agent_rel_path or not isinstance(agent_rel_path, str):
         return None, "Invalid path: empty or not a string"
     
@@ -304,30 +559,38 @@ def safe_resolve_agent_path(agent_rel_path, agents_dir=None):
         
     target_path = os.path.abspath(os.path.join(base_dir, normalized_rel))
     
-    # Common path containment check
+    # 1. Lexical containment check
     try:
         if os.path.commonpath([base_dir, target_path]) != base_dir:
             return None, "Path escapes agents directory"
     except (ValueError, Exception):
         return None, "Path containment check failed"
-        
-    # Symlink containment check
-    if os.path.islink(target_path):
-        real_target = os.path.realpath(target_path)
-        try:
-            real_base = os.path.realpath(base_dir)
-            if os.path.commonpath([real_base, real_target]) != real_base:
-                return None, "Symlink escape rejected"
-        except (ValueError, Exception):
-            return None, "Symlink containment check failed"
-            
+
+    # 2. Check for broken symlinks or non-existent paths before canonical inspection
+    if os.path.lexists(target_path) and not os.path.exists(target_path):
+        return None, f"Broken symlink or target does not exist: {normalized_rel}"
+
     if not os.path.exists(target_path):
         return None, f"Agent prompt file does not exist: {normalized_rel}"
-        
-    if not os.path.isfile(target_path):
+
+    # 3. Canonical path containment (enforces both intermediate-directory and final symlinks)
+    try:
+        canonical_base = os.path.realpath(base_dir)
+        canonical_target = os.path.realpath(target_path)
+        if canonical_target == canonical_base or os.path.commonpath([canonical_base, canonical_target]) != canonical_base:
+            return None, "Symlink escape rejected"
+    except (ValueError, Exception):
+        return None, "Symlink containment check failed"
+
+    # 4. Enforce regular file check (reject directories and special devices)
+    if os.path.isdir(canonical_target) or os.path.isdir(target_path):
+        return None, f"Agent path is a directory, not a regular file: {normalized_rel}"
+
+    if not os.path.isfile(canonical_target):
         return None, f"Agent path is not a regular file: {normalized_rel}"
         
-    return target_path, None
+    return canonical_target, None
+
 
 def safe_load_agent_prompt(agent_rel_path, fallback_prompt=None, max_bytes=MAX_AGENT_PROMPT_BYTES, agents_dir=None):
     """
@@ -837,6 +1100,7 @@ workflow_state = {
         "design": "",
         "development": "",
         "qa": "",
+        "qa_specialists": "",
         "seo": "",
         "animation": ""
     },
@@ -1900,6 +2164,7 @@ def continue_workflow(feedback=""):
         
         # 6. QA Stage with QA/Security Specialists
         qa_specialists = [s for s in active_squad if s["stage"] == "qa"]
+        qa_specialist_reports = []
         for s in qa_specialists:
             with state_lock:
                 s["status"] = "running"
@@ -1910,7 +2175,7 @@ def continue_workflow(feedback=""):
             if spec_def:
                 try:
                     add_feed(s["name"], s["display_name"], spec_def.get("color", "linear-gradient(135deg, #FF9A9E, #FECFEF)"), spec_def.get("short_name", "QA"), f"بدأت في تدقيق الجودة والمعايير المتخصصة: {s['reason']}")
-                    call_agent(
+                    spec_out = call_agent(
                         spec_def["prompt_file"],
                         spec_def["name"],
                         spec_def.get("short_name", "QA"),
@@ -1918,15 +2183,34 @@ def continue_workflow(feedback=""):
                         f"بصفتك ({spec_def['name']})، راجع الأكواد البرمجية والتصميم بناءً على اختصاصك: {s['reason']}.",
                         dev_out
                     )
-                    with state_lock:
-                        s["status"] = "completed"
+                    if spec_out and spec_out.strip():
+                        qa_specialist_reports.append(f"### تقرير {s['name']} ({s['display_name']}):\n{spec_out.strip()}")
+                        with state_lock:
+                            s["status"] = "completed"
+                    else:
+                        with state_lock:
+                            s["status"] = "failed"
+                        add_feed("النظام", "Squad Orchestrator", "orange", "WARN", f"لم يقدم المتخصص {s['name']} أي نتائج تدقيق صالحة.")
                 except Exception as e:
                     with state_lock:
                         s["status"] = "failed"
                     add_feed("النظام", "Squad Orchestrator", "orange", "WARN", f"تعذر استكمال تدقيق {s['name']}: {e}")
+            else:
+                with state_lock:
+                    s["status"] = "failed"
+                add_feed("النظام", "Squad Orchestrator", "orange", "WARN", f"تعذر العثور على تعريف المتخصص {s['name']}.")
             update_stats()
 
-        qa_out = call_agent(r"engineering\engineering-code-reviewer.md", "مهندس الجودة", "QA", "linear-gradient(135deg, #FF9A9E, #FECFEF)", "قم بمراجعة الأكواد المرفقة أدناه، وتأكد من خلوها من الأخطاء وراجع معايير الأمان وقابلية الاستخدام.", dev_out)
+        # Combine QA specialist findings with primary QA reviewer prompt
+        qa_specialists_text = "\n\n".join(qa_specialist_reports) if qa_specialist_reports else ""
+        with state_lock:
+            workflow_state["outputs"]["qa_specialists"] = qa_specialists_text
+
+        qa_input_context = dev_out
+        if qa_specialists_text:
+            qa_input_context = f"{dev_out}\n\n---\n## نتائج وتدقيقات المتخصصين المستقلة (QA Specialists Findings):\n{qa_specialists_text}\n---\nيُرجى أخذ نتائج المتخصصين أعلاه بعين الاعتبار والتحقق من توصياتهم أثناء تقييم الكود النهائي."
+
+        qa_out = call_agent(r"engineering\engineering-code-reviewer.md", "مهندس الجودة", "QA", "linear-gradient(135deg, #FF9A9E, #FECFEF)", "قم بمراجعة الأكواد المرفقة أدناه، وتأكد من خلوها من الأخطاء وراجع معايير الأمان وقابلية الاستخدام وتوصيات المتخصصين.", qa_input_context)
         
         with state_lock:
             workflow_state["outputs"]["qa"] = qa_out
@@ -1944,18 +2228,25 @@ def continue_workflow(feedback=""):
             if spec_def:
                 anim_prompt_file = spec_def["prompt_file"]
                 anim_role_name = spec_def["name"]
-                with state_lock:
-                    anim_spec["status"] = "running"
-                update_stats()
-
-        anim_out = call_agent(anim_prompt_file, anim_role_name, "MOTION", "linear-gradient(135deg, #ff758c, #ff7eb3)", "طور كود CSS و JS لإضافة تأثيرات بصرية وحركية احترافية تجعل الموقع حياً وفخماً. أرجع كود CSS المحدث داخل ```css وكود JS المحدث داخل ```javascript.", dev_out)
-        
-        if anim_spec:
             with state_lock:
-                anim_spec["status"] = "completed"
+                anim_spec["status"] = "running"
+            update_stats()
+
+        try:
+            anim_out = call_agent(anim_prompt_file, anim_role_name, "MOTION", "linear-gradient(135deg, #ff758c, #ff7eb3)", "طور كود CSS و JS لإضافة تأثيرات بصرية وحركية احترافية تجعل الموقع حياً وفخماً. أرجع كود CSS المحدث داخل ```css وكود JS المحدث داخل ```javascript.", dev_out)
+            if anim_spec:
+                with state_lock:
+                    anim_spec["status"] = "completed" if (anim_out and anim_out.strip()) else "failed"
+        except Exception as e:
+            anim_out = ""
+            if anim_spec:
+                with state_lock:
+                    anim_spec["status"] = "failed"
+            add_feed("النظام", "Squad Orchestrator", "orange", "WARN", f"تعذر استكمال مرحلة التأثيرات الحركية: {e}")
+        
         with state_lock:
             workflow_state["outputs"]["animation"] = anim_out
-            workflow_state["departments"]["animation"] = {"status": "done", "text": "تم إضافة التأثيرات الحركية."}
+            workflow_state["departments"]["animation"] = {"status": "done" if anim_out else "error", "text": "تم إضافة التأثيرات الحركية." if anim_out else "تعذر إضافة التأثيرات الحركية."}
             workflow_state["departments"]["seo"] = {"status": "active", "text": "يحسن أرشفة النظام..."}
         update_stats()
         
@@ -1969,18 +2260,25 @@ def continue_workflow(feedback=""):
             if spec_def:
                 seo_prompt_file = spec_def["prompt_file"]
                 seo_role_name = spec_def["name"]
-                with state_lock:
-                    seo_spec["status"] = "running"
-                update_stats()
-
-        seo_out = call_agent(seo_prompt_file, seo_role_name, "SEO", "linear-gradient(135deg, #f093fb, #f5576c)", "اقترح تحسينات محركات البحث وعلامات Meta tags والكلمات المفتاحية لتحسين الظهور.", dev_out)
-        
-        if seo_spec:
             with state_lock:
-                seo_spec["status"] = "completed"
+                seo_spec["status"] = "running"
+            update_stats()
+
+        try:
+            seo_out = call_agent(seo_prompt_file, seo_role_name, "SEO", "linear-gradient(135deg, #f093fb, #f5576c)", "اقترح تحسينات محركات البحث وعلامات Meta tags والكلمات المفتاحية لتحسين الظهور.", dev_out)
+            if seo_spec:
+                with state_lock:
+                    seo_spec["status"] = "completed" if (seo_out and seo_out.strip()) else "failed"
+        except Exception as e:
+            seo_out = ""
+            if seo_spec:
+                with state_lock:
+                    seo_spec["status"] = "failed"
+            add_feed("النظام", "Squad Orchestrator", "orange", "WARN", f"تعذر استكمال تحسين محركات البحث: {e}")
+
         with state_lock:
             workflow_state["outputs"]["seo"] = seo_out
-            workflow_state["departments"]["seo"] = {"status": "done", "text": "تم تحسين محركات البحث."}
+            workflow_state["departments"]["seo"] = {"status": "done" if seo_out else "error", "text": "تم تحسين محركات البحث." if seo_out else "تعذر تحسين محركات البحث."}
         update_stats()
         
         # --- Code Extraction ---
@@ -2362,12 +2660,28 @@ def get_agents():
             "id": raw_id,
             "name": agent["name"],
             "department": dept,
+            "division_id": agent.get("division_id", "specialized"),
+            "division_name": agent.get("division_name", dept),
+            "division_name_ar": agent.get("division_name_ar", dept),
+            "description": agent.get("description", ""),
             "status": status
         })
         
     order = {"working": 0, "selected": 1, "completed": 2, "failed": 3, "idle": 4}
     agents_list.sort(key=lambda a: (order.get(a["status"], 4), a["name"]))
     return jsonify(agents_list)
+
+@app.route('/api/divisions', methods=['GET'])
+def get_divisions():
+    inventory = discover_agents()
+    return jsonify({
+        "status": inventory.get("status", "discovered"),
+        "total_divisions": len(inventory.get("divisions", [])),
+        "total_agents": inventory.get("total", 0),
+        "divisions": inventory.get("divisions", []),
+        "unclassified": inventory.get("unclassified", []),
+        "error": inventory.get("error")
+    })
 
 @app.route('/api/budget', methods=['GET'])
 def get_budget():

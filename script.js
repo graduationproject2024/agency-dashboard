@@ -721,16 +721,27 @@ loadApprovalHistory();
 
 // Agents Management
 let allAgentsData = [];
+let allDivisionsData = [];
 let currentAgentDivision = 'all';
 let currentStatusFilter = 'all';
 
 async function loadAgents() {
     const list = document.getElementById('agents-list');
     if (!list) return;
-    list.innerHTML = '<div style="text-align:center; grid-column: 1 / -1;"><i class="fa-solid fa-spinner fa-spin"></i> جاري جلب قائمة الموظفين...</div>';
+    list.innerHTML = '<div style="text-align:center; grid-column: 1 / -1;"><i class="fa-solid fa-spinner fa-spin"></i> جاري جلب قائمة الموظفين والأقسام...</div>';
     try {
-        const res = await fetch('/api/agents');
-        allAgentsData = await res.json();
+        const [agentsRes, divisionsRes] = await Promise.all([
+            fetch('/api/agents'),
+            fetch('/api/divisions')
+        ]);
+        
+        if (agentsRes.ok) {
+            allAgentsData = await agentsRes.json();
+        }
+        if (divisionsRes.ok) {
+            const divData = await divisionsRes.json();
+            allDivisionsData = divData.divisions || [];
+        }
         
         const workingCount = allAgentsData.filter(a => a.status === 'working').length;
         const completedCount = allAgentsData.filter(a => a.status === 'completed').length;
@@ -760,7 +771,7 @@ async function loadAgents() {
         renderDivisionFilters();
         renderAgentsList();
     } catch (e) {
-        list.innerHTML = '<div style="text-align:center; grid-column: 1 / -1; color: red;">فشل في تحميل الموظفين.</div>';
+        list.innerHTML = '<div style="text-align:center; grid-column: 1 / -1; color: red;">فشل في تحميل الموظفين والأقسام.</div>';
     }
 }
 
@@ -783,20 +794,38 @@ function renderDivisionFilters() {
     filterContainer.innerHTML = '';
     
     const allBtn = document.createElement('button');
+    allBtn.type = 'button';
     allBtn.className = `btn btn-sm ${currentAgentDivision === 'all' ? 'btn-primary' : 'btn-secondary'}`;
-    allBtn.textContent = `كل الأقسام (${allAgentsData.length})`;
+    allBtn.innerHTML = `<i class="fa-solid fa-layer-group"></i> كل الأقسام (${allAgentsData.length})`;
     allBtn.addEventListener('click', () => setAgentDivision('all'));
     filterContainer.appendChild(allBtn);
     
-    const depts = Array.from(new Set(allAgentsData.map(a => a.department))).filter(Boolean);
-    depts.forEach(d => {
-        const count = allAgentsData.filter(a => a.department === d).length;
-        const btn = document.createElement('button');
-        btn.className = `btn btn-sm ${currentAgentDivision === d ? 'btn-primary' : 'btn-secondary'}`;
-        btn.textContent = `${d} (${count})`;
-        btn.addEventListener('click', () => setAgentDivision(d));
-        filterContainer.appendChild(btn);
-    });
+    if (allDivisionsData && allDivisionsData.length > 0) {
+        allDivisionsData.forEach(d => {
+            const count = d.discovered_count !== undefined ? d.discovered_count : (allAgentsData.filter(a => a.division_id === d.id || a.department === d.name).length);
+            const isSelected = currentAgentDivision === d.id || currentAgentDivision === d.name;
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = `btn btn-sm ${isSelected ? 'btn-primary' : 'btn-secondary'}`;
+            const safeIcon = escapeHtml(d.icon || 'fa-solid fa-folder');
+            const safeName = escapeHtml(d.name);
+            btn.title = d.description || `${d.name} (${d.name_ar || ''})`;
+            btn.innerHTML = `<i class="${safeIcon}"></i> ${safeName} (${count})`;
+            btn.addEventListener('click', () => setAgentDivision(d.id));
+            filterContainer.appendChild(btn);
+        });
+    } else {
+        const depts = Array.from(new Set(allAgentsData.map(a => a.department))).filter(Boolean);
+        depts.forEach(d => {
+            const count = allAgentsData.filter(a => a.department === d).length;
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = `btn btn-sm ${currentAgentDivision === d ? 'btn-primary' : 'btn-secondary'}`;
+            btn.textContent = `${d} (${count})`;
+            btn.addEventListener('click', () => setAgentDivision(d));
+            filterContainer.appendChild(btn);
+        });
+    }
 }
 
 function setAgentDivision(div) {
@@ -820,14 +849,37 @@ function renderAgentsList() {
         filtered = filtered.filter(a => a.status === currentStatusFilter);
     }
     if (currentAgentDivision !== 'all') {
-        filtered = filtered.filter(a => a.department === currentAgentDivision);
+        filtered = filtered.filter(a => a.division_id === currentAgentDivision || a.division_name === currentAgentDivision || a.department === currentAgentDivision);
     }
     if (query) {
-        filtered = filtered.filter(a => a.name.toLowerCase().includes(query) || a.department.toLowerCase().includes(query));
+        filtered = filtered.filter(a => 
+            (a.name && a.name.toLowerCase().includes(query)) ||
+            (a.id && a.id.toLowerCase().includes(query)) ||
+            (a.department && a.department.toLowerCase().includes(query)) ||
+            (a.division_name && a.division_name.toLowerCase().includes(query)) ||
+            (a.division_name_ar && a.division_name_ar.toLowerCase().includes(query)) ||
+            (a.description && a.description.toLowerCase().includes(query))
+        );
     }
     
     if (filtered.length === 0) {
-        list.innerHTML = '<div style="text-align:center; grid-column: 1 / -1; color: var(--text-muted); padding: 40px; font-size: 1.1rem;"><i class="fa-solid fa-filter" style="margin-bottom:10px; font-size: 2rem; display:block; opacity:0.5;"></i>لا يوجد وكلاء يطابقون خيارات التصفية الحالية.</div>';
+        const selectedDiv = allDivisionsData.find(d => d.id === currentAgentDivision || d.name === currentAgentDivision);
+        if (selectedDiv && !query && currentStatusFilter === 'all') {
+            const safeDivIcon = escapeHtml(selectedDiv.icon || 'fa-solid fa-folder-open');
+            const safeDivName = escapeHtml(selectedDiv.name);
+            const safeDivDesc = escapeHtml(selectedDiv.description || 'لا يوجد وكلاء مسجلون في هذا القسم حالياً.');
+            list.innerHTML = `
+                <div style="text-align:center; grid-column: 1 / -1; color: var(--text-muted); padding: 50px 20px;">
+                    <div style="font-size: 2.8rem; margin-bottom: 15px; opacity: 0.6; color: var(--accent-blue);">
+                        <i class="${safeDivIcon}"></i>
+                    </div>
+                    <h3 style="color: #fff; margin-bottom: 8px;">قسم ${safeDivName} خالي من الوكلاء حالياً</h3>
+                    <p style="font-size: 0.9rem; color: #8b949e; max-width: 500px; margin: 0 auto;">${safeDivDesc}</p>
+                </div>
+            `;
+        } else {
+            list.innerHTML = '<div style="text-align:center; grid-column: 1 / -1; color: var(--text-muted); padding: 40px; font-size: 1.1rem;"><i class="fa-solid fa-filter" style="margin-bottom:10px; font-size: 2rem; display:block; opacity:0.5;"></i>لا يوجد وكلاء يطابقون خيارات التصفية أو البحث الحالية.</div>';
+        }
         return;
     }
     
@@ -836,10 +888,13 @@ function renderAgentsList() {
         const card = document.createElement('div');
         const status = agent.status || 'idle';
         card.className = `agent-card status-${status}`;
-        card.style.cssText = 'padding: 18px 16px; border-radius: 14px; text-align: center; position: relative;';
+        card.style.cssText = 'padding: 18px 16px; border-radius: 14px; text-align: center; position: relative; display: flex; flex-direction: column; justify-content: space-between;';
         
         const safeName = escapeHtml(agent.name);
-        const safeDept = escapeHtml(agent.department);
+        const safeDept = escapeHtml(agent.division_name || agent.department || '');
+        const safeDesc = escapeHtml(agent.description || '');
+        const divMeta = allDivisionsData.find(d => d.id === agent.division_id || d.name === safeDept);
+        const safeIcon = escapeHtml(divMeta?.icon || 'fa-solid fa-user-gear');
         
         let badgeHtml = '';
         let iconColor = 'var(--accent-blue)';
@@ -858,14 +913,19 @@ function renderAgentsList() {
             iconColor = 'var(--text-muted)';
             statusSubtext = `<div style="font-size: 0.78rem; color: #8b949e; margin-top: 8px;">جاهز للتكليف القادم</div>`;
         }
+        
+        const descHtml = safeDesc ? `<p style="font-size: 0.78rem; color: #8b949e; margin: 8px 0 0 0; line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;" title="${safeDesc}">${safeDesc}</p>` : '';
             
         card.innerHTML = `
             ${badgeHtml}
-            <div style="font-size: 2.2rem; margin-top: 10px; margin-bottom: 12px; color: ${iconColor};">
-                <i class="fa-solid fa-user-gear"></i>
+            <div>
+                <div style="font-size: 2.2rem; margin-top: 10px; margin-bottom: 12px; color: ${iconColor};">
+                    <i class="${safeIcon}"></i>
+                </div>
+                <h4 style="margin-bottom: 6px; font-size: 1rem; color: #fff; font-weight: 700;">${safeName}</h4>
+                <span style="font-size: 0.75rem; background: rgba(88,166,255,0.12); color: var(--accent-blue); padding: 3px 10px; border-radius: 10px; display: inline-block;">${safeDept}</span>
+                ${descHtml}
             </div>
-            <h4 style="margin-bottom: 6px; font-size: 1rem; color: #fff; font-weight: 700;">${safeName}</h4>
-            <span style="font-size: 0.75rem; background: rgba(88,166,255,0.12); color: var(--accent-blue); padding: 3px 10px; border-radius: 10px; display: inline-block;">${safeDept}</span>
             ${statusSubtext}
         `;
         list.appendChild(card);

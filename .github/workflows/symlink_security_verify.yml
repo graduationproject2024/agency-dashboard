@@ -150,10 +150,21 @@ jobs:
           echo "=== Running full test_adversarial_paths.py security suite ==="
           python -m pytest tests/test_adversarial_paths.py -v --tb=short
 
+      - name: Run agent path security and canonical division tests
+        run: |
+          echo "=== Running test_agent_security_and_divisions.py on Ubuntu ==="
+          python -m pytest tests/test_agent_security_and_divisions.py -v --tb=short -rs
+          output=$(python -m pytest tests/test_agent_security_and_divisions.py -k "symlink" -q)
+          echo "$output"
+          if echo "$output" | grep -i "skipped"; then
+            echo "ERROR: Required agent symlink tests were skipped on Ubuntu! All symlink tests must execute."
+            exit 1
+          fi
+
       - name: Run broader core workflow & rollback test suites
         run: |
           echo "=== Running core integration, rollback, and reliability suites ==="
-          python -m pytest tests/test_adversarial_rollback.py tests/test_workflow_integration.py tests/test_workflow_reliability.py tests/test_csrf_origin_policy.py tests/test_financial_accounting.py tests/test_security_http_filesystem.py tests/test_security_secrets.py tests/test_squad_triage.py -v --tb=short
+          python -m pytest tests/test_adversarial_rollback.py tests/test_workflow_integration.py tests/test_workflow_reliability.py tests/test_csrf_origin_policy.py tests/test_financial_accounting.py tests/test_security_http_filesystem.py tests/test_security_secrets.py tests/test_squad_triage.py tests/test_agent_security_and_divisions.py -v --tb=short
 
       - name: Verify repository integrity post-test
         if: always()
