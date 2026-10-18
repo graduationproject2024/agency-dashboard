@@ -372,7 +372,24 @@ def get_task_execution_context(
             if dep_task and dep_task.get("output_text"):
                 upstream_outputs.append(f"[{dep_task['title']} ({dep_task['assigned_agent_id']})]:\n{dep_task['output_text']}")
         if upstream_outputs:
-            context_parts.append("--- مخرجات المهام السابقة المعتمدة ---\n" + "\n\n".join(upstream_outputs))
+            if task.get("assigned_agent_id") == "engineering-code-reviewer":
+                qa_spec_reports = []
+                dev_text = ""
+                for dep_id in deps:
+                    dep_task = db.get_task(dep_id, db_path=db_path)
+                    if dep_task and dep_task.get("output_text"):
+                        if dep_task.get("stage") == "development":
+                            dev_text = dep_task["output_text"]
+                        elif "_spec_" in dep_id or dep_task.get("stage") in ("qa", "testing"):
+                            qa_spec_reports.append(f"### تقرير {dep_task['title']} ({dep_task['assigned_agent_id']}):\n{dep_task['output_text']}")
+                qa_context = dev_text or task.get("input_context", "")
+                if qa_spec_reports:
+                    qa_spec_text = "\n\n".join(qa_spec_reports)
+                    context_parts.append(f"{qa_context}\n\n---\n## نتائج وتدقيقات المتخصصين المستقلة (QA Specialists Findings):\n{qa_spec_text}\n---\nيُرجى أخذ نتائج المتخصصين أعلاه بعين الاعتبار والتحقق من توصياتهم أثناء تقييم الكود النهائي.")
+                else:
+                    context_parts.append("--- مخرجات المهام السابقة المعتمدة ---\n" + "\n\n".join(upstream_outputs))
+            else:
+                context_parts.append("--- مخرجات المهام السابقة المعتمدة ---\n" + "\n\n".join(upstream_outputs))
 
     # 3. Verified project memory
     session = db.get_session(session_id, db_path=db_path)
@@ -415,13 +432,39 @@ def execute_single_task(
 
     # 2. Assemble context
     full_context = get_task_execution_context(session_id, task, db_path=db_path)
+
+    # Resolve canonical short name expected by provider wrappers and test fixtures
+    canonical_short_names = {
+        "engineering-senior-developer": "DEV",
+        "engineering-code-reviewer": "QA",
+        "design-whimsy-injector": "MOTION",
+        "marketing-seo-specialist": "SEO",
+        "engineering-software-architect": "ENG",
+        "design-ui-designer": "UI",
+        "business-strategist": "BS",
+        "product-manager": "PM",
+    }
+    short_name = canonical_short_names.get(agent_id)
+    if not short_name:
+        if stage in ("qa", "testing") or "qa" in agent_id or "reviewer" in agent_id or "sec" in agent_id:
+            short_name = "QA"
+        elif stage == "engineering" or task.get("division_id") == "engineering":
+            short_name = "ENG"
+        elif stage == "strategy" or task.get("division_id") == "specialized":
+            short_name = "SPC"
+        elif stage == "animation":
+            short_name = "MOTION"
+        elif stage == "seo":
+            short_name = "SEO"
+        else:
+            short_name = agent_id[:3].upper()
     
     # 3. Execute agent call
     try:
         output = call_agent_fn(
             prompt_file,
             role_name,
-            agent_id[:3].upper(),
+            short_name,
             color,
             task.get("input_context", ""),
             full_context
@@ -530,3 +573,146 @@ def execute_single_task(
                 add_feed_fn("النظام", "Task Engine", "red", "FAIL", f"فشل تنفيذ مهمة {task['title']} نهائياً: {err_msg}")
                 
         return False, None, err_msg
+
+
+def run_dag_stages(
+    session_id: str,
+    allowed_stages: List[str],
+    call_agent_fn: Callable[..., str],
+    agent_prompt_resolver_fn: Callable[[str], Tuple[str, str, str]],
+    add_feed_fn: Optional[Callable] = None,
+    on_task_start_fn: Optional[Callable[[Dict[str, Any]], None]] = None,
+    on_task_complete_fn: Optional[Callable[[Dict[str, Any], str], None]] = None,
+    on_task_fail_fn: Optional[Callable[[Dict[str, Any], str], None]] = None,
+    db_path: Optional[str] = None
+) -> Tuple[bool, List[str], Optional[str]]:
+    """
+    Execute all ready tasks in a session that belong to allowed_stages
+    following the Directed Acyclic Graph (DAG) dependencies.
+    Dispatches tasks as dependencies become satisfied.
+    Prevents duplicate claims via atomic database conditional locking.
+    Returns (success: bool, completed_task_ids: List[str], error_message: Optional[str]).
+    """
+    session = db.get_session(session_id, db_path=db_path)
+    if not session:
+        return False, [], f"Session {session_id} not found."
+
+    completed_ids: List[str] = []
+
+    while True:
+        all_tasks = db.list_tasks_for_session(session_id, db_path=db_path)
+        stage_tasks = [t for t in all_tasks if t.get("stage") in allowed_stages]
+        
+        if not stage_tasks:
+            return True, completed_ids, None
+
+        # Check if any core task in allowed_stages is terminally failed
+        failed_core_tasks = [t for t in stage_tasks if t.get("status") == "failed" and "_spec_" not in t.get("task_id", "")]
+        if failed_core_tasks:
+            err = failed_core_tasks[0].get("error_message") or "Prerequisite core task failed."
+            return False, completed_ids, f"Task {failed_core_tasks[0].get('title')} failed: {err}"
+
+        # Check if all tasks in allowed_stages are already completed (or specialist failed)
+        uncompleted = [t for t in stage_tasks if t.get("status") not in ("completed", "failed")]
+        if not uncompleted:
+            return True, [t["task_id"] for t in stage_tasks if t.get("status") == "completed"], None
+
+        # Claim the next ready task in allowed_stages
+        claimed_task = db.claim_next_ready_task(session_id, allowed_stages=allowed_stages, db_path=db_path)
+        if not claimed_task:
+            # Check if any tasks in allowed_stages are currently running
+            running_tasks = [t for t in stage_tasks if t.get("status") == "running"]
+            if running_tasks:
+                time.sleep(0.3)
+                continue
+                
+            # Check if any tasks in allowed_stages are blocked
+            blocked_tasks = [t for t in stage_tasks if t.get("status") == "blocked"]
+            if blocked_tasks:
+                return False, completed_ids, f"Execution halted: Tasks {', '.join([b['title'] for b in blocked_tasks])} are blocked."
+            
+            # Check if pending tasks exist but their prerequisite is outside allowed_stages
+            pending_tasks = [t for t in stage_tasks if t.get("status") == "pending"]
+            if pending_tasks:
+                completed_overall = {t["task_id"] for t in all_tasks if t.get("status") == "completed"}
+                waiting_on_external = False
+                for pt in pending_tasks:
+                    deps = pt.get("dependencies", [])
+                    if any(d not in completed_overall for d in deps):
+                        waiting_on_external = True
+                        break
+                if waiting_on_external:
+                    return True, completed_ids, None
+                    
+            return False, completed_ids, "No task in allowed stages is ready to execute."
+
+        # Task was claimed! Execute it.
+        if on_task_start_fn:
+            try:
+                on_task_start_fn(claimed_task)
+            except Exception as ex:
+                logging.warning("on_task_start_fn error: %s", ex)
+
+        success, output, err = execute_single_task(
+            task=claimed_task,
+            session=session,
+            call_agent_fn=call_agent_fn,
+            agent_prompt_resolver_fn=agent_prompt_resolver_fn,
+            add_feed_fn=add_feed_fn,
+            db_path=db_path
+        )
+
+        if success:
+            completed_ids.append(claimed_task["task_id"])
+            if on_task_complete_fn:
+                try:
+                    on_task_complete_fn(claimed_task, output or "")
+                except Exception as ex:
+                    logging.warning("on_task_complete_fn error: %s", ex)
+        else:
+            if on_task_fail_fn:
+                try:
+                    on_task_fail_fn(claimed_task, err or "Unknown error")
+                except Exception as ex:
+                    logging.warning("on_task_fail_fn error: %s", ex)
+            
+            latest_task = db.get_task(claimed_task["task_id"], db_path=db_path)
+            if latest_task and latest_task.get("status") == "failed" and "_spec_" not in claimed_task.get("task_id", ""):
+                return False, completed_ids, f"Task {claimed_task.get('title')} failed: {err}"
+
+
+def create_remediation_task(
+    session_id: str,
+    original_task_id: str,
+    qa_errors: List[str],
+    candidate_code: Dict[str, str],
+    attempt_num: int,
+    db_path: Optional[str] = None
+) -> str:
+    """
+    Dynamically inject a remediation task into the DAG for bounded self-healing.
+    Assigned to the responsible agent (senior developer).
+    """
+    title = f"إصلاح أخطاء فحص الجودة (محاولة {attempt_num} من 2)"
+    errors_str = "\n- ".join(qa_errors)
+    input_ctx = (
+        f"فحص الجودة البرمجية كشف عن الأخطاء التالية التي يجب إصلاحها فوراً:\n- {errors_str}\n\n"
+        f"الأكواد الحالية:\n"
+        f"```html\n{candidate_code.get('html', '')}\n```\n\n"
+        f"```css\n{candidate_code.get('css', '')}\n```\n\n"
+        f"```javascript\n{candidate_code.get('js', '')}\n```\n\n"
+        f"المطلوب: قم بإصلاح الأخطاء المذكورة فوراً، وأرجع كود HTML الكامل المصحح داخل ```html وكود CSS داخل ```css وكود JS داخل ```javascript."
+    )
+    remediation_task_id = db.create_task(
+        session_id=session_id,
+        title=title,
+        division_id="engineering",
+        assigned_agent_id="engineering-senior-developer",
+        stage="development",
+        dependencies=[original_task_id],
+        input_context=input_ctx,
+        max_retries=1,
+        db_path=db_path
+    )
+    return remediation_task_id
+

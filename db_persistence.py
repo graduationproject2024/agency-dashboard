@@ -367,18 +367,29 @@ def create_task(
     parent_task_id: Optional[str] = None,
     input_context: Optional[str] = None,
     max_retries: int = 2,
+    status: Optional[str] = None,
+    output_text: Optional[str] = None,
     db_path: Optional[str] = None
 ) -> str:
     task_id = f"task_{uuid.uuid4().hex[:12]}"
     deps_json = json.dumps(dependencies or [])
-    initial_status = "ready" if not dependencies else "pending"
+    initial_status = status or "ready"
     with get_db_connection(db_path) as conn:
+        if not status and dependencies:
+            placeholders = ",".join(["?"] * len(dependencies))
+            completed_count = conn.execute(
+                f"SELECT COUNT(*) as count FROM workflow_tasks WHERE task_id IN ({placeholders}) AND status = 'completed';",
+                dependencies
+            ).fetchone()["count"]
+            if completed_count < len(dependencies):
+                initial_status = "pending"
+
         conn.execute("""
             INSERT INTO workflow_tasks (
                 task_id, session_id, parent_task_id, title, division_id,
-                assigned_agent_id, stage, status, dependencies_json, input_context, max_retries
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-        """, (task_id, session_id, parent_task_id, title, division_id, assigned_agent_id, stage, initial_status, deps_json, input_context, max_retries))
+                assigned_agent_id, stage, status, dependencies_json, input_context, max_retries, output_text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """, (task_id, session_id, parent_task_id, title, division_id, assigned_agent_id, stage, initial_status, deps_json, input_context, max_retries, output_text))
         conn.commit()
     return task_id
 
@@ -484,6 +495,60 @@ def increment_task_retry(task_id: str, db_path: Optional[str] = None) -> Tuple[i
         conn.execute("UPDATE workflow_tasks SET retry_count = ? WHERE task_id = ?;", (new_count, task_id))
         conn.commit()
         return new_count, can_retry
+
+
+def claim_task(task_id: str, db_path: Optional[str] = None) -> bool:
+    """
+    Atomically claim a task for execution.
+    Transitions status from 'ready' (or 'pending') to 'running'.
+    Returns True if successfully claimed, False if already claimed or finished.
+    """
+    now = time.time()
+    with get_db_connection(db_path) as conn:
+        cursor = conn.execute("""
+            UPDATE workflow_tasks
+            SET status = 'running',
+                started_at = COALESCE(started_at, ?)
+            WHERE task_id = ? AND status IN ('ready', 'pending');
+        """, (now, task_id))
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def claim_next_ready_task(
+    session_id: str,
+    allowed_stages: Optional[List[str]] = None,
+    db_path: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """
+    Find and atomically claim the next ready task in a session.
+    Protects against duplicate worker execution.
+    """
+    all_tasks = list_tasks_for_session(session_id, db_path=db_path)
+    for t in all_tasks:
+        if t.get("status") in ("ready", "pending"):
+            if allowed_stages and t.get("stage") not in allowed_stages:
+                continue
+            deps = t.get("dependencies", [])
+            if deps:
+                satisfied_ids = {ot["task_id"] for ot in all_tasks if ot.get("status") == "completed" or (ot.get("status") == "failed" and "_spec_" in ot.get("task_id", ""))}
+                if not all(d in satisfied_ids for d in deps):
+                    continue
+            if claim_task(t["task_id"], db_path=db_path):
+                t["status"] = "running"
+                return t
+    return None
+
+
+def get_session_remediation_count(session_id: str, db_path: Optional[str] = None) -> int:
+    """Return how many remediation tasks have been created for this session."""
+    with get_db_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM workflow_tasks WHERE session_id = ? AND (title LIKE '%إصلاح%' OR title LIKE '%Remediation%');",
+            (session_id,)
+        ).fetchone()
+        return row["cnt"] if row else 0
+
 
 
 # =========================================================================
