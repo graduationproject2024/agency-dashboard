@@ -21,6 +21,7 @@
             <nav>
                 <a href="#" id="nav-overview" class="active" onclick="showSection('overview', this)"><i class="fa-solid fa-chart-pie"></i> نظرة عامة</a>
                 <a href="#" id="nav-agents" onclick="showSection('agents', this)"><i class="fa-solid fa-users-gear"></i> البوتات (Agents)</a>
+                <a href="#" id="nav-orchestration" onclick="showSection('orchestration', this)"><i class="fa-solid fa-network-wired"></i> إدارة المهام والذاكرة</a>
                 <a href="#" id="nav-approvals" onclick="showSection('approvals', this)"><i class="fa-solid fa-check-double"></i> الموافقات <span class="badge" id="sidebar-badge" style="display:none;">0</span></a>
                 <a href="#" id="nav-projects" onclick="showSection('projects', this)"><i class="fa-solid fa-folder-open"></i> المشاريع</a>
                 <a href="#" id="nav-budget" onclick="showSection('budget', this)"><i class="fa-solid fa-file-invoice-dollar"></i> الميزانية</a>
@@ -92,6 +93,31 @@
                         <div class="node" id="node-animation">الأنيميشن</div>
                         <i class="fa-solid fa-arrow-left arrow"></i>
                         <div class="node" id="node-seo">الـ SEO</div>
+                    </div>
+                </div>
+
+                <!-- Session Persistence Summary Bar -->
+                <div class="session-persistence-bar glass-panel" id="session-persistence-bar" style="margin-bottom: 20px; padding: 14px 20px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 15px; border-right: 4px solid var(--accent-blue);">
+                    <div style="display: flex; align-items: center; gap: 12px;">
+                        <div style="width: 38px; height: 38px; border-radius: 8px; background: rgba(88, 166, 255, 0.15); display: flex; align-items: center; justify-content: center; color: var(--accent-blue); font-size: 1.2rem;">
+                            <i class="fa-solid fa-database"></i>
+                        </div>
+                        <div>
+                            <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                                <span style="font-size: 0.85rem; color: var(--text-muted);">جلسة العمل الدائمة (Session):</span>
+                                <code id="overview-session-id" style="background: rgba(255,255,255,0.06); padding: 2px 8px; border-radius: 4px; color: #58a6ff; font-size: 0.85rem;">--</code>
+                                <span class="badge" id="overview-session-status" style="background: rgba(255,255,255,0.1); color: #fff;">خاملة</span>
+                            </div>
+                            <div style="font-size: 0.8rem; color: #8b949e; margin-top: 3px;">
+                                <span>آخر نقطة حفظ: <strong id="overview-session-checkpoint" style="color: #7ee787;">لا يوجد</strong></span> &bull;
+                                <span>المهام المنجزة: <strong id="overview-session-tasks-count" style="color: #58a6ff;">0 / 0</strong></span>
+                            </div>
+                        </div>
+                    </div>
+                    <div style="display: flex; gap: 10px;">
+                        <button class="btn btn-sm btn-secondary" onclick="showSection('orchestration', document.getElementById('nav-orchestration'))">
+                            <i class="fa-solid fa-network-wired"></i> استعراض تفاصيل المهام والذاكرة
+                        </button>
                     </div>
                 </div>
 
@@ -429,6 +455,96 @@
                     </div>
                     <button class="btn btn-primary" id="save-settings-btn" onclick="saveSettings()">حفظ الإعدادات</button>
                     <p id="settings-msg" style="color: var(--accent-green); margin-top: 10px; display: none;">تم حفظ الإعدادات بنجاح!</p>
+                </div>
+            </div>
+
+            <!-- Orchestration & Project Memory Section -->
+            <div id="section-orchestration" class="view-section" style="display:none;">
+                <header>
+                    <div>
+                        <h1>إدارة المهام والذاكرة المشتركة (Orchestration & Memory)</h1>
+                        <p>تتبع مخطط المهام الموجه (Task DAG)، تسليم المخرجات والتعاون بين الوكلاء، وذاكرة المشروع المستدامة.</p>
+                    </div>
+                    <div class="header-actions">
+                        <button class="btn btn-secondary" onclick="loadOrchestrationData()"><i class="fa-solid fa-rotate"></i> تحديث فوري</button>
+                    </div>
+                </header>
+
+                <!-- Session Status & Control Card -->
+                <div class="glass-panel" style="margin-bottom: 25px; padding: 20px; border-radius: 12px; border-right: 4px solid var(--accent-blue);">
+                    <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 15px;">
+                        <div>
+                            <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 6px; flex-wrap: wrap;">
+                                <h3 style="margin: 0; font-size: 1.2rem; color: #fff;">الجلسة الحالية: <span id="orch-session-id" style="color: var(--accent-blue); font-family: monospace;">--</span></h3>
+                                <span id="orch-session-badge" class="badge" style="background: rgba(88,166,255,0.2); color: #58a6ff; font-size: 0.85rem;">خاملة</span>
+                            </div>
+                            <p style="margin: 0; font-size: 0.9rem; color: #8b949e;">
+                                المشروع: <strong id="orch-project-name" style="color: #c9d1d9;">--</strong> &bull;
+                                المرحلة: <strong id="orch-current-stage" style="color: #7ee787;">--</strong> &bull;
+                                آخر نقطة استعادة: <strong id="orch-checkpoint" style="color: #d2a8ff;">--</strong>
+                            </p>
+                        </div>
+                        <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                            <button id="orch-resume-btn" class="btn btn-sm btn-primary" onclick="resumeCurrentSession()" style="display: none;">
+                                <i class="fa-solid fa-play"></i> استئناف الجلسة من نقطة الحفظ
+                            </button>
+                            <button id="orch-cancel-btn" class="btn btn-sm btn-danger" onclick="cancelCurrentSession()" style="display: none;">
+                                <i class="fa-solid fa-stop"></i> إلغاء الجلسة
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Sub-Navigation for Orchestration Views -->
+                <div style="display: flex; gap: 10px; margin-bottom: 20px; border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 10px; flex-wrap: wrap;">
+                    <button class="btn btn-sm btn-primary orch-tab-btn active" id="tab-btn-dag" onclick="switchOrchTab('dag', this)">
+                        <i class="fa-solid fa-diagram-project"></i> مخطط المهام المترابط (DAG)
+                    </button>
+                    <button class="btn btn-sm btn-secondary orch-tab-btn" id="tab-btn-handoffs" onclick="switchOrchTab('handoffs', this)">
+                        <i class="fa-solid fa-handshake"></i> تسليم المهام بين الوكلاء (Handoffs)
+                    </button>
+                    <button class="btn btn-sm btn-secondary orch-tab-btn" id="tab-btn-memory" onclick="switchOrchTab('memory', this)">
+                        <i class="fa-solid fa-brain"></i> ذاكرة المشروع التراكمية (Project Memory)
+                    </button>
+                    <button class="btn btn-sm btn-secondary orch-tab-btn" id="tab-btn-sessions" onclick="switchOrchTab('sessions', this)">
+                        <i class="fa-solid fa-clock-rotate-left"></i> سجل الجلسات السابقة (Sessions History)
+                    </button>
+                </div>
+
+                <!-- Tab 1: Directed Task Graph (DAG) -->
+                <div id="orch-tab-dag" class="orch-tab-content">
+                    <div id="orch-tasks-container" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 18px;">
+                        <!-- Task cards populated via JS -->
+                    </div>
+                </div>
+
+                <!-- Tab 2: Agent-to-Agent Handoffs -->
+                <div id="orch-tab-handoffs" class="orch-tab-content" style="display: none;">
+                    <div id="orch-handoffs-container" style="display: flex; flex-direction: column; gap: 12px;">
+                        <!-- Handoff stream populated via JS -->
+                    </div>
+                </div>
+
+                <!-- Tab 3: Project Memory -->
+                <div id="orch-tab-memory" class="orch-tab-content" style="display: none;">
+                    <div style="display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap; align-items: center;">
+                        <span style="font-size: 0.9rem; color: #8b949e;">تصفية حسب التصنيف:</span>
+                        <button class="btn btn-sm btn-secondary mem-filter-btn active" onclick="filterMemoryCategory('all', this)">الكل</button>
+                        <button class="btn btn-sm btn-secondary mem-filter-btn" onclick="filterMemoryCategory('architecture_decision', this)">قرارات معمارية</button>
+                        <button class="btn btn-sm btn-secondary mem-filter-btn" onclick="filterMemoryCategory('requirement', this)">متطلبات</button>
+                        <button class="btn btn-sm btn-secondary mem-filter-btn" onclick="filterMemoryCategory('qa_finding', this)">نتائج الجودة</button>
+                        <button class="btn btn-sm btn-secondary mem-filter-btn" onclick="filterMemoryCategory('decision', this)">قرارات الإدارة</button>
+                    </div>
+                    <div id="orch-memory-container" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 15px;">
+                        <!-- Memory items populated via JS -->
+                    </div>
+                </div>
+
+                <!-- Tab 4: Sessions History -->
+                <div id="orch-tab-sessions" class="orch-tab-content" style="display: none;">
+                    <div id="orch-sessions-history-container" style="display: flex; flex-direction: column; gap: 12px;">
+                        <!-- Sessions history table/cards populated via JS -->
+                    </div>
                 </div>
             </div>
         </main>

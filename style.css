@@ -703,3 +703,83 @@ textarea {
     animation: pulseGreen 1.6s infinite;
 }
 
+/* Phase 2.4-B Orchestration & Task DAG Styles */
+.task-dag-card {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    transition: transform 0.2s, border-color 0.2s;
+    position: relative;
+}
+.task-dag-card:hover {
+    transform: translateY(-3px);
+    border-color: rgba(88, 166, 255, 0.3);
+}
+.task-dag-card.status-completed {
+    border-right: 4px solid #3fb950;
+}
+.task-dag-card.status-running {
+    border-right: 4px solid #58a6ff;
+    box-shadow: 0 0 15px rgba(88, 166, 255, 0.15);
+}
+.task-dag-card.status-failed {
+    border-right: 4px solid #da3633;
+}
+.task-dag-card.status-pending {
+    border-right: 4px solid #8b949e;
+    opacity: 0.85;
+}
+
+.handoff-card {
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 10px;
+    padding: 14px 18px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+    transition: background 0.2s;
+}
+.handoff-card:hover {
+    background: rgba(255, 255, 255, 0.04);
+}
+
+.memory-card {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 10px;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.memory-card.cat-architecture_decision {
+    border-top: 3px solid #58a6ff;
+}
+.memory-card.cat-requirement {
+    border-top: 3px solid #3fb950;
+}
+.memory-card.cat-qa_finding {
+    border-top: 3px solid #f0883e;
+}
+.memory-card.cat-decision {
+    border-top: 3px solid #a371f7;
+}
+
+.orch-tab-btn.active {
+    background: var(--accent-blue) !important;
+    color: #fff !important;
+}
+.mem-filter-btn.active {
+    background: rgba(88, 166, 255, 0.2) !important;
+    border-color: var(--accent-blue) !important;
+    color: var(--accent-blue) !important;
+}
+
+

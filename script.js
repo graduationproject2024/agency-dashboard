@@ -109,6 +109,30 @@ async function fetchState() {
             globalOutputs = state.outputs;
         }
 
+        // Update Session Persistence Bar on Overview
+        if (state.persistence && state.persistence.session_id) {
+            const sidEl = document.getElementById('overview-session-id');
+            const sstatusEl = document.getElementById('overview-session-status');
+            const scpEl = document.getElementById('overview-session-checkpoint');
+            const stasksEl = document.getElementById('overview-session-tasks-count');
+            
+            if (sidEl) sidEl.textContent = state.persistence.session_id.substring(0, 16) + '...';
+            if (sstatusEl) {
+                const s = state.status || 'unknown';
+                sstatusEl.textContent = s === 'running' ? 'نشطة' : (s === 'approval_needed' ? 'بانتظار الاعتماد' : (s === 'completed' ? 'مكتملة' : (s === 'failed' ? 'متعثرة' : s)));
+                sstatusEl.style.background = s === 'running' ? 'rgba(46,160,67,0.2)' : (s === 'approval_needed' ? 'rgba(210,153,34,0.2)' : (s === 'completed' ? 'rgba(88,166,255,0.2)' : 'rgba(218,54,51,0.2)'));
+                sstatusEl.style.color = s === 'running' ? '#3fb950' : (s === 'approval_needed' ? '#d29922' : (s === 'completed' ? '#58a6ff' : '#da3633'));
+            }
+            if (scpEl) {
+                const cps = state.persistence.checkpoints || [];
+                const lastCp = cps.length > 0 ? cps[0].step_name : (state.approval_request ? 'prd_approval_gate' : 'بدء التنفيذ');
+                scpEl.textContent = lastCp;
+            }
+            if (stasksEl) {
+                stasksEl.textContent = `${state.persistence.completed_tasks || 0} / ${state.persistence.task_count || 0}`;
+            }
+        }
+
         // Update Departments & Pipeline Nodes
         const depts = ['strategy', 'product', 'engineering', 'design', 'development', 'qa', 'animation', 'seo'];
         const elements = {
@@ -519,6 +543,8 @@ async function showSection(sectionId, navElement) {
         loadApprovalHistory();
     } else if (sectionId === 'agents') {
         loadAgents();
+    } else if (sectionId === 'orchestration') {
+        loadOrchestrationData();
     } else if (sectionId === 'projects') {
         const list = document.getElementById('projects-container');
         if (!list) return;
@@ -980,3 +1006,375 @@ function updateBudgetUI(budget) {
         });
     }
 }
+
+// --- Phase 2.4-B Orchestration & Project Memory UI ---
+
+let currentOrchSessionId = null;
+let currentProjectMemories = [];
+
+async function loadOrchestrationData() {
+    try {
+        const stateRes = await fetch('/api/state');
+        if (!stateRes.ok) return;
+        const state = await stateRes.json();
+        
+        const sessionId = state.persistence ? state.persistence.session_id : (state.session_id || null);
+        currentOrchSessionId = sessionId;
+        
+        const sidEl = document.getElementById('orch-session-id');
+        const sbadgeEl = document.getElementById('orch-session-badge');
+        const sprojectEl = document.getElementById('orch-project-name');
+        const sstageEl = document.getElementById('orch-current-stage');
+        const scpEl = document.getElementById('orch-checkpoint');
+        const resumeBtn = document.getElementById('orch-resume-btn');
+        const cancelBtn = document.getElementById('orch-cancel-btn');
+        
+        if (sidEl) sidEl.textContent = sessionId || 'لا توجد جلسة نشطة';
+        if (sprojectEl) sprojectEl.textContent = state.current_task || 'لم يبدأ بعد';
+        
+        let currentStage = '--';
+        for (const [dept, dData] of Object.entries(state.departments || {})) {
+            if (dData.status === 'active') {
+                currentStage = dept;
+                break;
+            }
+        }
+        if (sstageEl) sstageEl.textContent = currentStage;
+        
+        if (sbadgeEl) {
+            const st = state.status || 'idle';
+            sbadgeEl.textContent = st === 'running' ? 'جارية' : (st === 'approval_needed' ? 'بانتظار الاعتماد' : (st === 'completed' ? 'مكتملة' : (st === 'failed' ? 'متعثرة' : st)));
+            sbadgeEl.style.background = st === 'running' ? 'rgba(46,160,67,0.2)' : (st === 'approval_needed' ? 'rgba(210,153,34,0.2)' : (st === 'completed' ? 'rgba(88,166,255,0.2)' : 'rgba(218,54,51,0.2)'));
+            sbadgeEl.style.color = st === 'running' ? '#3fb950' : (st === 'approval_needed' ? '#d29922' : (st === 'completed' ? '#58a6ff' : '#da3633'));
+        }
+        
+        const checkpoints = (state.persistence && state.persistence.checkpoints) || [];
+        const lastCp = checkpoints.length > 0 ? checkpoints[0].step_name : (state.approval_request ? 'prd_approval_gate' : '--');
+        if (scpEl) scpEl.textContent = lastCp;
+        
+        if (resumeBtn) {
+            resumeBtn.style.display = (sessionId && (state.status === 'approval_needed' || state.status === 'failed')) ? 'inline-flex' : 'none';
+        }
+        if (cancelBtn) {
+            cancelBtn.style.display = (sessionId && state.status === 'running') ? 'inline-flex' : 'none';
+        }
+        
+        // Render DAG tasks
+        const tasks = (state.persistence && state.persistence.tasks) || [];
+        renderTaskDAG(tasks);
+        
+        // Render Handoffs
+        const handoffs = (state.persistence && state.persistence.handoffs) || [];
+        renderHandoffs(handoffs);
+        
+        // Render Project Memory
+        const memories = state.memory || [];
+        currentProjectMemories = memories;
+        renderMemory(memories);
+        
+        // Load sessions history
+        loadSessionsHistory();
+    } catch (err) {
+        console.error("Error loading orchestration data:", err);
+    }
+}
+
+function renderTaskDAG(tasks) {
+    const container = document.getElementById('orch-tasks-container');
+    if (!container) return;
+    container.innerHTML = '';
+    
+    if (!tasks || tasks.length === 0) {
+        container.innerHTML = '<div style="grid-column: 1 / -1; text-align: center; color: var(--text-muted); padding: 40px;"><i class="fa-solid fa-diagram-project" style="font-size: 2rem; margin-bottom: 10px; display: block; opacity: 0.5;"></i>لا توجد مهام مخططة للجلسة الحالية بعد. ابدأ مشروعاً جديداً لتوليد المخطط.</div>';
+        return;
+    }
+    
+    tasks.forEach(t => {
+        const card = document.createElement('div');
+        const st = t.status || 'pending';
+        card.className = `task-dag-card status-${st}`;
+        
+        const safeTitle = escapeHtml(t.title);
+        const safeAgent = escapeHtml(t.assigned_agent);
+        const safeDiv = escapeHtml(t.division_id || 'engineering');
+        const safeId = escapeHtml(t.id);
+        const deps = t.dependencies || [];
+        const depsHtml = deps.length > 0 
+            ? deps.map(d => `<span style="font-size: 0.72rem; background: rgba(255,255,255,0.06); padding: 2px 6px; border-radius: 4px; color: #8b949e;">${escapeHtml(d)}</span>`).join(' ')
+            : '<span style="font-size: 0.72rem; color: #7ee787;">لا توجد (مهمة أساسية)</span>';
+            
+        let statusBadge = '<span style="font-size: 0.75rem; color: #8b949e;">⚪ في الانتظار</span>';
+        if (st === 'running') {
+            statusBadge = '<span style="font-size: 0.75rem; color: #58a6ff; font-weight: bold;"><i class="fa-solid fa-gear fa-spin"></i> قيد التنفيذ</span>';
+        } else if (st === 'completed') {
+            statusBadge = '<span style="font-size: 0.75rem; color: #3fb950; font-weight: bold;"><i class="fa-solid fa-circle-check"></i> مكتملة بنجاح</span>';
+        } else if (st === 'failed') {
+            statusBadge = '<span style="font-size: 0.75rem; color: #da3633; font-weight: bold;"><i class="fa-solid fa-circle-xmark"></i> متعثرة</span>';
+        }
+        
+        const hasOutput = Boolean(t.output);
+        const viewOutputBtn = hasOutput 
+            ? `<button class="btn btn-sm btn-secondary" onclick="viewTaskOutputModal('${safeId}', '${safeTitle}')" style="margin-top: 10px; width: 100%;"><i class="fa-solid fa-file-lines"></i> عرض مخرجات المهمة</button>`
+            : '';
+            
+        card.innerHTML = `
+            <div>
+                <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px;">
+                    <span style="font-size: 0.72rem; color: var(--accent-blue); font-family: monospace;">${safeId}</span>
+                    ${statusBadge}
+                </div>
+                <h4 style="margin: 0 0 8px 0; color: #fff; font-size: 1.05rem;">${safeTitle}</h4>
+                <div style="font-size: 0.82rem; color: #8b949e; margin-bottom: 6px;">
+                    <span>الوكيل المكلف:</span> <strong style="color: #c9d1d9;"><i class="fa-solid fa-robot"></i> ${safeAgent}</strong>
+                </div>
+                <div style="font-size: 0.8rem; color: #8b949e; margin-bottom: 8px;">
+                    <span>القسم:</span> <span style="background: rgba(88,166,255,0.1); color: var(--accent-blue); padding: 2px 7px; border-radius: 4px;">${safeDiv}</span>
+                </div>
+                <div style="font-size: 0.78rem; color: #8b949e; margin-top: 6px;">
+                    <span style="display: block; margin-bottom: 4px;">المهام التي تعتمد عليها:</span>
+                    <div style="display: flex; gap: 4px; flex-wrap: wrap;">${depsHtml}</div>
+                </div>
+            </div>
+            <div>
+                ${viewOutputBtn}
+            </div>
+        `;
+        container.appendChild(card);
+    });
+}
+
+function renderHandoffs(handoffs) {
+    const container = document.getElementById('orch-handoffs-container');
+    if (!container) return;
+    container.innerHTML = '';
+    
+    if (!handoffs || handoffs.length === 0) {
+        container.innerHTML = '<div style="text-align: center; color: var(--text-muted); padding: 40px;"><i class="fa-solid fa-handshake" style="font-size: 2rem; margin-bottom: 10px; display: block; opacity: 0.5;"></i>لم يتم تسجيل تسليم مخرجات بين الوكلاء في هذه الجلسة بعد.</div>';
+        return;
+    }
+    
+    handoffs.forEach(h => {
+        const item = document.createElement('div');
+        item.className = 'handoff-card';
+        
+        const safeFrom = escapeHtml(h.from_agent);
+        const safeTo = escapeHtml(h.to_agent);
+        const safeContext = escapeHtml(h.context_summary || 'تسليم مخرجات مرحلية');
+        const safeTime = escapeHtml(h.timestamp || '');
+        const safeStatus = escapeHtml(h.status || 'delivered');
+        
+        item.innerHTML = `
+            <div style="display: flex; align-items: center; gap: 15px; flex-wrap: wrap;">
+                <div style="display: flex; align-items: center; gap: 8px;">
+                    <span style="background: rgba(88,166,255,0.15); color: #58a6ff; padding: 4px 10px; border-radius: 6px; font-weight: bold; font-size: 0.85rem;">
+                        <i class="fa-solid fa-robot"></i> ${safeFrom}
+                    </span>
+                    <i class="fa-solid fa-arrow-left" style="color: #7ee787;"></i>
+                    <span style="background: rgba(46,160,67,0.15); color: #3fb950; padding: 4px 10px; border-radius: 6px; font-weight: bold; font-size: 0.85rem;">
+                        <i class="fa-solid fa-robot"></i> ${safeTo}
+                    </span>
+                </div>
+                <div style="color: #c9d1d9; font-size: 0.9rem;">
+                    ${safeContext}
+                </div>
+            </div>
+            <div style="display: flex; align-items: center; gap: 10px;">
+                <span style="font-size: 0.78rem; color: #8b949e;">${safeTime}</span>
+                <span class="badge" style="background: rgba(46,160,67,0.2); color: #3fb950; font-size: 0.75rem;">${safeStatus}</span>
+            </div>
+        `;
+        container.appendChild(item);
+    });
+}
+
+function renderMemory(memories) {
+    const container = document.getElementById('orch-memory-container');
+    if (!container) return;
+    container.innerHTML = '';
+    
+    if (!memories || memories.length === 0) {
+        container.innerHTML = '<div style="grid-column: 1 / -1; text-align: center; color: var(--text-muted); padding: 40px;"><i class="fa-solid fa-brain" style="font-size: 2rem; margin-bottom: 10px; display: block; opacity: 0.5;"></i>لا توجد حقائق أو قرارات مسجلة في ذاكرة هذا المشروع بعد.</div>';
+        return;
+    }
+    
+    memories.forEach(m => {
+        const card = document.createElement('div');
+        const cat = m.category || 'fact';
+        card.className = `memory-card cat-${cat}`;
+        
+        const safeKey = escapeHtml(m.key);
+        const safeAuthor = escapeHtml(m.author_agent || 'system');
+        const safeTime = escapeHtml(m.timestamp || '');
+        const safeContent = escapeHtml(m.content || '');
+        const isVerified = Boolean(m.is_verified);
+        
+        const catLabels = {
+            architecture_decision: 'قرار معماري',
+            requirement: 'متطلب معتمد',
+            qa_finding: 'تدقيق جودة',
+            decision: 'توجيه الإدارة',
+            fact: 'حقيقة مؤكدة'
+        };
+        const catLabel = catLabels[cat] || cat;
+        
+        card.innerHTML = `
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <span style="font-size: 0.75rem; background: rgba(255,255,255,0.06); padding: 2px 8px; border-radius: 4px; color: #c9d1d9;">${catLabel}</span>
+                ${isVerified ? '<span style="font-size: 0.75rem; color: #3fb950;"><i class="fa-solid fa-certificate"></i> موثق</span>' : ''}
+            </div>
+            <h4 style="margin: 0; color: #fff; font-size: 1rem;">${safeKey}</h4>
+            <p style="margin: 0; font-size: 0.85rem; color: #8b949e; line-height: 1.5; max-height: 120px; overflow-y: auto; white-space: pre-wrap;">${safeContent}</p>
+            <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.75rem; color: #8b949e; border-top: 1px solid rgba(255,255,255,0.05); padding-top: 8px; margin-top: 4px;">
+                <span>المصدر: <strong style="color: #58a6ff;">${safeAuthor}</strong></span>
+                <span>${safeTime}</span>
+            </div>
+        `;
+        container.appendChild(card);
+    });
+}
+
+function filterMemoryCategory(category, btnElement) {
+    const buttons = document.querySelectorAll('.mem-filter-btn');
+    buttons.forEach(b => b.classList.remove('active'));
+    if (btnElement) btnElement.classList.add('active');
+    
+    if (category === 'all') {
+        renderMemory(currentProjectMemories);
+    } else {
+        const filtered = currentProjectMemories.filter(m => m.category === category);
+        renderMemory(filtered);
+    }
+}
+
+async function loadSessionsHistory() {
+    const container = document.getElementById('orch-sessions-history-container');
+    if (!container) return;
+    try {
+        const res = await fetch('/api/sessions');
+        if (!res.ok) return;
+        const data = await res.json();
+        const sessions = data.sessions || [];
+        
+        container.innerHTML = '';
+        if (sessions.length === 0) {
+            container.innerHTML = '<div style="text-align: center; color: var(--text-muted); padding: 30px;">لا توجد جلسات مسجلة في قاعدة البيانات بعد.</div>';
+            return;
+        }
+        
+        sessions.forEach(s => {
+            const row = document.createElement('div');
+            row.style.cssText = 'background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.06); padding: 14px 18px; border-radius: 10px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;';
+            
+            const safeId = escapeHtml(s.id);
+            const safeProject = escapeHtml(s.project_id);
+            const safeStatus = escapeHtml(s.status);
+            const safeCp = escapeHtml(s.checkpoint_step || '--');
+            const safeCreated = escapeHtml(s.created_at || '');
+            
+            row.innerHTML = `
+                <div>
+                    <div style="display: flex; align-items: center; gap: 10px;">
+                        <code style="color: var(--accent-blue); font-size: 0.85rem;">${safeId}</code>
+                        <strong style="color: #fff; font-size: 0.95rem;">${safeProject}</strong>
+                        <span class="badge" style="background: rgba(255,255,255,0.1); color: #c9d1d9; font-size: 0.75rem;">${safeStatus}</span>
+                    </div>
+                    <div style="font-size: 0.8rem; color: #8b949e; margin-top: 4px;">
+                        <span>نقطة الحفظ: <strong style="color: #7ee787;">${safeCp}</strong></span> &bull;
+                        <span>التاريخ: ${safeCreated}</span>
+                    </div>
+                </div>
+                <div>
+                    ${(safeStatus === 'approval_needed' || safeStatus === 'interrupted') 
+                        ? `<button class="btn btn-sm btn-primary" onclick="resumeSpecificSession('${safeId}')"><i class="fa-solid fa-play"></i> استئناف</button>`
+                        : ''}
+                </div>
+            `;
+            container.appendChild(row);
+        });
+    } catch (e) {
+        console.error("Error loading sessions history:", e);
+    }
+}
+
+function switchOrchTab(tabId, btnElement) {
+    const tabs = document.querySelectorAll('.orch-tab-content');
+    tabs.forEach(t => t.style.display = 'none');
+    
+    const target = document.getElementById('orch-tab-' + tabId);
+    if (target) target.style.display = 'block';
+    
+    const buttons = document.querySelectorAll('.orch-tab-btn');
+    buttons.forEach(b => b.classList.remove('active'));
+    if (btnElement) btnElement.classList.add('active');
+}
+
+async function resumeCurrentSession() {
+    if (!currentOrchSessionId) return;
+    resumeSpecificSession(currentOrchSessionId);
+}
+
+async function resumeSpecificSession(sessionId) {
+    if (!confirm('هل تريد استئناف هذه الجلسة من آخر نقطة حفظ تم التحقق منها؟')) return;
+    try {
+        const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/resume`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        });
+        const result = await res.json();
+        if (res.ok) {
+            alert('تم استئناف الجلسة بنجاح!');
+            fetchState();
+            loadOrchestrationData();
+        } else {
+            alert('تعذر استئناف الجلسة: ' + (result.error || 'خطأ غير معروف'));
+        }
+    } catch (e) {
+        alert('فشل الاتصال بالخادم: ' + e);
+    }
+}
+
+async function cancelCurrentSession() {
+    if (!currentOrchSessionId) return;
+    if (!confirm('هل أنت متأكد من رغبتك في إلغاء هذه الجلسة الجارية؟')) return;
+    try {
+        const res = await fetch(`/api/sessions/${encodeURIComponent(currentOrchSessionId)}/cancel`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        });
+        const result = await res.json();
+        if (res.ok) {
+            alert('تم إلغاء الجلسة.');
+            fetchState();
+            loadOrchestrationData();
+        } else {
+            alert('تعذر إلغاء الجلسة: ' + (result.error || 'خطأ غير معروف'));
+        }
+    } catch (e) {
+        alert('فشل الاتصال بالخادم: ' + e);
+    }
+}
+
+function viewTaskOutputModal(taskId, title) {
+    fetch('/api/state')
+        .then(res => res.json())
+        .then(state => {
+            const tasks = (state.persistence && state.persistence.tasks) || [];
+            const task = tasks.find(t => t.id === taskId);
+            const content = task ? (task.output || 'لا توجد مخرجات مسجلة لهذه المهمة بعد.') : 'المهمة غير موجودة.';
+            
+            const titleEl = document.getElementById('outputModalTitle');
+            const bodyEl = document.getElementById('outputModalBody');
+            if (titleEl) titleEl.textContent = `مخرجات: ${title}`;
+            if (bodyEl) {
+                if (typeof marked !== 'undefined') {
+                    bodyEl.innerHTML = sanitizeHtml(marked.parse(content));
+                } else {
+                    bodyEl.textContent = content;
+                }
+            }
+            const modal = document.getElementById('outputModal');
+            if (modal) modal.style.display = 'flex';
+        })
+        .catch(err => alert('تعذر تحميل مخرجات المهمة: ' + err));
+}
+

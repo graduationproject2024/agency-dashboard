@@ -13,6 +13,12 @@ import subprocess
 import logging
 from urllib.parse import urlparse
 from html.parser import HTMLParser
+import db_persistence as db_store
+import task_orchestrator as orch
+
+# Initialize persistence schema on application startup
+db_store.init_db()
+db_store.reconcile_interrupted_sessions()
 
 # Secure Flask initialization: Never expose current working directory as static root
 app = Flask(__name__, static_folder=None)
@@ -1077,6 +1083,7 @@ total_agents = initial_agent_inventory["total"]
 
 # Global workflow state
 workflow_state = {
+    "session_id": None,
     "execution_id": None,
     "status": "idle",  # idle | running | approval_needed | completed | failed
     "current_task": None,
@@ -1113,6 +1120,42 @@ workflow_state = {
     "blockers": [],
     "qa_report": None
 }
+
+def sync_task_to_db(session_id, stage, agent_id, status, output=None, error=None):
+    """Synchronize workflow execution state to the SQLite task DAG."""
+    if not session_id:
+        return
+    try:
+        tasks = db_store.list_tasks_for_session(session_id)
+        matching = [t for t in tasks if t["stage"] == stage and t["assigned_agent_id"] == agent_id]
+        if matching:
+            db_store.update_task_status(matching[0]["task_id"], status, output_text=output, error_message=error)
+    except Exception as e:
+        logging.warning("Failed to sync task %s (%s) to DB: %s", agent_id, stage, e)
+
+def get_agent_prompt_meta(agent_id):
+    """Resolve prompt_file, role_name, color for an agent ID."""
+    known_defaults = {
+        "business-strategist": (r"specialized\business-strategist.md", "مستشار البزنس", "linear-gradient(135deg, #FF6B6B, #FF8E53)"),
+        "product-manager": (r"product\product-manager.md", "مدير المنتج", "linear-gradient(135deg, #4facfe, #00f2fe)"),
+        "engineering-software-architect": (r"engineering\engineering-software-architect.md", "المهندس المعماري", "linear-gradient(135deg, #20E2D7, #F9FEA5)"),
+        "design-ui-designer": (r"design\design-ui-designer.md", "مصمم الواجهات", "linear-gradient(135deg, #a18cd1, #fbc2eb)"),
+        "engineering-senior-developer": (r"engineering\engineering-senior-developer.md", "كبير المبرمجين", "linear-gradient(135deg, #11998e, #38ef7d)"),
+        "engineering-code-reviewer": (r"engineering\engineering-code-reviewer.md", "مهندس الجودة", "linear-gradient(135deg, #FF9A9E, #FECFEF)"),
+        "design-whimsy-injector": (r"design\design-whimsy-injector.md", "خبير الأنيميشن", "linear-gradient(135deg, #ff758c, #ff7eb3)"),
+        "marketing-seo-specialist": (r"marketing\marketing-seo-specialist.md", "خبير SEO", "linear-gradient(135deg, #f093fb, #f5576c)"),
+        "security-appsec-engineer": (r"security\security-appsec-engineer.md", "مهندس أمن التطبيقات", "red")
+    }
+    if agent_id in known_defaults:
+        return known_defaults[agent_id]
+        
+    inv = discover_agents()
+    for a in inv.get("agents", []):
+        if a["id"] == agent_id:
+            return a.get("relative_path", f"{agent_id}.md"), a.get("name", agent_id), "linear-gradient(135deg, #667eea, #764ba2)"
+            
+    return f"{agent_id}.md", agent_id, "linear-gradient(135deg, #667eea, #764ba2)"
+
 
 # --- Secrets and Configuration Security ---
 
@@ -1553,7 +1596,23 @@ def run_workflow(task_desc):
             "status": "selected"
         })
 
+    # Initialize persistent session and build Directed Task Graph
+    project_title = task_desc[:40].strip()
+    session_id = None
+    try:
+        session_id = db_store.create_session(
+            project_name=project_title,
+            task_description=task_desc,
+            squad_archetype=squad_plan.get("archetype"),
+            metadata={"squad_plan": squad_plan, "active_squad": active_squad}
+        )
+        db_store.update_session_status(session_id, "running", current_stage="strategy")
+        orch.build_project_task_graph(session_id, project_title, task_desc, squad_plan)
+    except Exception as e:
+        logging.warning("Persistent session creation warning: %s", e)
+
     with state_lock:
+        workflow_state["session_id"] = session_id
         workflow_state["status"] = "running"
         workflow_state["current_task"] = task_desc
         workflow_state["squad_plan"] = squad_plan
@@ -1585,6 +1644,8 @@ def run_workflow(task_desc):
             with state_lock:
                 s["status"] = "running"
             update_stats()
+            if session_id:
+                sync_task_to_db(session_id, "strategy", s["id"], "running")
             spec_def = next((sp for sp in squad_plan["specialists"] if sp["id"] == s["id"]), None)
             if spec_def:
                 try:
@@ -1599,13 +1660,20 @@ def run_workflow(task_desc):
                     spec_strat_context += f"\n\n[توصيات {s['name']}]:\n{spec_out}"
                     with state_lock:
                         s["status"] = "completed"
+                    if session_id:
+                        sync_task_to_db(session_id, "strategy", s["id"], "completed", output=spec_out)
+                        db_store.add_project_memory(project_title, session_id, "requirement", f"Specialist_Advice_{s['id']}", spec_out[:1000], s["id"])
                 except Exception as e:
                     with state_lock:
                         s["status"] = "failed"
+                    if session_id:
+                        sync_task_to_db(session_id, "strategy", s["id"], "failed", error=str(e))
                     add_feed("النظام", "Squad Orchestrator", "orange", "WARN", f"تعذر استكمال استشارة {s['name']}: {e}")
             update_stats()
 
         strat_prompt = f"المشروع هو: {task_desc}. قدم دراسة جدوى استراتيجية شاملة وموجزة."
+        if session_id:
+            sync_task_to_db(session_id, "strategy", "business-strategist", "running")
         strat_out = call_agent(
             r"specialized\business-strategist.md",
             "مستشار البزنس", "BS",
@@ -1613,6 +1681,10 @@ def run_workflow(task_desc):
             strat_prompt,
             context_text=spec_strat_context
         )
+        if session_id:
+            sync_task_to_db(session_id, "strategy", "business-strategist", "completed", output=strat_out)
+            db_store.add_project_memory(project_title, session_id, "requirement", "Strategic_Feasibility_Summary", strat_out[:1200], "business-strategist")
+            
         with state_lock:
             workflow_state["outputs"]["strategy"] = strat_out
             workflow_state["departments"]["strategy"] = {"status": "done", "text": "أنهى دراسة الجدوى."}
@@ -1620,6 +1692,10 @@ def run_workflow(task_desc):
         update_stats()
         
         # 2. Product Stage
+        if session_id:
+            sync_task_to_db(session_id, "product", "product-manager", "running")
+            db_store.update_session_status(session_id, "running", current_stage="product")
+            
         add_feed("مدير المنتج", "Product Manager", "linear-gradient(135deg, #4facfe, #00f2fe)", "PM", "أقوم بكتابة وثيقة متطلبات المنتج (PRD).")
         prod_out = call_agent(
             r"product\product-manager.md",
@@ -1628,6 +1704,10 @@ def run_workflow(task_desc):
             "قم بكتابة وثيقة متطلبات المنتج (PRD) بناءً على الاستراتيجية التالية.",
             strat_out
         )
+        if session_id:
+            sync_task_to_db(session_id, "product", "product-manager", "completed", output=prod_out)
+            db_store.add_project_memory(project_title, session_id, "requirement", "PRD_Approved_Requirements", prod_out[:1500], "product-manager")
+            
         with state_lock:
             workflow_state["outputs"]["product"] = prod_out
             workflow_state["departments"]["product"] = {"status": "done", "text": "تم كتابة وثيقة المتطلبات (PRD)."}
@@ -1640,6 +1720,13 @@ def run_workflow(task_desc):
             }
         update_stats()
         
+        # Save durable checkpoint at PRD approval gate
+        if session_id:
+            with state_lock:
+                state_snap = copy.deepcopy(workflow_state)
+            db_store.save_session_checkpoint(session_id, "prd_approval_gate", state_snap)
+            db_store.update_session_status(session_id, "approval_needed", checkpoint_step="prd_approval_gate")
+        
     except Exception as e:
         with state_lock:
             workflow_state["status"] = "failed"
@@ -1651,6 +1738,8 @@ def run_workflow(task_desc):
             for s in workflow_state.get("active_squad", []):
                 if s.get("status") == "running":
                     s["status"] = "failed"
+        if session_id:
+            db_store.update_session_status(session_id, "failed", error_message=str(e))
         update_stats()
         add_feed("النظام", "System", "red", "ERR", f"توقف سير العمل: {str(e)}")
 
@@ -2068,7 +2157,23 @@ def continue_workflow(feedback=""):
         workflow_state["departments"]["engineering"] = {"status": "active", "text": "يصمم الآن معمارية النظام..."}
         active_squad = workflow_state.get("active_squad", [])
         squad_plan = workflow_state.get("squad_plan")
+        session_id = workflow_state.get("session_id")
+        cur_task = workflow_state.get('current_task', 'موقع ويب متكامل')
     update_stats()
+    
+    if session_id:
+        try:
+            if not db_store.get_session(session_id):
+                session_id = None
+                with state_lock:
+                    workflow_state["session_id"] = None
+            else:
+                db_store.update_session_status(session_id, "running", current_stage="engineering")
+                if feedback:
+                    db_store.add_project_memory(cur_task, session_id, "decision", "PRD_Approval_Feedback", feedback, "human_reviewer")
+        except Exception as pe:
+            logging.warning("Session status update warning: %s", pe)
+            session_id = None
     
     if feedback:
         add_feed("النظام", "System", "linear-gradient(135deg, #2c3e50, #3498db)", "SY", f"تم تقديم ملاحظات: {feedback}. جاري مواصلة العمل...")
@@ -2092,6 +2197,8 @@ def continue_workflow(feedback=""):
                 spec_def = next((sp for sp in squad_plan.get("specialists", []) if sp["id"] == s["id"]), None)
             if spec_def:
                 try:
+                    if session_id:
+                        sync_task_to_db(session_id, "engineering", s["id"], "running")
                     add_feed(s["name"], s["display_name"], spec_def.get("color", "linear-gradient(135deg, #20E2D7, #F9FEA5)"), spec_def.get("short_name", "ENG"), f"بدأت في صياغة المتطلبات الهندسية التخصصية: {s['reason']}")
                     spec_out = call_agent(
                         spec_def["prompt_file"],
@@ -2104,15 +2211,32 @@ def continue_workflow(feedback=""):
                     spec_eng_context += f"\n\n[توصيات {s['name']}]:\n{spec_out}"
                     with state_lock:
                         s["status"] = "completed"
+                    if session_id:
+                        sync_task_to_db(session_id, "engineering", s["id"], "completed", output=spec_out)
+                        db_store.add_project_memory(cur_task, session_id, "architecture_decision", f"Specialist_Eng_{s['id']}", spec_out[:1200], s["id"])
                 except Exception as e:
                     with state_lock:
                         s["status"] = "failed"
+                    if session_id:
+                        sync_task_to_db(session_id, "engineering", s["id"], "failed", error=str(e))
                     add_feed("النظام", "Squad Orchestrator", "orange", "WARN", f"تعذر استكمال استشارة {s['name']}: {e}")
             update_stats()
 
+        if session_id:
+            sync_task_to_db(session_id, "engineering", "engineering-software-architect", "running")
         eng_prompt = f"ضع خطة هندسية وهيكلية لقواعد البيانات والنظام بناء على هذه المتطلبات.\n{('ملاحظات المدير: ' + feedback) if feedback else ''}"
         full_eng_context = f"{prod_out}\n{spec_eng_context}" if spec_eng_context else prod_out
         eng_out = call_agent(r"engineering\engineering-software-architect.md", "المهندس المعماري", "ENG", "linear-gradient(135deg, #20E2D7, #F9FEA5)", eng_prompt, full_eng_context)
+        if session_id:
+            try:
+                sync_task_to_db(session_id, "engineering", "engineering-software-architect", "completed", output=eng_out)
+                db_store.add_project_memory(cur_task, session_id, "architecture_decision", "System_Architecture_Plan", eng_out[:1500], "engineering-software-architect")
+                db_store.record_task_handoff(session_id, "engineering_task", "design_task", "engineering-software-architect", "design-ui-designer", "System Architecture & Data Schemas", {"architecture_summary": eng_out[:300]})
+                with state_lock:
+                    state_snap = copy.deepcopy(workflow_state)
+                db_store.save_session_checkpoint(session_id, "engineering_completed", state_snap)
+            except Exception as pe:
+                logging.warning("Engineering stage persistence warning: %s", pe)
         
         with state_lock:
             workflow_state["outputs"]["engineering"] = eng_out
@@ -2121,6 +2245,9 @@ def continue_workflow(feedback=""):
         update_stats()
         
         # 4. Design Stage
+        if session_id:
+            sync_task_to_db(session_id, "design", "design-ui-designer", "running")
+            db_store.update_session_status(session_id, "running", current_stage="design")
         des_prompt = f"""أنت رئيس المصممين الإبداعيين (Creative UI/UX Director). صمم هوية بصرية كاملة وتجربة مستخدم فاخرة بناءً على المخطط المعماري:
 1. لوحة ألوان دقيقة ومتناسقة.
 2. خطوط عربية ولاتينية راقية.
@@ -2128,6 +2255,10 @@ def continue_workflow(feedback=""):
 المخطط:
 {eng_out}"""
         des_out = call_agent(r"design\design-ui-designer.md", "مصمم الواجهات", "UI", "linear-gradient(135deg, #a18cd1, #fbc2eb)", des_prompt, eng_out)
+        if session_id:
+            sync_task_to_db(session_id, "design", "design-ui-designer", "completed", output=des_out)
+            db_store.add_project_memory(cur_task, session_id, "architecture_decision", "UI_UX_Design_System", des_out[:1200], "design-ui-designer")
+            db_store.record_task_handoff(session_id, "design_task", "development_task", "design-ui-designer", "engineering-senior-developer", "UI Design System & Component Hierarchy", {"design_summary": des_out[:300]})
         
         with state_lock:
             workflow_state["outputs"]["design"] = des_out
@@ -2136,6 +2267,9 @@ def continue_workflow(feedback=""):
         update_stats()
         
         # 5. Development Stage
+        if session_id:
+            sync_task_to_db(session_id, "development", "engineering-senior-developer", "running")
+            db_store.update_session_status(session_id, "running", current_stage="development")
         dev_prompt = f"""بناءً على المعمارية المرفقة:
 {eng_out}
 وبناءً على التصميم المرفق:
@@ -2155,6 +2289,9 @@ def continue_workflow(feedback=""):
 تأكد من استدعاء style.css و script.js بداخل HTML ولا تستخدم أي اختصارات."""
 
         dev_out = call_agent(r"engineering\engineering-senior-developer.md", "كبير المبرمجين", "DEV", "linear-gradient(135deg, #11998e, #38ef7d)", dev_prompt, "")
+        if session_id:
+            sync_task_to_db(session_id, "development", "engineering-senior-developer", "completed", output=dev_out)
+            db_store.record_task_handoff(session_id, "development_task", "qa_task", "engineering-senior-developer", "engineering-code-reviewer", "Raw Candidate Code for QA and Security Auditing", {"dev_length": len(dev_out)})
         
         with state_lock:
             workflow_state["outputs"]["development"] = dev_out
@@ -2163,6 +2300,8 @@ def continue_workflow(feedback=""):
         update_stats()
         
         # 6. QA Stage with QA/Security Specialists
+        if session_id:
+            db_store.update_session_status(session_id, "running", current_stage="qa")
         qa_specialists = [s for s in active_squad if s["stage"] == "qa"]
         qa_specialist_reports = []
         for s in qa_specialists:
@@ -2174,6 +2313,8 @@ def continue_workflow(feedback=""):
                 spec_def = next((sp for sp in squad_plan.get("specialists", []) if sp["id"] == s["id"]), None)
             if spec_def:
                 try:
+                    if session_id:
+                        sync_task_to_db(session_id, "qa", s["id"], "running")
                     add_feed(s["name"], s["display_name"], spec_def.get("color", "linear-gradient(135deg, #FF9A9E, #FECFEF)"), spec_def.get("short_name", "QA"), f"بدأت في تدقيق الجودة والمعايير المتخصصة: {s['reason']}")
                     spec_out = call_agent(
                         spec_def["prompt_file"],
@@ -2187,17 +2328,27 @@ def continue_workflow(feedback=""):
                         qa_specialist_reports.append(f"### تقرير {s['name']} ({s['display_name']}):\n{spec_out.strip()}")
                         with state_lock:
                             s["status"] = "completed"
+                        if session_id:
+                            sync_task_to_db(session_id, "qa", s["id"], "completed", output=spec_out)
+                            db_store.add_project_memory(cur_task, session_id, "qa_finding", f"QA_Specialist_Finding_{s['id']}", spec_out[:1200], s["id"])
+                            db_store.record_task_handoff(session_id, f"qa_spec_{s['id']}", "qa_review", s["id"], "engineering-code-reviewer", f"Independent QA Findings from {s['name']}", {"finding_summary": spec_out[:300]})
                     else:
                         with state_lock:
                             s["status"] = "failed"
+                        if session_id:
+                            sync_task_to_db(session_id, "qa", s["id"], "failed", error="Empty output from specialist")
                         add_feed("النظام", "Squad Orchestrator", "orange", "WARN", f"لم يقدم المتخصص {s['name']} أي نتائج تدقيق صالحة.")
                 except Exception as e:
                     with state_lock:
                         s["status"] = "failed"
+                    if session_id:
+                        sync_task_to_db(session_id, "qa", s["id"], "failed", error=str(e))
                     add_feed("النظام", "Squad Orchestrator", "orange", "WARN", f"تعذر استكمال تدقيق {s['name']}: {e}")
             else:
                 with state_lock:
                     s["status"] = "failed"
+                if session_id:
+                    sync_task_to_db(session_id, "qa", s["id"], "failed", error="Specialist definition not found")
                 add_feed("النظام", "Squad Orchestrator", "orange", "WARN", f"تعذر العثور على تعريف المتخصص {s['name']}.")
             update_stats()
 
@@ -2210,7 +2361,12 @@ def continue_workflow(feedback=""):
         if qa_specialists_text:
             qa_input_context = f"{dev_out}\n\n---\n## نتائج وتدقيقات المتخصصين المستقلة (QA Specialists Findings):\n{qa_specialists_text}\n---\nيُرجى أخذ نتائج المتخصصين أعلاه بعين الاعتبار والتحقق من توصياتهم أثناء تقييم الكود النهائي."
 
+        if session_id:
+            sync_task_to_db(session_id, "qa", "engineering-code-reviewer", "running")
         qa_out = call_agent(r"engineering\engineering-code-reviewer.md", "مهندس الجودة", "QA", "linear-gradient(135deg, #FF9A9E, #FECFEF)", "قم بمراجعة الأكواد المرفقة أدناه، وتأكد من خلوها من الأخطاء وراجع معايير الأمان وقابلية الاستخدام وتوصيات المتخصصين.", qa_input_context)
+        if session_id:
+            sync_task_to_db(session_id, "qa", "engineering-code-reviewer", "completed", output=qa_out)
+            db_store.add_project_memory(cur_task, session_id, "qa_finding", "Primary_Code_Review_Report", qa_out[:1500], "engineering-code-reviewer")
         
         with state_lock:
             workflow_state["outputs"]["qa"] = qa_out
@@ -2219,8 +2375,11 @@ def continue_workflow(feedback=""):
         update_stats()
         
         # 7. Animation Stage
+        if session_id:
+            db_store.update_session_status(session_id, "running", current_stage="animation")
         anim_specialists = [s for s in active_squad if s["stage"] == "animation"]
         anim_spec = anim_specialists[0] if anim_specialists else None
+        anim_agent_id = anim_spec["id"] if anim_spec else "design-whimsy-injector"
         anim_prompt_file = r"design\design-whimsy-injector.md"
         anim_role_name = "خبير الأنيميشن"
         if anim_spec and squad_plan:
@@ -2232,16 +2391,22 @@ def continue_workflow(feedback=""):
                 anim_spec["status"] = "running"
             update_stats()
 
+        if session_id:
+            sync_task_to_db(session_id, "animation", anim_agent_id, "running")
         try:
             anim_out = call_agent(anim_prompt_file, anim_role_name, "MOTION", "linear-gradient(135deg, #ff758c, #ff7eb3)", "طور كود CSS و JS لإضافة تأثيرات بصرية وحركية احترافية تجعل الموقع حياً وفخماً. أرجع كود CSS المحدث داخل ```css وكود JS المحدث داخل ```javascript.", dev_out)
             if anim_spec:
                 with state_lock:
                     anim_spec["status"] = "completed" if (anim_out and anim_out.strip()) else "failed"
+            if session_id:
+                sync_task_to_db(session_id, "animation", anim_agent_id, "completed" if anim_out else "failed", output=anim_out)
         except Exception as e:
             anim_out = ""
             if anim_spec:
                 with state_lock:
                     anim_spec["status"] = "failed"
+            if session_id:
+                sync_task_to_db(session_id, "animation", anim_agent_id, "failed", error=str(e))
             add_feed("النظام", "Squad Orchestrator", "orange", "WARN", f"تعذر استكمال مرحلة التأثيرات الحركية: {e}")
         
         with state_lock:
@@ -2251,8 +2416,11 @@ def continue_workflow(feedback=""):
         update_stats()
         
         # 8. SEO Stage
+        if session_id:
+            db_store.update_session_status(session_id, "running", current_stage="seo")
         seo_specialists = [s for s in active_squad if s["stage"] == "seo"]
         seo_spec = seo_specialists[0] if seo_specialists else None
+        seo_agent_id = seo_spec["id"] if seo_spec else "marketing-seo-specialist"
         seo_prompt_file = r"marketing\marketing-seo-specialist.md"
         seo_role_name = "خبير SEO"
         if seo_spec and squad_plan:
@@ -2264,16 +2432,22 @@ def continue_workflow(feedback=""):
                 seo_spec["status"] = "running"
             update_stats()
 
+        if session_id:
+            sync_task_to_db(session_id, "seo", seo_agent_id, "running")
         try:
             seo_out = call_agent(seo_prompt_file, seo_role_name, "SEO", "linear-gradient(135deg, #f093fb, #f5576c)", "اقترح تحسينات محركات البحث وعلامات Meta tags والكلمات المفتاحية لتحسين الظهور.", dev_out)
             if seo_spec:
                 with state_lock:
                     seo_spec["status"] = "completed" if (seo_out and seo_out.strip()) else "failed"
+            if session_id:
+                sync_task_to_db(session_id, "seo", seo_agent_id, "completed" if seo_out else "failed", output=seo_out)
         except Exception as e:
             seo_out = ""
             if seo_spec:
                 with state_lock:
                     seo_spec["status"] = "failed"
+            if session_id:
+                sync_task_to_db(session_id, "seo", seo_agent_id, "failed", error=str(e))
             add_feed("النظام", "Squad Orchestrator", "orange", "WARN", f"تعذر استكمال تحسين محركات البحث: {e}")
 
         with state_lock:
@@ -2313,6 +2487,8 @@ def continue_workflow(feedback=""):
                 workflow_state["blockers"].append(err_msg)
                 workflow_state["departments"]["qa"]["status"] = "failed"
                 workflow_state["departments"]["qa"]["text"] = "فشل فحص المعايير البرمجية"
+            if session_id:
+                db_store.update_session_status(session_id, "failed", error_message=err_msg)
             update_stats()
             add_feed("مهندس الجودة", "QA", "red", "QA", err_msg)
             return
@@ -2451,12 +2627,22 @@ def continue_workflow(feedback=""):
         
         with state_lock:
             workflow_state["status"] = "completed"
+        if session_id:
+            try:
+                with state_lock:
+                    state_snap = copy.deepcopy(workflow_state)
+                db_store.save_session_checkpoint(session_id, "delivery_completed", state_snap)
+                db_store.update_session_status(session_id, "completed", checkpoint_step="delivery_completed")
+            except Exception as pe:
+                logging.warning("Delivery completion persistence warning: %s", pe)
         update_stats()
         
     except Exception as e:
         with state_lock:
             workflow_state["status"] = "failed"
             workflow_state["blockers"].append(str(e))
+        if session_id:
+            db_store.update_session_status(session_id, "failed", error_message=str(e))
         update_stats()
         add_feed("النظام", "System", "red", "ERR", f"توقف سير العمل: {str(e)}")
 
@@ -2491,7 +2677,142 @@ def get_state():
     with state_lock:
         state_copy = copy.deepcopy(workflow_state)
     state_copy["budget"] = load_budget()
+    
+    session_id = state_copy.get("session_id")
+    if session_id:
+        try:
+            tasks = db_store.get_session_tasks(session_id)
+            handoffs = db_store.get_session_handoffs(session_id)
+            checkpoints = db_store.get_session_checkpoints(session_id)
+            state_copy["persistence"] = {
+                "session_id": session_id,
+                "tasks": tasks,
+                "handoffs": handoffs,
+                "checkpoints": checkpoints,
+                "task_count": len(tasks),
+                "completed_tasks": sum(1 for t in tasks if t.get("status") == "completed")
+            }
+            project_title = state_copy.get("current_task", "")
+            if project_title:
+                state_copy["memory"] = db_store.get_project_memory(project_title)
+        except Exception as e:
+            state_copy["persistence_error"] = str(e)
     return jsonify(state_copy)
+
+@app.route('/api/sessions', methods=['GET'])
+def list_sessions():
+    """List recent persistent workflow sessions."""
+    project_id = request.args.get('project_id')
+    sessions = db_store.get_recent_sessions(project_id=project_id, limit=50)
+    return jsonify({"sessions": sessions, "total": len(sessions)})
+
+@app.route('/api/sessions/<session_id>', methods=['GET'])
+def get_session_detail(session_id):
+    """Retrieve full detail for a single workflow session."""
+    session = db_store.get_session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    tasks = db_store.get_session_tasks(session_id)
+    handoffs = db_store.get_session_handoffs(session_id)
+    checkpoints = db_store.get_session_checkpoints(session_id)
+    return jsonify({
+        "session": session,
+        "tasks": tasks,
+        "handoffs": handoffs,
+        "checkpoints": checkpoints
+    })
+
+@app.route('/api/sessions/<session_id>/tasks', methods=['GET'])
+def get_session_tasks(session_id):
+    """Retrieve all structured tasks for a workflow session."""
+    session = db_store.get_session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    tasks = db_store.get_session_tasks(session_id)
+    return jsonify({"session_id": session_id, "tasks": tasks, "total": len(tasks)})
+
+@app.route('/api/sessions/<session_id>/handoffs', methods=['GET'])
+def get_session_handoffs(session_id):
+    """Retrieve all agent-to-agent collaboration handoffs."""
+    session = db_store.get_session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    handoffs = db_store.get_session_handoffs(session_id)
+    return jsonify({"session_id": session_id, "handoffs": handoffs, "total": len(handoffs)})
+
+@app.route('/api/memory/<project_id>', methods=['GET'])
+def get_project_memory_endpoint(project_id):
+    """Retrieve project-scoped memory facts, architecture decisions, and requirements."""
+    category = request.args.get('category')
+    verified_only = request.args.get('verified_only', 'false').lower() == 'true'
+    memories = db_store.get_project_memory(project_id, category=category, verified_only=verified_only)
+    return jsonify({"project_id": project_id, "memories": memories, "total": len(memories)})
+
+@app.route('/api/sessions/<session_id>/cancel', methods=['POST'])
+def cancel_session(session_id):
+    """Manually cancel a running or paused workflow session."""
+    if not is_safe_origin(request):
+        return jsonify({"error": "Forbidden: Invalid origin"}), 403
+    session = db_store.get_session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    if session["status"] in ("completed", "cancelled"):
+        return jsonify({"error": f"Cannot cancel session in '{session['status']}' state"}), 400
+    
+    db_store.update_session_status(session_id, "cancelled")
+    with state_lock:
+        if workflow_state.get("session_id") == session_id:
+            workflow_state["status"] = "cancelled"
+            workflow_state["approval_request"] = None
+    update_stats()
+    return jsonify({"message": f"Session {session_id} cancelled successfully"})
+
+@app.route('/api/sessions/<session_id>/resume', methods=['POST'])
+def resume_session(session_id):
+    """Resume an interrupted or waiting workflow session from its last verified checkpoint."""
+    if not is_safe_origin(request):
+        return jsonify({"error": "Forbidden: Invalid origin"}), 403
+    session = db_store.get_session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    if session["status"] in ("completed", "cancelled"):
+        return jsonify({"error": f"Cannot resume session in terminal '{session['status']}' state"}), 400
+    
+    last_cp = db_store.get_latest_checkpoint(session_id)
+    if not last_cp:
+        return jsonify({"error": "No verified checkpoint found to resume from"}), 400
+
+    state_data = last_cp.get("state_data") or {}
+    cp_step = last_cp.get("step_name")
+
+    with state_lock:
+        if workflow_state["status"] == "running":
+            return jsonify({"error": "Another workflow is currently running"}), 409
+        workflow_state.clear()
+        workflow_state.update(state_data)
+        workflow_state["session_id"] = session_id
+
+    if cp_step == "prd_approval_gate":
+        with state_lock:
+            workflow_state["status"] = "approval_needed"
+        db_store.update_session_status(session_id, "approval_needed", checkpoint_step="prd_approval_gate")
+        update_stats()
+        return jsonify({
+            "message": "Session resumed successfully at PRD approval gate",
+            "session_id": session_id,
+            "resumed_from": cp_step
+        })
+    elif cp_step in ("engineering_completed", "engineering_started"):
+        data = request.get_json(silent=True) or {}
+        feedback = str(data.get('feedback', '')).strip()
+        threading.Thread(target=continue_workflow, args=(feedback,), daemon=True).start()
+        return jsonify({
+            "message": f"Session resumed successfully from {cp_step}",
+            "session_id": session_id,
+            "resumed_from": cp_step
+        })
+    else:
+        return jsonify({"error": f"Unsupported resumption checkpoint: {cp_step}"}), 400
 
 @app.route('/api/start_task', methods=['POST'])
 def start_task():
