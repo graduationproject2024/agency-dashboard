@@ -287,13 +287,18 @@ def safe_resolve_agent_path(agent_rel_path, agents_dir=None):
     if not clean_path:
         return None, "Invalid path: empty string"
 
-    # Reject absolute paths or Windows drive letters
-    if os.path.isabs(clean_path) or (len(clean_path) > 1 and clean_path[1] == ':'):
+    # Normalize Windows backslashes to standard forward slashes for cross-platform containment
+    unified_path = clean_path.replace('\\', '/')
+
+    # Reject absolute paths (Unix '/', Windows '\' or drive letters 'C:')
+    if (os.path.isabs(clean_path) or os.path.isabs(unified_path) or 
+        clean_path.startswith('\\') or clean_path.startswith('/') or 
+        (len(clean_path) > 1 and clean_path[1] == ':')):
         return None, "Absolute paths not permitted"
         
-    normalized_rel = os.path.normpath(clean_path)
-    # Check for path traversal components
-    parts = normalized_rel.split(os.sep)
+    normalized_rel = os.path.normpath(unified_path)
+    # Check for path traversal components across all platforms
+    parts = normalized_rel.replace('\\', '/').split('/')
     if '..' in parts or normalized_rel.startswith('..'):
         return None, "Path traversal rejected"
         
