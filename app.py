@@ -10,6 +10,7 @@ import copy
 import uuid
 import shutil
 import subprocess
+import logging
 from urllib.parse import urlparse
 from html.parser import HTMLParser
 
@@ -263,6 +264,531 @@ def discover_agents(agents_dir=None):
         "error": None
     }
 
+# --- Safe Agent Discovery & Secure Prompt Loading ---
+
+MAX_AGENT_PROMPT_BYTES = 65536  # 64 KB prompt size limit
+MIN_AGENT_PROMPT_BYTES = 20     # Minimum viable agent definition size
+
+def safe_resolve_agent_path(agent_rel_path, agents_dir=None):
+    """
+    Resolve agent prompt file strictly relative to trusted agent root.
+    Rejects:
+    - Non-string or empty paths
+    - Absolute paths or Windows drive letters
+    - Path traversal ('..')
+    - Symlink escapes pointing outside trusted agent root
+    - Non-existent files or directories
+    """
+    base_dir = os.path.abspath(agents_dir or get_agents_dir())
+    if not agent_rel_path or not isinstance(agent_rel_path, str):
+        return None, "Invalid path: empty or not a string"
+    
+    clean_path = agent_rel_path.strip()
+    if not clean_path:
+        return None, "Invalid path: empty string"
+
+    # Reject absolute paths or Windows drive letters
+    if os.path.isabs(clean_path) or (len(clean_path) > 1 and clean_path[1] == ':'):
+        return None, "Absolute paths not permitted"
+        
+    normalized_rel = os.path.normpath(clean_path)
+    # Check for path traversal components
+    parts = normalized_rel.split(os.sep)
+    if '..' in parts or normalized_rel.startswith('..'):
+        return None, "Path traversal rejected"
+        
+    target_path = os.path.abspath(os.path.join(base_dir, normalized_rel))
+    
+    # Common path containment check
+    try:
+        if os.path.commonpath([base_dir, target_path]) != base_dir:
+            return None, "Path escapes agents directory"
+    except (ValueError, Exception):
+        return None, "Path containment check failed"
+        
+    # Symlink containment check
+    if os.path.islink(target_path):
+        real_target = os.path.realpath(target_path)
+        try:
+            real_base = os.path.realpath(base_dir)
+            if os.path.commonpath([real_base, real_target]) != real_base:
+                return None, "Symlink escape rejected"
+        except (ValueError, Exception):
+            return None, "Symlink containment check failed"
+            
+    if not os.path.exists(target_path):
+        return None, f"Agent prompt file does not exist: {normalized_rel}"
+        
+    if not os.path.isfile(target_path):
+        return None, f"Agent path is not a regular file: {normalized_rel}"
+        
+    return target_path, None
+
+def safe_load_agent_prompt(agent_rel_path, fallback_prompt=None, max_bytes=MAX_AGENT_PROMPT_BYTES, agents_dir=None):
+    """
+    Safely load an agent prompt file with strict size, encoding, and containment validation.
+    Returns: (content: str, success: bool, error: str or None)
+    """
+    safe_path, err = safe_resolve_agent_path(agent_rel_path, agents_dir)
+    if err or not safe_path:
+        return fallback_prompt or "", False, err
+        
+    try:
+        file_size = os.path.getsize(safe_path)
+        if file_size > max_bytes:
+            return fallback_prompt or "", False, f"File size ({file_size} bytes) exceeds maximum limit ({max_bytes} bytes)"
+        if file_size < MIN_AGENT_PROMPT_BYTES:
+            return fallback_prompt or "", False, f"File size ({file_size} bytes) below minimum viable threshold"
+            
+        with open(safe_path, 'r', encoding='utf-8', errors='replace') as f:
+            content = f.read()
+            
+        return content, True, None
+    except Exception as e:
+        return fallback_prompt or "", False, f"Failed to read agent prompt: {str(e)}"
+
+# --- Hybrid Squad Triage Engine ---
+
+def normalize_text(text):
+    """Normalize Arabic and Latin text for robust keyword matching."""
+    text = (text or '').lower()
+    text = re.sub(r'[إأآا]', 'ا', text)
+    text = re.sub(r'ة', 'ه', text)
+    text = re.sub(r'ى', 'ي', text)
+    text = re.sub(r'[\u064B-\u0652]', '', text)
+    text = re.sub(r'[\r\n\t]', ' ', text)
+    return text
+
+def contains_keyword(text, kw):
+    """Boundary-aware keyword matching with support for Arabic prefixes."""
+    if ' ' in kw:
+        return kw in text
+    pattern = r'(?:\b|(?<=[\s\W]))(?:ال|و|ف|ب|ك|ل|لل|وال|فال|بال|كال)?' + re.escape(kw) + r'(?=\b|[\s\W]|$)'
+    return bool(re.search(pattern, text))
+
+SQUAD_ARCHETYPES = {
+    'healthcare': {
+        'label': 'Healthcare & Clinic Systems',
+        'keywords': [
+            'عياده', 'عيادات', 'طبيب', 'اطباء', 'دكتور', 'دكاتره', 'اسنان', 'سن', 'مستشفي', 'مستشفيات',
+            'مرضي', 'مريض', 'صيدليه', 'صيدليات', 'علاج', 'صحه', 'طبي', 'طبيه', 'روشسته', 'مواعيد طبيه',
+            'clinic', 'dental', 'dentist', 'doctor', 'hospital', 'patient', 'patients', 'healthcare',
+            'medical', 'medicine', 'pharmacy', 'health', 'appointment'
+        ],
+        'specialists': [
+            {
+                'id': 'healthcare-clinical-evidence-agent',
+                'name': 'خبير الأدلة الطبية والسريرية',
+                'display_name': 'Clinical Evidence Specialist',
+                'short_name': 'MED',
+                'category': 'domain',
+                'stage': 'strategy',
+                'reason': 'يتحقق من دقة تدفق المواعيد ومطابقة المعايير الطبية وخصوصية بيانات المرضى',
+                'prompt_file': r'healthcare\healthcare-clinical-evidence-agent.md',
+                'color': 'linear-gradient(135deg, #10b981, #059669)'
+            },
+            {
+                'id': 'engineering-database-optimizer',
+                'name': 'مهندس قواعد البيانات الطبية',
+                'display_name': 'Database Optimizer',
+                'short_name': 'DB',
+                'category': 'architecture',
+                'stage': 'engineering',
+                'reason': 'يصمم مخططات بيانات المرضى وسجلات المواعيد الطبية بكفاءة وأمان',
+                'prompt_file': r'engineering\engineering-database-optimizer.md',
+                'color': 'linear-gradient(135deg, #3b82f6, #1d4ed8)'
+            },
+            {
+                'id': 'testing-accessibility-auditor',
+                'name': 'مدقق إمكانية الوصول والتوافق',
+                'display_name': 'Accessibility Auditor',
+                'short_name': 'A11Y',
+                'category': 'testing',
+                'stage': 'qa',
+                'reason': 'يضمن سهولة استخدام النظام للمرضى وكبار السن وفق معايير WCAG',
+                'prompt_file': r'testing\testing-accessibility-auditor.md',
+                'color': 'linear-gradient(135deg, #f59e0b, #d97706)'
+            }
+        ]
+    },
+    'ecommerce': {
+        'label': 'E-Commerce & Pricing Systems',
+        'keywords': [
+            'متجر', 'متاجر', 'تسوق', 'سله', 'سلات', 'شراء', 'منتجات', 'منتج', 'دفع', 'اسعار', 'سعر',
+            'تسعير', 'طلبات', 'طلب', 'تخفيضات', 'خصم', 'بضائع', 'بضاعه', 'شحن', 'توصيل', 'عملاء',
+            'ecommerce', 'e-commerce', 'store', 'shop', 'shopping', 'cart', 'checkout', 'pricing',
+            'price', 'inventory', 'marketplace', 'retail', 'discount', 'payment', 'order'
+        ],
+        'specialists': [
+            {
+                'id': 'specialized-pricing-analyst',
+                'name': 'محلل التسعير والتجارة الإلكترونية',
+                'display_name': 'Pricing Analyst',
+                'short_name': 'PRICE',
+                'category': 'domain',
+                'stage': 'strategy',
+                'reason': 'يحلل ديناميكيات التسعير، الخصومات وسلة الشراء لتحقيق أعلى معدل تحويل',
+                'prompt_file': r'specialized\specialized-pricing-analyst.md',
+                'color': 'linear-gradient(135deg, #f97316, #ea580c)'
+            },
+            {
+                'id': 'security-appsec-engineer',
+                'name': 'مهندس أمن تطبيقات التجارة والدفع',
+                'display_name': 'AppSec Engineer',
+                'short_name': 'SEC',
+                'category': 'security',
+                'stage': 'engineering',
+                'reason': 'يؤمن بوابات الدفع الإلكتروني، حماية بطاقات العملاء ومنع التلاعب بالأسعار',
+                'prompt_file': r'security\security-appsec-engineer.md',
+                'color': 'linear-gradient(135deg, #ef4444, #b91c1c)'
+            },
+            {
+                'id': 'testing-performance-benchmarker',
+                'name': 'مدقق أداء المتاجر والتحميل',
+                'display_name': 'Performance Benchmarker',
+                'short_name': 'PERF',
+                'category': 'testing',
+                'stage': 'qa',
+                'reason': 'يختبر سرعة تصفح المنتجات وأداء إتمام الطلبات تحت الضغط العالي',
+                'prompt_file': r'testing\testing-performance-benchmarker.md',
+                'color': 'linear-gradient(135deg, #8b5cf6, #6d28d9)'
+            }
+        ]
+    },
+    'industrial': {
+        'label': 'Industrial Automation & Telemetry',
+        'keywords': [
+            'مصنع', 'مصانع', 'صناعي', 'صناعيه', 'مراقبه', 'حساسات', 'حساس', 'تتبع', 'معدات', 'صيانه',
+            'صيانه تنبويه', 'انترنت الاشياء', 'تشغيل', 'انتاج', 'خط انتاج', 'تليميتري', 'قراءات',
+            'industrial', 'factory', 'iot', 'telemetry', 'sensor', 'sensors', 'predictive maintenance',
+            'monitoring', 'scada', 'automation', 'equipment', 'manufacturing', 'plc'
+        ],
+        'specialists': [
+            {
+                'id': 'engineering-ai-data-remediation-engineer',
+                'name': 'مهندس معالجة البيانات والحساسات',
+                'display_name': 'IoT Data Remediation Engineer',
+                'short_name': 'IOT',
+                'category': 'domain',
+                'stage': 'strategy',
+                'reason': 'ينظم تدفق بيانات الحساسات، قراءات الأجهزة ومعايير اكتشاف الأعطال',
+                'prompt_file': r'engineering\engineering-ai-data-remediation-engineer.md',
+                'color': 'linear-gradient(135deg, #06b6d4, #0891b2)'
+            },
+            {
+                'id': 'engineering-database-optimizer',
+                'name': 'مهندس قواعد بيانات القياس والوقت',
+                'display_name': 'Database Optimizer',
+                'short_name': 'DB',
+                'category': 'architecture',
+                'stage': 'engineering',
+                'reason': 'يهيئ قواعد بيانات السلاسل الزمنية لتخزين ملايين الإشارات الصناعية',
+                'prompt_file': r'engineering\engineering-database-optimizer.md',
+                'color': 'linear-gradient(135deg, #3b82f6, #1d4ed8)'
+            },
+            {
+                'id': 'security-appsec-engineer',
+                'name': 'مهندس أمن الأنظمة الصناعية والشبكات',
+                'display_name': 'AppSec Engineer',
+                'short_name': 'SEC',
+                'category': 'security',
+                'stage': 'qa',
+                'reason': 'يدقق بروتوكولات عزل الحساسات ومنع الهجمات على خطوط الإنتاج والمعدات',
+                'prompt_file': r'security\security-appsec-engineer.md',
+                'color': 'linear-gradient(135deg, #ef4444, #b91c1c)'
+            }
+        ]
+    },
+    'gaming': {
+        'label': 'Games & Interactive Experiences',
+        'keywords': [
+            'لعبه', 'العاب', 'جيم', 'مرحله', 'مراحل', 'نقاط', 'لاعب', 'لاعبين', 'تحدي', 'تتريس', 'اركيد',
+            'سكور', 'مستويات', 'مستوي', 'تحكم', 'game', 'games', 'gaming', 'arcade', 'player', 'score',
+            'scores', 'tetris', 'gameplay', 'level', 'levels', 'puzzle'
+        ],
+        'specialists': [
+            {
+                'id': 'game-designer',
+                'name': 'مصمم ألعاب وتجربة اللعب',
+                'display_name': 'Game Designer',
+                'short_name': 'GAME',
+                'category': 'domain',
+                'stage': 'strategy',
+                'reason': 'يضع ميكانيكا وحلقة اللعب وقواعد التفاعل وتدرج الصعوبة',
+                'prompt_file': r'game-development\game-designer.md',
+                'color': 'linear-gradient(135deg, #ec4899, #be185d)'
+            },
+            {
+                'id': 'economy-designer',
+                'name': 'مصمم ميكانيكا ونقاط اللعبة',
+                'display_name': 'Economy Designer',
+                'short_name': 'ECON',
+                'category': 'domain',
+                'stage': 'engineering',
+                'reason': 'يوازن جداول النقاط والمكافآت وشروط الفوز والخسارة',
+                'prompt_file': r'game-development\economy-designer.md',
+                'color': 'linear-gradient(135deg, #8b5cf6, #6d28d9)'
+            },
+            {
+                'id': 'design-whimsy-injector',
+                'name': 'خبير المؤثرات الحركية والألعاب',
+                'display_name': 'Whimsy Injector',
+                'short_name': 'WHIMSY',
+                'category': 'design',
+                'stage': 'animation',
+                'reason': 'يضيف مؤثرات بصرية مبهجة وتفاعل فيزيائي واستجابة سريعة للتحكم',
+                'prompt_file': r'design\design-whimsy-injector.md',
+                'color': 'linear-gradient(135deg, #ff758c, #ff7eb3)'
+            }
+        ]
+    },
+    'fintech': {
+        'label': 'Business Dashboards & Fintech',
+        'keywords': [
+            'لوحه تحكم', 'مؤشرات', 'ماليه', 'محاسبه', 'ميزانيه', 'استثمار', 'تقارير', 'احصائيات',
+            'ارباح', 'فواتير', 'فاتوره', 'تحليلات', 'بنوك', 'ارصده', 'رصيد', 'dashboard', 'fintech',
+            'analytics', 'finance', 'financial', 'accounting', 'budget', 'kpi', 'investment',
+            'invoicing', 'invoice', 'metrics', 'ledger'
+        ],
+        'specialists': [
+            {
+                'id': 'finance-financial-analyst',
+                'name': 'المحلل المالي للشركات',
+                'display_name': 'Financial Analyst',
+                'short_name': 'FIN',
+                'category': 'domain',
+                'stage': 'strategy',
+                'reason': 'يحدد معادلات المؤشرات المالية، تدفق الإيرادات ونماذج التقارير الدقيقة',
+                'prompt_file': r'finance\finance-financial-analyst.md',
+                'color': 'linear-gradient(135deg, #10b981, #047857)'
+            },
+            {
+                'id': 'engineering-database-optimizer',
+                'name': 'مهندس تدفق وقواعد البيانات المالية',
+                'display_name': 'Database Optimizer',
+                'short_name': 'DB',
+                'category': 'architecture',
+                'stage': 'engineering',
+                'reason': 'يضمن دقة العمليات الحسابية وتطابق القيود المحاسبية وسرعة التجميع',
+                'prompt_file': r'engineering\engineering-database-optimizer.md',
+                'color': 'linear-gradient(135deg, #3b82f6, #1d4ed8)'
+            },
+            {
+                'id': 'security-appsec-engineer',
+                'name': 'مهندس أمان المعاملات المالية',
+                'display_name': 'AppSec Engineer',
+                'short_name': 'SEC',
+                'category': 'security',
+                'stage': 'qa',
+                'reason': 'يتحقق من سرية البيانات المالية وسجلات التدقيق ومنع التلاعب بالأرقام',
+                'prompt_file': r'security\security-appsec-engineer.md',
+                'color': 'linear-gradient(135deg, #ef4444, #b91c1c)'
+            }
+        ]
+    },
+    'general': {
+        'label': 'General Websites & Portfolios',
+        'keywords': [
+            'بورتفوليو', 'موقع شخصي', 'معرض اعمال', 'مدونه', 'موقع تعريفي', 'صفحه هبوط', 'موقع ويب',
+            'portfolio', 'personal website', 'landing page', 'blog', 'showcase', 'website', 'web application'
+        ],
+        'specialists': [
+            {
+                'id': 'engineering-code-reviewer',
+                'name': 'مراجع جودة الأكواد ومعايير الويب',
+                'display_name': 'Code Reviewer',
+                'short_name': 'REV',
+                'category': 'testing',
+                'stage': 'qa',
+                'reason': 'يراقب المعايير البرمجية ونظافة هيكلة المشروع وخلوه من العيوب',
+                'prompt_file': r'engineering\engineering-code-reviewer.md',
+                'color': 'linear-gradient(135deg, #6366f1, #4f46e5)'
+            },
+            {
+                'id': 'design-whimsy-injector',
+                'name': 'خبير تفاعل ومؤثرات الواجهة',
+                'display_name': 'Whimsy Injector',
+                'short_name': 'WHIMSY',
+                'category': 'design',
+                'stage': 'animation',
+                'reason': 'يضفي طابعاً تفاعلياً مبهجاً على الواجهة والحركات الدقيقة',
+                'prompt_file': r'design\design-whimsy-injector.md',
+                'color': 'linear-gradient(135deg, #ff758c, #ff7eb3)'
+            },
+            {
+                'id': 'marketing-seo-specialist',
+                'name': 'أخصائي تحسين محركات البحث والظهور',
+                'display_name': 'SEO Specialist',
+                'short_name': 'SEO',
+                'category': 'marketing',
+                'stage': 'seo',
+                'reason': 'يحسن العناوين والبيانات الوصفية لتحقيق أرشفة مثالية في محركات البحث',
+                'prompt_file': r'marketing\marketing-seo-specialist.md',
+                'color': 'linear-gradient(135deg, #f093fb, #f5576c)'
+            }
+        ]
+    }
+}
+
+def _validate_specialists(specialist_list, agents_dir=None):
+    """
+    Validate each specialist prompt file against trusted agent directory.
+    Replaces missing or unreadable specialists with safe fallback generalists.
+    """
+    validated = []
+    for spec in specialist_list:
+        spec_copy = copy.deepcopy(spec)
+        prompt_file = spec_copy.get("prompt_file", "")
+        safe_path, err = safe_resolve_agent_path(prompt_file, agents_dir)
+        if err or not safe_path:
+            logging.warning("Specialist '%s' prompt file invalid (%s): %s. Substituting fallback.", spec_copy.get("id"), prompt_file, err)
+            spec_copy["prompt_file"] = r"engineering\engineering-code-reviewer.md"
+            spec_copy["reason"] += " (Safe fallback: code reviewer)"
+        validated.append(spec_copy)
+    return validated
+
+def classify_project_semantic(task_desc):
+    """
+    Semantic fallback triage using configured provider LLM.
+    Strictly bounded prompt, strict schema, returns valid archetype string or None on failure.
+    Never executes in test environments or without credentials.
+    """
+    if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("TESTING") or os.environ.get("DISABLE_SEMANTIC_TRIAGE"):
+        return None
+
+    settings = load_settings()
+    provider = settings.get('provider', 'gemini')
+    api_key = get_api_key(provider)
+    if not api_key and provider != 'opencode':
+        return None
+
+    system_prompt = (
+        "You are an autonomous software agency project classifier.\n"
+        "Classify the given project task into exactly one of these archetypes:\n"
+        "[\"healthcare\", \"ecommerce\", \"industrial\", \"gaming\", \"fintech\", \"general\"]\n"
+        "Return ONLY a valid JSON object matching this schema:\n"
+        "{\"archetype\": \"<string>\", \"confidence\": <float between 0.0 and 1.0>, \"reasoning\": \"<short string>\"}\n"
+        "Do not wrap in markdown or include extra text."
+    )
+    
+    clean_task = (task_desc or "").strip()[:500]  # Bounded prompt
+    try:
+        if provider == 'gemini':
+            model = settings.get('openrouter_model', 'gemini-3.5-flash-lite')
+            if not model or any(k in model.lower() for k in ['gpt', 'claude', 'openai', '1.5', '2.5']):
+                model = 'gemini-3.5-flash-lite'
+            resp = call_agent_gemini(system_prompt, clean_task, api_key, "Triage Classifier", preferred_model=model)
+        elif provider == 'openrouter':
+            model = settings.get('openrouter_model', 'google/gemini-2.0-flash-001')
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": clean_task}
+                ],
+                "temperature": 0.1,
+                "max_tokens": 150
+            }
+            r = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=10)
+            if r.status_code != 200:
+                return None
+            resp = r.json()["choices"][0]["message"]["content"]
+        else:
+            return None
+
+        # Parse JSON and validate archetype
+        resp_clean = resp.strip()
+        if resp_clean.startswith("```"):
+            resp_clean = re.sub(r"^```(?:json)?\s*", "", resp_clean)
+            resp_clean = re.sub(r"\s*```$", "", resp_clean)
+            
+        data = json.loads(resp_clean)
+        arch = data.get("archetype", "").strip().lower()
+        if arch in SQUAD_ARCHETYPES:
+            conf = float(data.get("confidence", 0.8))
+            return arch, min(1.0, max(0.0, conf)), data.get("reasoning", "")
+    except Exception as e:
+        logging.warning("Semantic triage fallback encountered error: %s", e)
+        
+    return None
+
+def triage_project_squad(task_desc, allow_semantic=True, agents_dir=None):
+    """
+    Hybrid squad triage engine:
+    1. Deterministic heuristic fast-path for supported archetypes (Arabic & English).
+    2. Semantic fallback via LLM only when heuristic is ambiguous.
+    3. Safe generalist squad fallback on empty/unclassified briefs or errors.
+    4. Safe filesystem resolution and validation for every specialist prompt file.
+    """
+    if not task_desc or not isinstance(task_desc, str) or not task_desc.strip():
+        arch = "general"
+        validated_specs = _validate_specialists(SQUAD_ARCHETYPES[arch]["specialists"], agents_dir)
+        return {
+            "archetype": arch,
+            "label": SQUAD_ARCHETYPES[arch]["label"],
+            "method": "fallback",
+            "confidence": 1.0,
+            "specialists": validated_specs
+        }
+        
+    norm = normalize_text(task_desc)
+    scores = {}
+    matched = {}
+    for arch, cfg in SQUAD_ARCHETYPES.items():
+        if arch == "general":
+            continue
+        hits = [kw for kw in cfg["keywords"] if contains_keyword(norm, kw)]
+        scores[arch] = len(hits)
+        matched[arch] = hits
+        
+    gen_hits = [kw for kw in SQUAD_ARCHETYPES["general"]["keywords"] if contains_keyword(norm, kw)]
+    scores["general"] = len(gen_hits)
+    matched["general"] = gen_hits
+    
+    sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    best_arch, best_score = sorted_scores[0]
+    second_arch, second_score = sorted_scores[1] if len(sorted_scores) > 1 else ("", 0)
+    
+    # Deterministic heuristic fast path
+    if best_score > 0 and (best_score > second_score or best_score >= 2):
+        validated_specs = _validate_specialists(SQUAD_ARCHETYPES[best_arch]["specialists"], agents_dir)
+        return {
+            "archetype": best_arch,
+            "label": SQUAD_ARCHETYPES[best_arch]["label"],
+            "method": "heuristic",
+            "confidence": round(min(1.0, 0.6 + (best_score * 0.1)), 2),
+            "specialists": validated_specs,
+            "matched_keywords": matched[best_arch]
+        }
+        
+    # Heuristic is ambiguous: try semantic fallback if permitted
+    if allow_semantic:
+        sem_res = classify_project_semantic(task_desc)
+        if sem_res:
+            sem_arch, sem_conf, sem_reason = sem_res
+            validated_specs = _validate_specialists(SQUAD_ARCHETYPES[sem_arch]["specialists"], agents_dir)
+            return {
+                "archetype": sem_arch,
+                "label": SQUAD_ARCHETYPES[sem_arch]["label"],
+                "method": "semantic",
+                "confidence": sem_conf,
+                "reasoning": sem_reason,
+                "specialists": validated_specs
+            }
+            
+    # Safe generalist fallback
+    arch = "general"
+    validated_specs = _validate_specialists(SQUAD_ARCHETYPES[arch]["specialists"], agents_dir)
+    return {
+        "archetype": arch,
+        "label": SQUAD_ARCHETYPES[arch]["label"],
+        "method": "fallback",
+        "confidence": 0.5,
+        "specialists": validated_specs,
+        "ambiguous": True
+    }
+
 # Thread synchronization locks (RLock for re-entrant thread safety)
 state_lock = threading.RLock()
 budget_lock = threading.RLock()
@@ -286,6 +812,8 @@ workflow_state = {
     "execution_id": None,
     "status": "idle",  # idle | running | approval_needed | completed | failed
     "current_task": None,
+    "squad_plan": None,
+    "active_squad": [],
     "feed": [],
     "departments": {
         "strategy": {"status": "idle", "text": "في انتظار بدء المشروع"},
@@ -615,14 +1143,10 @@ def call_agent(agent_file, role_name, short_name, color, prompt, context_text=""
     Orchestrate specialized agent invocation with honest failure handling.
     Returns string response or raises RuntimeError on genuine failure.
     """
-    agent_path = os.path.join(AGENTS_DIR, agent_file)
-    system_prompt = f"أنت {role_name} محترف."
-    if os.path.exists(agent_path):
-        try:
-            with open(agent_path, 'r', encoding='utf-8', errors='ignore') as f:
-                system_prompt = f.read()
-        except Exception:
-            pass
+    default_prompt = f"أنت {role_name} محترف."
+    system_prompt, loaded_ok, load_err = safe_load_agent_prompt(agent_file, fallback_prompt=default_prompt)
+    if not loaded_ok and load_err:
+        logging.warning("Agent prompt load fallback for %s (%s): %s", role_name, agent_file, load_err)
             
     full_prompt = f"{prompt}\n\nالسياق:\n{context_text}" if context_text else prompt
     settings = load_settings()
@@ -746,9 +1270,25 @@ def call_agent(agent_file, role_name, short_name, color, prompt, context_text=""
 # --- Autonomous Workflow Execution Engine ---
 
 def run_workflow(task_desc):
+    squad_plan = triage_project_squad(task_desc)
+    active_squad = []
+    for spec in squad_plan["specialists"]:
+        active_squad.append({
+            "id": spec["id"],
+            "role_id": spec["id"],
+            "name": spec["name"],
+            "display_name": spec["display_name"],
+            "category": spec["category"],
+            "stage": spec["stage"],
+            "reason": spec["reason"],
+            "status": "selected"
+        })
+
     with state_lock:
         workflow_state["status"] = "running"
         workflow_state["current_task"] = task_desc
+        workflow_state["squad_plan"] = squad_plan
+        workflow_state["active_squad"] = active_squad
         workflow_state["feed"] = []
         workflow_state["blockers"] = []
         workflow_state["qa_report"] = None
@@ -765,15 +1305,44 @@ def run_workflow(task_desc):
         }
         
     update_stats()
+    add_feed("النظام", "Squad Triage", "linear-gradient(135deg, #667eea, #764ba2)", "TRI", f"🎯 تم توجيه المشروع إلى تصنيف '{squad_plan['label']}'. تم اختيار الفريق المتخصص: " + "، ".join([s['name'] for s in active_squad]))
     add_feed("مستشار البزنس", "Business Strategist", "linear-gradient(135deg, #FF6B6B, #FF8E53)", "BS", f"بدأت في تحليل جدوى مشروع: {task_desc}")
     
     try:
-        # 1. Strategy Stage
+        # 1. Strategy Stage with Domain Specialists
+        spec_strat_context = ""
+        strat_specialists = [s for s in active_squad if s["stage"] == "strategy"]
+        for s in strat_specialists:
+            with state_lock:
+                s["status"] = "running"
+            update_stats()
+            spec_def = next((sp for sp in squad_plan["specialists"] if sp["id"] == s["id"]), None)
+            if spec_def:
+                try:
+                    add_feed(s["name"], s["display_name"], spec_def.get("color", "linear-gradient(135deg, #FF6B6B, #FF8E53)"), spec_def.get("short_name", "SPC"), f"بدأت في تحليل الجوانب التخصصية للمشروع: {s['reason']}")
+                    spec_out = call_agent(
+                        spec_def["prompt_file"],
+                        spec_def["name"],
+                        spec_def.get("short_name", "SPC"),
+                        spec_def.get("color", "linear-gradient(135deg, #FF6B6B, #FF8E53)"),
+                        f"بصفتك متخصصاً ({spec_def['name']})، قدم توصياتك وتحليلك المتخصص لمشروع: {task_desc} بناءً على اختصاصك: {s['reason']}."
+                    )
+                    spec_strat_context += f"\n\n[توصيات {s['name']}]:\n{spec_out}"
+                    with state_lock:
+                        s["status"] = "completed"
+                except Exception as e:
+                    with state_lock:
+                        s["status"] = "failed"
+                    add_feed("النظام", "Squad Orchestrator", "orange", "WARN", f"تعذر استكمال استشارة {s['name']}: {e}")
+            update_stats()
+
+        strat_prompt = f"المشروع هو: {task_desc}. قدم دراسة جدوى استراتيجية شاملة وموجزة."
         strat_out = call_agent(
             r"specialized\business-strategist.md",
             "مستشار البزنس", "BS",
             "linear-gradient(135deg, #FF6B6B, #FF8E53)",
-            f"المشروع هو: {task_desc}. قدم دراسة جدوى استراتيجية شاملة وموجزة."
+            strat_prompt,
+            context_text=spec_strat_context
         )
         with state_lock:
             workflow_state["outputs"]["strategy"] = strat_out
@@ -810,6 +1379,9 @@ def run_workflow(task_desc):
                 if workflow_state["departments"][d]["status"] == "active":
                     workflow_state["departments"][d]["status"] = "failed"
                     workflow_state["departments"][d]["text"] = "تعثر التنفيذ بسبب خطأ"
+            for s in workflow_state.get("active_squad", []):
+                if s.get("status") == "running":
+                    s["status"] = "failed"
         update_stats()
         add_feed("النظام", "System", "red", "ERR", f"توقف سير العمل: {str(e)}")
 
@@ -1225,6 +1797,8 @@ def continue_workflow(feedback=""):
         workflow_state["status"] = "running"
         workflow_state["approval_request"] = None
         workflow_state["departments"]["engineering"] = {"status": "active", "text": "يصمم الآن معمارية النظام..."}
+        active_squad = workflow_state.get("active_squad", [])
+        squad_plan = workflow_state.get("squad_plan")
     update_stats()
     
     if feedback:
@@ -1233,11 +1807,43 @@ def continue_workflow(feedback=""):
         add_feed("النظام", "System", "linear-gradient(135deg, #2c3e50, #3498db)", "SY", "✅ تم الاعتماد. فريق الهندسة يبدأ العمل الآن.")
         
     try:
-        # 3. Engineering Stage
+        # 3. Engineering Stage with Architecture/Engineering Specialists
         with state_lock:
             prod_out = workflow_state["outputs"].get("product", "")
+            cur_task = workflow_state.get('current_task', 'موقع ويب متكامل')
+
+        spec_eng_context = ""
+        eng_specialists = [s for s in active_squad if s["stage"] == "engineering"]
+        for s in eng_specialists:
+            with state_lock:
+                s["status"] = "running"
+            update_stats()
+            spec_def = None
+            if squad_plan:
+                spec_def = next((sp for sp in squad_plan.get("specialists", []) if sp["id"] == s["id"]), None)
+            if spec_def:
+                try:
+                    add_feed(s["name"], s["display_name"], spec_def.get("color", "linear-gradient(135deg, #20E2D7, #F9FEA5)"), spec_def.get("short_name", "ENG"), f"بدأت في صياغة المتطلبات الهندسية التخصصية: {s['reason']}")
+                    spec_out = call_agent(
+                        spec_def["prompt_file"],
+                        spec_def["name"],
+                        spec_def.get("short_name", "ENG"),
+                        spec_def.get("color", "linear-gradient(135deg, #20E2D7, #F9FEA5)"),
+                        f"بصفتك ({spec_def['name']})، ضع التوصيات الهندسية والمعمارية لمشروع: {cur_task} استناداً إلى: {s['reason']}.",
+                        prod_out
+                    )
+                    spec_eng_context += f"\n\n[توصيات {s['name']}]:\n{spec_out}"
+                    with state_lock:
+                        s["status"] = "completed"
+                except Exception as e:
+                    with state_lock:
+                        s["status"] = "failed"
+                    add_feed("النظام", "Squad Orchestrator", "orange", "WARN", f"تعذر استكمال استشارة {s['name']}: {e}")
+            update_stats()
+
         eng_prompt = f"ضع خطة هندسية وهيكلية لقواعد البيانات والنظام بناء على هذه المتطلبات.\n{('ملاحظات المدير: ' + feedback) if feedback else ''}"
-        eng_out = call_agent(r"engineering\engineering-software-architect.md", "المهندس المعماري", "ENG", "linear-gradient(135deg, #20E2D7, #F9FEA5)", eng_prompt, prod_out)
+        full_eng_context = f"{prod_out}\n{spec_eng_context}" if spec_eng_context else prod_out
+        eng_out = call_agent(r"engineering\engineering-software-architect.md", "المهندس المعماري", "ENG", "linear-gradient(135deg, #20E2D7, #F9FEA5)", eng_prompt, full_eng_context)
         
         with state_lock:
             workflow_state["outputs"]["engineering"] = eng_out
@@ -1261,9 +1867,6 @@ def continue_workflow(feedback=""):
         update_stats()
         
         # 5. Development Stage
-        with state_lock:
-            cur_task = workflow_state.get('current_task', 'موقع ويب متكامل')
-            
         dev_prompt = f"""بناءً على المعمارية المرفقة:
 {eng_out}
 وبناءً على التصميم المرفق:
@@ -1290,8 +1893,35 @@ def continue_workflow(feedback=""):
             workflow_state["departments"]["qa"] = {"status": "active", "text": "يقوم باختبار النظام وإصلاح الأخطاء..."}
         update_stats()
         
-        # 6. QA Stage (Independent Concrete Inspection)
-        qa_out = call_agent(r"engineering\engineering-qa-engineer.md", "مهندس الجودة", "QA", "linear-gradient(135deg, #FF9A9E, #FECFEF)", "قم بمراجعة الأكواد المرفقة أدناه، وتأكد من خلوها من الأخطاء وراجع معايير الأمان وقابلية الاستخدام.", dev_out)
+        # 6. QA Stage with QA/Security Specialists
+        qa_specialists = [s for s in active_squad if s["stage"] == "qa"]
+        for s in qa_specialists:
+            with state_lock:
+                s["status"] = "running"
+            update_stats()
+            spec_def = None
+            if squad_plan:
+                spec_def = next((sp for sp in squad_plan.get("specialists", []) if sp["id"] == s["id"]), None)
+            if spec_def:
+                try:
+                    add_feed(s["name"], s["display_name"], spec_def.get("color", "linear-gradient(135deg, #FF9A9E, #FECFEF)"), spec_def.get("short_name", "QA"), f"بدأت في تدقيق الجودة والمعايير المتخصصة: {s['reason']}")
+                    call_agent(
+                        spec_def["prompt_file"],
+                        spec_def["name"],
+                        spec_def.get("short_name", "QA"),
+                        spec_def.get("color", "linear-gradient(135deg, #FF9A9E, #FECFEF)"),
+                        f"بصفتك ({spec_def['name']})، راجع الأكواد البرمجية والتصميم بناءً على اختصاصك: {s['reason']}.",
+                        dev_out
+                    )
+                    with state_lock:
+                        s["status"] = "completed"
+                except Exception as e:
+                    with state_lock:
+                        s["status"] = "failed"
+                    add_feed("النظام", "Squad Orchestrator", "orange", "WARN", f"تعذر استكمال تدقيق {s['name']}: {e}")
+            update_stats()
+
+        qa_out = call_agent(r"engineering\engineering-code-reviewer.md", "مهندس الجودة", "QA", "linear-gradient(135deg, #FF9A9E, #FECFEF)", "قم بمراجعة الأكواد المرفقة أدناه، وتأكد من خلوها من الأخطاء وراجع معايير الأمان وقابلية الاستخدام.", dev_out)
         
         with state_lock:
             workflow_state["outputs"]["qa"] = qa_out
@@ -1300,8 +1930,24 @@ def continue_workflow(feedback=""):
         update_stats()
         
         # 7. Animation Stage
-        anim_out = call_agent(r"design\design-motion-designer.md", "خبير الأنيميشن", "MOTION", "linear-gradient(135deg, #ff758c, #ff7eb3)", "طور كود CSS و JS لإضافة تأثيرات بصرية وحركية احترافية تجعل الموقع حياً وفخماً. أرجع كود CSS المحدث داخل ```css وكود JS المحدث داخل ```javascript.", dev_out)
+        anim_specialists = [s for s in active_squad if s["stage"] == "animation"]
+        anim_spec = anim_specialists[0] if anim_specialists else None
+        anim_prompt_file = r"design\design-whimsy-injector.md"
+        anim_role_name = "خبير الأنيميشن"
+        if anim_spec and squad_plan:
+            spec_def = next((sp for sp in squad_plan.get("specialists", []) if sp["id"] == anim_spec["id"]), None)
+            if spec_def:
+                anim_prompt_file = spec_def["prompt_file"]
+                anim_role_name = spec_def["name"]
+                with state_lock:
+                    anim_spec["status"] = "running"
+                update_stats()
+
+        anim_out = call_agent(anim_prompt_file, anim_role_name, "MOTION", "linear-gradient(135deg, #ff758c, #ff7eb3)", "طور كود CSS و JS لإضافة تأثيرات بصرية وحركية احترافية تجعل الموقع حياً وفخماً. أرجع كود CSS المحدث داخل ```css وكود JS المحدث داخل ```javascript.", dev_out)
         
+        if anim_spec:
+            with state_lock:
+                anim_spec["status"] = "completed"
         with state_lock:
             workflow_state["outputs"]["animation"] = anim_out
             workflow_state["departments"]["animation"] = {"status": "done", "text": "تم إضافة التأثيرات الحركية."}
@@ -1309,8 +1955,24 @@ def continue_workflow(feedback=""):
         update_stats()
         
         # 8. SEO Stage
-        seo_out = call_agent(r"specialized\seo-expert.md", "خبير SEO", "SEO", "linear-gradient(135deg, #f093fb, #f5576c)", "اقترح تحسينات محركات البحث وعلامات Meta tags والكلمات المفتاحية لتحسين الظهور.", dev_out)
+        seo_specialists = [s for s in active_squad if s["stage"] == "seo"]
+        seo_spec = seo_specialists[0] if seo_specialists else None
+        seo_prompt_file = r"marketing\marketing-seo-specialist.md"
+        seo_role_name = "خبير SEO"
+        if seo_spec and squad_plan:
+            spec_def = next((sp for sp in squad_plan.get("specialists", []) if sp["id"] == seo_spec["id"]), None)
+            if spec_def:
+                seo_prompt_file = spec_def["prompt_file"]
+                seo_role_name = spec_def["name"]
+                with state_lock:
+                    seo_spec["status"] = "running"
+                update_stats()
+
+        seo_out = call_agent(seo_prompt_file, seo_role_name, "SEO", "linear-gradient(135deg, #f093fb, #f5576c)", "اقترح تحسينات محركات البحث وعلامات Meta tags والكلمات المفتاحية لتحسين الظهور.", dev_out)
         
+        if seo_spec:
+            with state_lock:
+                seo_spec["status"] = "completed"
         with state_lock:
             workflow_state["outputs"]["seo"] = seo_out
             workflow_state["departments"]["seo"] = {"status": "done", "text": "تم تحسين محركات البحث."}
@@ -1645,16 +2307,17 @@ def get_agents():
     with state_lock:
         working_depts = [k.lower() for k, v in workflow_state["departments"].items() if v.get("status") == "active"]
         done_depts = [k.lower() for k, v in workflow_state["departments"].items() if v.get("status") == "done"]
-    
-    dept_map = {
-        "strategy": ["strateg", "business", "market", "pricing", "analyst"],
-        "product": ["product", "prd", "feature", "trend", "nudge"],
-        "engineering": ["architect", "backend", "database", "security", "api", "sre", "devops"],
-        "design": ["ui-designer", "ux", "brand", "design", "visual"],
-        "development": ["senior-developer", "frontend", "developer", "code", "dev", "fullstack"],
-        "qa": ["qa", "tester", "audit", "benchmark", "quality", "test"],
-        "animation": ["motion", "whimsy", "animation"],
-        "seo": ["seo", "content", "search", "metadata"]
+        active_squad_map = {s["id"]: s["status"] for s in workflow_state.get("active_squad", [])}
+
+    core_stage_map = {
+        "strategy": ["business-strategist"],
+        "product": ["product-manager"],
+        "engineering": ["engineering-software-architect"],
+        "design": ["design-ui-designer"],
+        "development": ["engineering-senior-developer"],
+        "qa": ["engineering-code-reviewer", "engineering-qa-engineer"],
+        "animation": ["design-whimsy-injector", "design-motion-designer"],
+        "seo": ["marketing-seo-specialist", "seo-expert"]
     }
     
     inventory = discover_agents()
@@ -1665,18 +2328,31 @@ def get_agents():
         dept = agent["department"]
         status = "idle"
         
-        for wd in working_depts:
-            kw_list = dept_map.get(wd, [wd])
-            if any(kw in raw_id.lower() or kw in dept.lower() for kw in kw_list):
+        # Check if specialist is in active_squad
+        if raw_id in active_squad_map:
+            s_status = active_squad_map[raw_id]
+            if s_status == "running":
                 status = "working"
-                break
-        if status == "idle":
-            for dd in done_depts:
-                kw_list = dept_map.get(dd, [dd])
-                if any(kw in raw_id.lower() or kw in dept.lower() for kw in kw_list):
-                    status = "completed"
+            elif s_status == "completed":
+                status = "completed"
+            elif s_status == "selected":
+                status = "selected"
+            elif s_status == "failed":
+                status = "failed"
+            else:
+                status = "idle"
+        else:
+            # Check core stage execution truthfully based on exact matching role
+            for wd in working_depts:
+                if raw_id in core_stage_map.get(wd, []):
+                    status = "working"
                     break
-                    
+            if status == "idle":
+                for dd in done_depts:
+                    if raw_id in core_stage_map.get(dd, []):
+                        status = "completed"
+                        break
+                        
         agents_list.append({
             "id": raw_id,
             "name": agent["name"],
@@ -1684,8 +2360,8 @@ def get_agents():
             "status": status
         })
         
-    order = {"working": 0, "completed": 1, "idle": 2}
-    agents_list.sort(key=lambda a: (order.get(a["status"], 2), a["name"]))
+    order = {"working": 0, "selected": 1, "completed": 2, "failed": 3, "idle": 4}
+    agents_list.sort(key=lambda a: (order.get(a["status"], 4), a["name"]))
     return jsonify(agents_list)
 
 @app.route('/api/budget', methods=['GET'])
