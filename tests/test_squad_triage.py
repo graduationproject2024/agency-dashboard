@@ -28,6 +28,41 @@ def client():
         yield c
 
 @pytest.fixture(autouse=True)
+def isolated_agents_environment(tmp_path, monkeypatch):
+    """
+    Hermetic test isolation fixture:
+    Provisions a lightweight isolated directory containing the archetypal specialist agent definitions.
+    Sets AGENTS_DIR to this isolated path for the duration of every test.
+    Guarantees test portability across local workstations and headless CI runners.
+    """
+    agents_dir = tmp_path / "mock_agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    
+    specialist_files = [
+        os.path.join("specialized", "business-strategist.md"),
+        os.path.join("specialized", "specialized-pricing-analyst.md"),
+        os.path.join("healthcare", "healthcare-clinical-evidence-agent.md"),
+        os.path.join("engineering", "engineering-database-optimizer.md"),
+        os.path.join("engineering", "engineering-ai-data-remediation-engineer.md"),
+        os.path.join("engineering", "engineering-code-reviewer.md"),
+        os.path.join("testing", "testing-accessibility-auditor.md"),
+        os.path.join("testing", "testing-performance-benchmarker.md"),
+        os.path.join("game-development", "game-designer.md"),
+        os.path.join("game-development", "economy-designer.md"),
+        os.path.join("design", "design-whimsy-injector.md"),
+        os.path.join("marketing", "marketing-seo-specialist.md"),
+        os.path.join("security", "security-appsec-engineer.md"),
+        os.path.join("finance", "finance-financial-analyst.md")
+    ]
+    for rel in specialist_files:
+        fpath = agents_dir / rel
+        fpath.parent.mkdir(parents=True, exist_ok=True)
+        fpath.write_text(f"# Specialist Agent: {rel}\nRole: Autonomous specialist test definition.\n", encoding="utf-8")
+        
+    monkeypatch.setenv("AGENTS_DIR", str(agents_dir))
+    monkeypatch.setattr("app.AGENTS_DIR", str(agents_dir))
+
+@pytest.fixture(autouse=True)
 def reset_state():
     """Reset workflow_state to idle baseline before and after each test."""
     with state_lock:
