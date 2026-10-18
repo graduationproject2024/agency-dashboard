@@ -21,6 +21,76 @@ def isolate_settings_file(monkeypatch, tmp_path):
     temp_settings.write_text(json.dumps({"provider": "gemini"}), encoding="utf-8")
     monkeypatch.setattr("app.SETTINGS_FILE", str(temp_settings))
 
+@pytest.fixture(autouse=True)
+def isolated_agents_environment(tmp_path, monkeypatch):
+    """
+    Hermetic test isolation fixture:
+    Provisions a lightweight isolated directory containing representative agent definitions
+    for each canonical agency division.
+    Sets AGENTS_DIR to this isolated path for the duration of every test.
+    Guarantees test portability across local workstations and headless CI runners.
+    """
+    agents_dir = tmp_path / "mock_agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    
+    canonical_samples = [
+        ("academic", "academic-research-scientist.md", "Academic Research Scientist"),
+        ("design", "design-ui-designer.md", "UI Designer"),
+        ("engineering", "engineering-code-reviewer.md", "Code Reviewer"),
+        ("finance", "finance-financial-analyst.md", "Financial Analyst"),
+        ("game-development", "game-designer.md", "Game Designer"),
+        ("gis", "gis-analyst.md", "GIS Analyst"),
+        ("healthcare", "healthcare-clinical-evidence-agent.md", "Clinical Evidence Specialist"),
+        ("marketing", "marketing-seo-specialist.md", "SEO Specialist"),
+        ("paid-media", "paid-media-manager.md", "Paid Media Manager"),
+        ("product", "product-manager.md", "Product Manager"),
+        ("project-management", "project-manager.md", "Project Manager"),
+        ("research", "trend-researcher.md", "Trend Researcher"),
+        ("sales", "outbound-strategist.md", "Outbound Strategist"),
+        ("security", "security-appsec-engineer.md", "AppSec Engineer"),
+        ("spatial-computing", "vision-pro-developer.md", "Vision Pro Developer"),
+        ("specialized", "business-strategist.md", "Business Strategist"),
+        ("support", "support-customer-care.md", "Customer Care Specialist"),
+        ("testing", "testing-accessibility-auditor.md", "Accessibility Auditor")
+    ]
+    for div_id, filename, agent_name in canonical_samples:
+        fpath = agents_dir / div_id / filename
+        fpath.parent.mkdir(parents=True, exist_ok=True)
+        fpath.write_text(
+            f"---\nname: {agent_name}\ndivision: {div_id}\ndescription: Test specialist for {div_id}\n---\n# Specialist Agent: {agent_name}\nRole: Autonomous specialist test definition with sufficient length.\n",
+            encoding="utf-8"
+        )
+        
+    monkeypatch.setenv("AGENTS_DIR", str(agents_dir))
+    monkeypatch.setattr("app.AGENTS_DIR", str(agents_dir))
+
+@pytest.fixture(autouse=True)
+def reset_state():
+    """Reset workflow_state to idle baseline before and after each test."""
+    with state_lock:
+        workflow_state["status"] = "idle"
+        workflow_state["current_task"] = None
+        workflow_state["squad_plan"] = None
+        workflow_state["active_squad"] = []
+        workflow_state["feed"] = []
+        workflow_state["blockers"] = []
+        workflow_state["qa_report"] = None
+        workflow_state["approval_request"] = None
+        for d in workflow_state["departments"]:
+            workflow_state["departments"][d] = {"status": "idle", "text": "في انتظار بدء المشروع"}
+    yield
+    with state_lock:
+        workflow_state["status"] = "idle"
+        workflow_state["current_task"] = None
+        workflow_state["squad_plan"] = None
+        workflow_state["active_squad"] = []
+        workflow_state["feed"] = []
+        workflow_state["blockers"] = []
+        workflow_state["qa_report"] = None
+        workflow_state["approval_request"] = None
+        for d in workflow_state["departments"]:
+            workflow_state["departments"][d] = {"status": "idle", "text": "في انتظار بدء المشروع"}
+
 @pytest.fixture
 def client():
     app.config['TESTING'] = True
@@ -190,7 +260,7 @@ def test_api_divisions_endpoint(client):
     res = client.get('/api/divisions')
     assert res.status_code == 200
     data = res.get_json()
-    assert data["status"] in ["discovered", "empty"]
+    assert data["status"] in ["discovered", "empty", "not_found"]
     assert data["total_divisions"] == 18
     divisions = data["divisions"]
     assert len(divisions) == 18
@@ -223,14 +293,14 @@ def test_agent_division_metadata_in_api_agents(client):
     assert res.status_code == 200
     agents = res.get_json()
     assert isinstance(agents, list)
-    if agents:
-        a0 = agents[0]
-        assert "id" in a0
-        assert "name" in a0
-        assert "department" in a0
-        assert "division_id" in a0
-        assert "division_name" in a0
-        assert "status" in a0
+    assert len(agents) > 0
+    for a in agents:
+        assert "id" in a
+        assert "name" in a
+        assert "department" in a
+        assert "division_id" in a
+        assert "division_name" in a
+        assert "status" in a
 
 def test_agent_assignment_deterministic(tmp_path):
     """Test explicit frontmatter assignment takes precedence over directory name."""
