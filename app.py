@@ -1627,7 +1627,7 @@ def call_agent(agent_file, role_name, short_name, color, prompt, context_text=""
 
 # --- Autonomous Workflow Execution Engine ---
 
-def run_workflow(task_desc, existing_session_id=None):
+def run_workflow(task_desc, existing_session_id=None, call_agent_fn=None):
     squad_plan = None
     active_squad = []
 
@@ -1740,10 +1740,11 @@ def run_workflow(task_desc, existing_session_id=None):
             update_stats()
 
         # Run Pre-PRD stages: strategy and product via verified DAG execution
+        effective_call_agent = call_agent_fn or call_agent
         success, completed_ids, err = orch.run_dag_stages(
             session_id=session_id,
             allowed_stages=["strategy", "product"],
-            call_agent_fn=call_agent,
+            call_agent_fn=effective_call_agent,
             agent_prompt_resolver_fn=get_agent_prompt_meta,
             add_feed_fn=add_feed,
             on_task_start_fn=_on_task_start,
@@ -2340,22 +2341,29 @@ def publish_workflow_deliverables(
     }
 
 
-def continue_workflow(feedback=""):
+def continue_workflow(feedback="", session_id=None, call_agent_fn=None):
     with state_lock:
         workflow_state["status"] = "running"
         workflow_state["approval_request"] = None
         workflow_state["departments"]["engineering"] = {"status": "active", "text": "يصمم الآن معمارية النظام..."}
         active_squad = workflow_state.get("active_squad", [])
         squad_plan = workflow_state.get("squad_plan")
-        session_id = workflow_state.get("session_id")
+        if not session_id:
+            session_id = workflow_state.get("session_id")
+        else:
+            workflow_state["session_id"] = session_id
         cur_task = workflow_state.get('current_task') or 'موقع ويب متكامل'
     update_stats()
     
     if session_id and db_store.get_session(session_id):
+        sess_obj = db_store.get_session(session_id)
+        proj_name = sess_obj.get("project_name") or str(cur_task)[:40].strip()
         try:
             db_store.update_session_status(session_id, "running", current_stage="engineering")
             if feedback:
-                db_store.add_project_memory(cur_task, session_id, "decision", "PRD_Approval_Feedback", feedback, "human_reviewer")
+                db_store.add_project_memory(proj_name, session_id, "decision", "PRD_Approval_Feedback", feedback, "human_reviewer")
+                if cur_task != proj_name:
+                    db_store.add_project_memory(cur_task, session_id, "decision", "PRD_Approval_Feedback", feedback, "human_reviewer")
             with state_lock:
                 state_snap = copy.deepcopy(workflow_state)
             db_store.save_session_checkpoint(session_id, "engineering_started", state_snap)
@@ -2454,11 +2462,12 @@ def continue_workflow(feedback=""):
             update_stats()
 
         # Run Post-PRD stages: engineering, design, development, qa, animation, seo via verified DAG
+        effective_call_agent = call_agent_fn or call_agent
         post_prd_stages = ["engineering", "design", "development", "qa", "animation", "seo"]
         success, completed_ids, err = orch.run_dag_stages(
             session_id=session_id,
             allowed_stages=post_prd_stages,
-            call_agent_fn=call_agent,
+            call_agent_fn=effective_call_agent,
             agent_prompt_resolver_fn=get_agent_prompt_meta,
             add_feed_fn=add_feed,
             on_task_start_fn=_on_task_start,
@@ -2521,12 +2530,12 @@ def continue_workflow(feedback=""):
             
             # Persist failure diagnostics in project memory
             if session_id:
-                db_store.add_project_memory(
-                    cur_task, session_id, "qa_finding",
-                    f"QA_Defect_Cycle_{remediation_count}",
-                    f"Errors: {err_summary}\nHTML_Valid: {qa_report.get('html_valid')}\nCSS_Valid: {qa_report.get('css_valid')}\nJS_Valid: {qa_report.get('js_valid')}",
-                    "engineering-code-reviewer"
-                )
+                sess_obj = db_store.get_session(session_id)
+                proj_name = sess_obj.get("project_name") or str(cur_task)[:40].strip() if sess_obj else str(cur_task)[:40].strip()
+                diag_content = f"Errors: {err_summary}\nHTML_Valid: {qa_report.get('html_valid')}\nCSS_Valid: {qa_report.get('css_valid')}\nJS_Valid: {qa_report.get('js_valid')}"
+                db_store.add_project_memory(proj_name, session_id, "qa_finding", f"QA_Defect_Cycle_{remediation_count}", diag_content, "engineering-code-reviewer")
+                if cur_task != proj_name:
+                    db_store.add_project_memory(cur_task, session_id, "qa_finding", f"QA_Defect_Cycle_{remediation_count}", diag_content, "engineering-code-reviewer")
 
             # Find developer task to set as dependency
             dev_task_id = "task_eng_dev"
@@ -2546,6 +2555,7 @@ def continue_workflow(feedback=""):
                     candidate_code={"html": app_html, "css": app_css, "js": app_js},
                     attempt_num=remediation_count
                 )
+                db_store.claim_task(rem_task_id)
                 rem_task = db_store.get_task(rem_task_id)
                 session_obj = db_store.get_session(session_id)
                 
@@ -2553,7 +2563,7 @@ def continue_workflow(feedback=""):
                 ok, rem_output, rem_err = orch.execute_single_task(
                     task=rem_task,
                     session=session_obj,
-                    call_agent_fn=call_agent,
+                    call_agent_fn=effective_call_agent,
                     agent_prompt_resolver_fn=get_agent_prompt_meta,
                     add_feed_fn=add_feed
                 )
@@ -2578,12 +2588,12 @@ def continue_workflow(feedback=""):
                         
                     if qa_report["passed"]:
                         add_feed("مهندس الجودة", "QA Auditor", "linear-gradient(135deg, #11998e, #38ef7d)", "HEALED", f"✅ نجحت دورة المعالجة الذاتية (محاولة {remediation_count}) وتجاوز الكود كافة الفحوصات!")
-                        db_store.add_project_memory(
-                            cur_task, session_id, "qa_finding",
-                            f"QA_Remediation_Success_{remediation_count}",
-                            "All structural and syntax defects were successfully resolved by self-healing.",
-                            "engineering-senior-developer"
-                        )
+                        sess_obj = db_store.get_session(session_id)
+                        proj_name = sess_obj.get("project_name") or str(cur_task)[:40].strip() if sess_obj else str(cur_task)[:40].strip()
+                        success_content = "All structural and syntax defects were successfully resolved by self-healing."
+                        db_store.add_project_memory(proj_name, session_id, "qa_finding", f"QA_Remediation_Success_{remediation_count}", success_content, "engineering-senior-developer")
+                        if cur_task != proj_name:
+                            db_store.add_project_memory(cur_task, session_id, "qa_finding", f"QA_Remediation_Success_{remediation_count}", success_content, "engineering-senior-developer")
                         break
 
         # If still failing after bounded retries, fail closed!
@@ -2647,7 +2657,18 @@ def continue_workflow(feedback=""):
                 tasks = db_store.list_tasks_for_session(session_id)
                 deliv_task = next((t for t in tasks if t.get("stage") == "delivery"), None)
                 if deliv_task:
-                    db_store.update_task_status(deliv_task["task_id"], "completed", output_text=f"Atomic publication verified at {app_dir}")
+                    db_store.complete_task_with_agent_run(
+                        task_id=deliv_task["task_id"],
+                        session_id=session_id,
+                        agent_id="project-manager",
+                        agent_name="مدير المشروع",
+                        division_id="project-management",
+                        prompt_file=r"product\project-manager.md",
+                        output_text=f"Atomic publication verified at {app_dir}",
+                        tokens_used=100,
+                        token_source="estimated",
+                        output_preview=f"Published to {clean_folder_name}"
+                    )
                     db_store.record_task_handoff(
                         session_id=session_id,
                         from_task_id=deliv_task["task_id"],
