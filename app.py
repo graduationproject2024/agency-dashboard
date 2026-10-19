@@ -2917,7 +2917,14 @@ def continue_workflow(feedback="", session_id=None, call_agent_fn=None):
                 cleanup_backups(pre_existing_backups)
             except Exception as pe:
                 logging.error("Delivery completion persistence failed, restoring pre-existing backups and rolling back files: %s", pe)
-                for fpath in written_files:
+                rollback_failures = []
+                failed_restorations = {}
+                all_rollback_targets = list(written_files)
+                for p in pre_existing_backups:
+                    if p not in all_rollback_targets:
+                        all_rollback_targets.append(p)
+
+                for fpath in all_rollback_targets:
                     try:
                         if fpath in pre_existing_backups:
                             bak_path = pre_existing_backups[fpath]
@@ -2926,8 +2933,19 @@ def continue_workflow(feedback="", session_id=None, call_agent_fn=None):
                         elif os.path.exists(fpath):
                             os.remove(fpath)
                     except Exception as rb_e:
-                        logging.warning("Rollback file restoration/removal error for %s: %s", fpath, rb_e)
-                cleanup_backups(pre_existing_backups)
+                        if fpath in pre_existing_backups:
+                            bak_path = pre_existing_backups[fpath]
+                            failed_restorations[fpath] = (bak_path, str(rb_e))
+                            rollback_failures.append(
+                                f"Failed to rollback {os.path.basename(fpath)} (restoration failed, retained recovery backup at {bak_path}): {rb_e}"
+                            )
+                        else:
+                            rollback_failures.append(f"Failed to rollback {os.path.basename(fpath)}: {rb_e}")
+
+                clean_errs = cleanup_backups(pre_existing_backups, failed_restorations)
+                rollback_failures.extend(clean_errs)
+                if rollback_failures:
+                    raise IOError(f"Database delivery persistence failed: {pe}; Rollback errors: {'; '.join(rollback_failures)}") from pe
                 raise IOError(f"Database delivery persistence failed: {pe}") from pe
         else:
             cleanup_backups(pre_existing_backups)

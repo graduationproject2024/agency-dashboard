@@ -1713,7 +1713,8 @@ def get_operator_session_audit(session_id: str, db_path: Optional[str] = None) -
 
     # Failure analysis
     failed_task = next((t for t in tasks if t.get("status") == "failed"), None)
-    is_retry_safe = not has_ambiguous_provider_call and (session.get("status") in ("interrupted", "failed"))
+    rollback_failed = "rollback error" in (session.get("error_message") or "").lower()
+    is_retry_safe = not has_ambiguous_provider_call and not rollback_failed and (session.get("status") in ("interrupted", "failed"))
 
     # Permitted recovery actions
     status = session.get("status")
@@ -1725,7 +1726,10 @@ def get_operator_session_audit(session_id: str, db_path: Optional[str] = None) -
     elif status == "interrupted":
         permitted_recovery = ["resume", "cancel"]
     elif status == "failed":
-        permitted_recovery = ["retry"] if is_retry_safe else ["inspect_diagnostics"]
+        if rollback_failed:
+            permitted_recovery = ["inspect_diagnostics", "reconcile_incomplete_rollback"]
+        else:
+            permitted_recovery = ["retry"] if is_retry_safe else ["inspect_diagnostics"]
     elif status == "completed":
         permitted_recovery = ["inspect_deliverables"]
     elif status == "cancelled":
@@ -1767,6 +1771,7 @@ def get_operator_session_audit(session_id: str, db_path: Optional[str] = None) -
             "failed_task_id": failed_task["task_id"] if failed_task else None,
             "error_message": session.get("error_message"),
             "is_provider_ambiguous": has_ambiguous_provider_call,
+            "rollback_failed": rollback_failed,
             "is_retry_safe": is_retry_safe
         },
         "permitted_recovery_actions": permitted_recovery,
