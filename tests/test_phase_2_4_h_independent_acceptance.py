@@ -133,7 +133,7 @@ def _make_deterministic_agent_adapter(html_defect=False, defect_resolved=True):
 
 
 try:
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import sync_playwright  # type: ignore[import-not-found]
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
