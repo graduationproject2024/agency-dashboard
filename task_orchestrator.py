@@ -487,6 +487,7 @@ def execute_single_task(
             prompt_file=prompt_file,
             status="completed",
             tokens_used=tokens_est,
+            token_source="estimated",
             input_preview=full_context[:400],
             output_preview=output[:400],
             db_path=db_path
@@ -562,6 +563,7 @@ def execute_single_task(
             prompt_file=prompt_file,
             status="failed",
             tokens_used=tokens_est,
+            token_source="estimated",
             input_preview=full_context[:400],
             error_message=err_msg,
             db_path=db_path
@@ -698,6 +700,12 @@ def create_remediation_task(
     Assigned to the responsible agent (senior developer).
     """
     title = f"إصلاح أخطاء فحص الجودة (محاولة {attempt_num} من 2)"
+    # Idempotency check: if remediation task already exists for this session/attempt, return existing ID
+    existing_tasks = db.list_tasks_for_session(session_id, db_path=db_path)
+    for t in existing_tasks:
+        if t.get("title") == title:
+            return t["task_id"]
+
     errors_str = "\n- ".join(qa_errors)
     input_ctx = (
         f"فحص الجودة البرمجية كشف عن الأخطاء التالية التي يجب إصلاحها فوراً:\n- {errors_str}\n\n"

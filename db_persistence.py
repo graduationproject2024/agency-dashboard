@@ -4,6 +4,7 @@ import json
 import time
 import uuid
 import re
+import hashlib
 import logging
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -125,6 +126,7 @@ def init_db(db_path: Optional[str] = None):
             input_preview TEXT,
             output_preview TEXT,
             tokens_used INTEGER NOT NULL DEFAULT 0,
+            token_source TEXT NOT NULL DEFAULT 'estimated',
             error_message TEXT,
             started_at REAL NOT NULL,
             finished_at REAL,
@@ -189,6 +191,12 @@ def init_db(db_path: Optional[str] = None):
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_memory_project ON project_memory(project_id, category);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON execution_checkpoints(session_id, created_at);")
 
+        # Ensure token_source column exists in agent_runs table
+        cursor.execute("PRAGMA table_info(agent_runs);")
+        run_cols = {row[1] for row in cursor.fetchall()}
+        if "token_source" not in run_cols:
+            cursor.execute("ALTER TABLE agent_runs ADD COLUMN token_source TEXT DEFAULT 'estimated';")
+
         conn.commit()
 
 
@@ -196,18 +204,41 @@ def init_db(db_path: Optional[str] = None):
 # Memory Secret Sanitization
 # =========================================================================
 
-SECRET_API_KEY_PATTERN = re.compile(r'(?i)(AIzaSy[0-9A-Za-z_-]{20,}|sk-[0-9A-Za-z]{20,})')
-SECRET_CREDENTIAL_PATTERN = re.compile(r'(?i)(password|secret|bearer\s+[a-z0-9_\-\.]+)\s*[:=]\s*["\']?([^"\'\s]+)["\']?')
-SECRET_API_KEY_ASSIGN_PATTERN = re.compile(r'(?i)(api[_-]?key)\s*[:=]\s*["\']?([^"\'\s]+)["\']?')
+SECRET_API_KEY_PATTERN = re.compile(r'(?i)\b(AIzaSy[0-9A-Za-z_-]{20,}|sk-[0-9A-Za-z_-]{20,}|AKIA[0-9A-Z]{16})\b')
+SECRET_JWT_PATTERN = re.compile(r'\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_\-.]*')
+SECRET_BEARER_PATTERN = re.compile(r'(?i)\bbearer\s+([A-Za-z0-9_\-\.]{15,})')
+SECRET_URL_KEY_PATTERN = re.compile(r'(?i)([?&](?:key|api[_-]?key|token|secret)=)([^&\s]+)')
+SECRET_ASSIGN_PATTERN = re.compile(r'(?i)\b((?:password|secret|auth[_-]?token|client[_-]?secret))\s*[:=]\s*["\']?([^"\'\s,;{}]+)["\']?')
+SECRET_API_KEY_ASSIGN_PATTERN = re.compile(r'(?i)\b(api[_-]?key)\s*[:=]\s*["\']?([^"\'\s,;{}]+)["\']?')
+SECRET_JSON_PATTERN = re.compile(r'(?i)("(?:apiKey|clientSecret|secret|token|password|accessToken|refreshToken)")\s*:\s*"([^"]+)"')
 
-def sanitize_memory_content(text: str) -> str:
-    """Mask any sensitive API keys or credentials before saving to persistent memory."""
-    if not text or not isinstance(text, str):
+def sanitize_memory_content(text: Any) -> str:
+    """Mask sensitive API keys, bearer tokens, or credentials before saving to persistent memory, handoffs, or logs."""
+    if text is None:
         return ""
+    if isinstance(text, (dict, list)):
+        try:
+            text = json.dumps(text, ensure_ascii=False)
+        except Exception:
+            text = str(text)
+    elif not isinstance(text, str):
+        text = str(text)
+
     sanitized = text
-    sanitized = SECRET_API_KEY_PATTERN.sub("[REDACTED_API_KEY]", sanitized)
-    sanitized = SECRET_CREDENTIAL_PATTERN.sub(r"\1=[REDACTED_CREDENTIAL]", sanitized)
+    # Redact URL query params with secrets
+    sanitized = SECRET_URL_KEY_PATTERN.sub(r"\1[REDACTED_KEY]", sanitized)
+    # Redact Bearer tokens
+    sanitized = SECRET_BEARER_PATTERN.sub("Bearer [REDACTED_CREDENTIAL]", sanitized)
+    # Redact JSON structured credentials
+    sanitized = SECRET_JSON_PATTERN.sub(r'\1: "[REDACTED_CREDENTIAL]"', sanitized)
+    # Redact explicit credential assignments
+    sanitized = SECRET_ASSIGN_PATTERN.sub(r"\1=[REDACTED_CREDENTIAL]", sanitized)
+    # Redact api_key assignments
     sanitized = SECRET_API_KEY_ASSIGN_PATTERN.sub(r"\1=[REDACTED_API_KEY]", sanitized)
+    # Redact known API key token formats (Gemini, OpenAI, AWS)
+    sanitized = SECRET_API_KEY_PATTERN.sub("[REDACTED_API_KEY]", sanitized)
+    # Redact JWT tokens
+    sanitized = SECRET_JWT_PATTERN.sub("[REDACTED_JWT]", sanitized)
     return sanitized
 
 
@@ -455,6 +486,7 @@ def update_task_status(
     now = time.time()
     started_at = now if status == 'running' else None
     completed_at = now if status in ('completed', 'failed', 'cancelled', 'blocked') else None
+    safe_error = sanitize_memory_content(error_message) if error_message else None
     with get_db_connection(db_path) as conn:
         if status == 'completed':
             current = conn.execute("SELECT output_text FROM workflow_tasks WHERE task_id = ?;", (task_id,)).fetchone()
@@ -471,7 +503,7 @@ def update_task_status(
                 started_at = COALESCE(started_at, ?),
                 completed_at = COALESCE(?, completed_at)
             WHERE task_id = ?;
-        """, (status, output_text, error_message, started_at, completed_at, task_id))
+        """, (status, output_text, safe_error, started_at, completed_at, task_id))
         
         # When a task completes, evaluate pending dependent tasks in the same session
         if status == 'completed':
@@ -610,6 +642,7 @@ def record_agent_run(
     prompt_file: str,
     status: str,
     tokens_used: int = 0,
+    token_source: str = "estimated",
     input_preview: Optional[str] = None,
     output_preview: Optional[str] = None,
     error_message: Optional[str] = None,
@@ -618,20 +651,39 @@ def record_agent_run(
     run_id = f"run_{uuid.uuid4().hex[:12]}"
     now = time.time()
     fin = now if status in ('completed', 'failed') else None
+    safe_input = sanitize_memory_content(input_preview[:500]) if input_preview else None
+    safe_output = sanitize_memory_content(output_preview[:500]) if output_preview else None
+    safe_error = sanitize_memory_content(error_message) if error_message else None
     with get_db_connection(db_path) as conn:
-        conn.execute("""
-            INSERT INTO agent_runs (
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(agent_runs);")
+        cols = {row[1] for row in cursor.fetchall()}
+        if "token_source" in cols:
+            conn.execute("""
+                INSERT INTO agent_runs (
+                    run_id, task_id, session_id, agent_id, agent_name,
+                    division_id, prompt_file, status, input_preview,
+                    output_preview, tokens_used, token_source, error_message, started_at, finished_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """, (
                 run_id, task_id, session_id, agent_id, agent_name,
-                division_id, prompt_file, status, input_preview,
-                output_preview, tokens_used, error_message, started_at, finished_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-        """, (
-            run_id, task_id, session_id, agent_id, agent_name,
-            division_id, prompt_file, status,
-            input_preview[:500] if input_preview else None,
-            output_preview[:500] if output_preview else None,
-            tokens_used, error_message, now, fin
-        ))
+                division_id, prompt_file, status,
+                safe_input, safe_output,
+                tokens_used, token_source, safe_error, now, fin
+            ))
+        else:
+            conn.execute("""
+                INSERT INTO agent_runs (
+                    run_id, task_id, session_id, agent_id, agent_name,
+                    division_id, prompt_file, status, input_preview,
+                    output_preview, tokens_used, error_message, started_at, finished_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """, (
+                run_id, task_id, session_id, agent_id, agent_name,
+                division_id, prompt_file, status,
+                safe_input, safe_output,
+                tokens_used, safe_error, now, fin
+            ))
         conn.commit()
     return run_id
 
@@ -663,11 +715,10 @@ def record_task_handoff(
     status: str = "delivered",
     db_path: Optional[str] = None
 ) -> Dict[str, Any]:
-    handoff_id = f"hoff_{uuid.uuid4().hex[:12]}"
     now = time.time()
     src_agent = from_agent or from_agent_id or "unknown"
     dst_agent = to_agent or to_agent_id or "unknown"
-    summary = context_summary or artifact_summary or ""
+    summary = sanitize_memory_content(context_summary or artifact_summary or "")
     art_dict = artifacts if isinstance(artifacts, dict) else ({"summary": summary} if summary else {})
     stored_payload = {
         "context_summary": summary,
@@ -676,13 +727,35 @@ def record_task_handoff(
     payload_json = json.dumps(stored_payload, ensure_ascii=False)
     
     with get_db_connection(db_path) as conn:
-        conn.execute("""
-            INSERT INTO task_handoffs (
-                handoff_id, session_id, from_task_id, to_task_id,
-                from_agent_id, to_agent_id, artifact_type,
-                artifact_summary, status, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-        """, (handoff_id, session_id, from_task_id, to_task_id, src_agent, dst_agent, artifact_type, payload_json, status, now))
+        # Enforce DAG invariant: failed, cancelled, or blocked tasks cannot produce successful handoffs
+        src_task = conn.execute("SELECT status FROM workflow_tasks WHERE task_id = ?;", (from_task_id,)).fetchone()
+        if src_task and src_task["status"] in ("failed", "cancelled", "blocked") and status in ("delivered", "acknowledged"):
+            raise ValueError(f"Cannot record successful handoff from {src_task['status']} task {from_task_id}")
+
+        # Enforce deterministic identity and idempotency for handoff records
+        existing = conn.execute(
+            "SELECT handoff_id FROM task_handoffs WHERE session_id = ? AND from_task_id = ? AND to_task_id = ?;",
+            (session_id, from_task_id, to_task_id)
+        ).fetchone()
+
+        if existing:
+            handoff_id = existing["handoff_id"]
+            conn.execute("""
+                UPDATE task_handoffs
+                SET from_agent_id = ?, to_agent_id = ?, artifact_type = ?,
+                    artifact_summary = ?, status = ?, created_at = ?
+                WHERE handoff_id = ?;
+            """, (src_agent, dst_agent, artifact_type, payload_json, status, now, handoff_id))
+        else:
+            h = hashlib.sha256(f"{session_id}_{from_task_id}_{to_task_id}".encode("utf-8")).hexdigest()[:16]
+            handoff_id = f"hoff_{h}"
+            conn.execute("""
+                INSERT INTO task_handoffs (
+                    handoff_id, session_id, from_task_id, to_task_id,
+                    from_agent_id, to_agent_id, artifact_type,
+                    artifact_summary, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """, (handoff_id, session_id, from_task_id, to_task_id, src_agent, dst_agent, artifact_type, payload_json, status, now))
         conn.commit()
 
     return {
@@ -761,13 +834,6 @@ def add_project_memory(
         category = "architecture_decision"
         
     with get_db_connection(db_path) as conn:
-        # Check if supersedes_key was specified
-        if supersedes_key:
-            conn.execute(
-                "UPDATE project_memory SET status = 'superseded', superseded_by = ?, updated_at = ? WHERE project_id = ? AND key = ?;",
-                (memory_id, now, project_id, supersedes_key)
-            )
-
         # Check if an active record with this key already exists in the same category
         existing = conn.execute(
             "SELECT memory_id, version FROM project_memory WHERE project_id = ? AND category = ? AND key = ? AND status = 'verified';",
@@ -775,22 +841,40 @@ def add_project_memory(
         ).fetchone()
         
         version = 1
+        old_id = None
         if existing:
             old_id = existing["memory_id"]
             version = existing["version"] + 1
-            # Mark previous record as superseded
-            conn.execute(
-                "UPDATE project_memory SET status = 'superseded', superseded_by = ?, updated_at = ? WHERE memory_id = ?;",
-                (memory_id, now, old_id)
-            )
 
+        valid_session_id = None
+        if session_id:
+            sess_row = conn.execute("SELECT session_id FROM workflow_sessions WHERE session_id = ?;", (session_id,)).fetchone()
+            if sess_row:
+                valid_session_id = session_id
+
+        # 1. Insert the new verified record first (so memory_id exists for any FK references)
         conn.execute("""
             INSERT INTO project_memory (
                 memory_id, project_id, session_id, category, key,
                 content, provenance_agent, provenance_task_id, status,
                 version, created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-        """, (memory_id, project_id, session_id, category, key, sanitized, provenance_agent, provenance_task_id, status, version, now, now))
+        """, (memory_id, project_id, valid_session_id, category, key, sanitized, provenance_agent, provenance_task_id, status, version, now, now))
+
+        # 2. Mark previous record as superseded
+        if old_id:
+            conn.execute(
+                "UPDATE project_memory SET status = 'superseded', superseded_by = ?, updated_at = ? WHERE memory_id = ?;",
+                (memory_id, now, old_id)
+            )
+
+        # 3. Mark supersedes_key target as superseded
+        if supersedes_key:
+            conn.execute(
+                "UPDATE project_memory SET status = 'superseded', superseded_by = ?, updated_at = ? WHERE project_id = ? AND key = ? AND memory_id != ?;",
+                (memory_id, now, project_id, supersedes_key, memory_id)
+            )
+
         conn.commit()
 
     return {
@@ -939,7 +1023,7 @@ def get_session_checkpoints(session_id: str, db_path: Optional[str] = None) -> L
 def can_resume_session(session_id: str, db_path: Optional[str] = None) -> bool:
     """Check if session is eligible to resume from a verified checkpoint."""
     sess = get_session(session_id, db_path)
-    if not sess or sess["status"] not in ('running', 'failed', 'approval_needed', 'interrupted'):
+    if not sess or sess["status"] not in ('interrupted', 'failed', 'approval_needed'):
         return False
     chk = get_latest_checkpoint(session_id, db_path)
     return chk is not None
@@ -949,10 +1033,32 @@ def reconcile_interrupted_sessions(db_path: Optional[str] = None) -> int:
     Called upon server startup to reconcile any sessions left in 'running' state
     due to unexpected server restart or power loss. Never falsely marks them as completed.
     Safely reconciles interrupted running tasks via bounded retry without duplicating token costs.
+    Also cleans up stale running tasks belonging to cancelled or failed sessions.
     Returns the integer count of reconciled sessions.
     """
     interrupted_ids = []
     with get_db_connection(db_path) as conn:
+        # 1. Clean up stale running tasks belonging to cancelled sessions
+        conn.execute("""
+            UPDATE workflow_tasks
+            SET status = 'cancelled',
+                error_message = 'Task cancelled because parent session was cancelled.'
+            WHERE status = 'running' AND session_id IN (
+                SELECT session_id FROM workflow_sessions WHERE status = 'cancelled'
+            );
+        """)
+
+        # 2. Clean up stale running tasks belonging to failed sessions
+        conn.execute("""
+            UPDATE workflow_tasks
+            SET status = 'failed',
+                error_message = 'Task failed because parent session failed.'
+            WHERE status = 'running' AND session_id IN (
+                SELECT session_id FROM workflow_sessions WHERE status = 'failed'
+            );
+        """)
+
+        # 3. Reconcile sessions that were left in 'running' state
         rows = conn.execute("SELECT session_id FROM workflow_sessions WHERE status = 'running';").fetchall()
         for r in rows:
             sid = r["session_id"]
@@ -971,6 +1077,7 @@ def reconcile_interrupted_sessions(db_path: Optional[str] = None) -> int:
                 WHERE session_id = ? AND status = 'running';
             """, (sid,)).fetchall()
             
+            session_should_fail = False
             for t in running_tasks:
                 tid = t["task_id"]
                 retries = t["retry_count"]
@@ -1012,6 +1119,17 @@ def reconcile_interrupted_sessions(db_path: Optional[str] = None) -> int:
                             error_message = 'Interrupted by unexpected process restart. Maximum retries exceeded.'
                         WHERE task_id = ?;
                     """, (tid,))
+                    if "_spec_" not in tid:
+                        session_should_fail = True
+
+            if session_should_fail:
+                conn.execute("""
+                    UPDATE workflow_sessions
+                    SET status = 'failed',
+                        error_message = 'Interrupted session failed: core task exceeded maximum restart retry limit.'
+                    WHERE session_id = ?;
+                """, (sid,))
+
         conn.commit()
     return len(interrupted_ids)
 

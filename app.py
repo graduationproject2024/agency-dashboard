@@ -1392,12 +1392,19 @@ def update_stats():
             "animation": 3,
             "seo": 2
         }
-        for dept_key, dept_data in workflow_state["departments"].items():
-            if dept_data["status"] == "active":
-                active_squad_count += dept_squad_sizes.get(dept_key, 3)
+        if "departments" in workflow_state and isinstance(workflow_state["departments"], dict):
+            for dept_key, dept_data in workflow_state["departments"].items():
+                if isinstance(dept_data, dict) and dept_data.get("status") == "active":
+                    active_squad_count += dept_squad_sizes.get(dept_key, 3)
                 
+        if "stats" not in workflow_state or not isinstance(workflow_state["stats"], dict):
+            workflow_state["stats"] = {
+                "total_agents": total_agents,
+                "active_agents": 0,
+                "pending_approvals": 0
+            }
         workflow_state["stats"]["active_agents"] = active_squad_count
-        workflow_state["stats"]["pending_approvals"] = 1 if workflow_state["status"] == "approval_needed" else 0
+        workflow_state["stats"]["pending_approvals"] = 1 if workflow_state.get("status") == "approval_needed" else 0
 
 def add_feed(name, role, color, initial, text):
     with state_lock:
@@ -1587,7 +1594,7 @@ def call_agent(agent_file, role_name, short_name, color, prompt, context_text=""
         return reply
 
     except Exception as e:
-        safe_msg = str(e)[:150]
+        safe_msg = db_store.sanitize_memory_content(str(e))[:150]
         add_feed(role_name, "Error", "red", "ERR", f"فشل: {safe_msg}")
         raise RuntimeError(f"فشل دور {role_name}: {safe_msg}")
 
@@ -2424,10 +2431,17 @@ def continue_workflow(feedback=""):
 
         # Delivery gate task execution in DAG
         if session_id:
+            sess_curr = db_store.get_session(session_id)
+            if sess_curr and sess_curr.get("status") == "cancelled":
+                add_feed("مدير المشروع", "Project Manager", "orange", "PM", "تم إلغاء الجلسة، تم إيقاف عملية النشر.")
+                return
             tasks = db_store.list_tasks_for_session(session_id)
             deliv_task = next((t for t in tasks if t.get("stage") == "delivery"), None)
             if deliv_task:
-                db_store.claim_task(deliv_task["task_id"])
+                claimed = db_store.claim_task(deliv_task["task_id"])
+                if not claimed:
+                    add_feed("مدير المشروع", "Project Manager", "orange", "PM", "مهمة التسليم قيد التنفيذ أو اكتملت بالفعل.")
+                    return
 
         # Capture the exact validated candidate artifacts for identity verification
         validated_html = app_html
@@ -2712,7 +2726,7 @@ def cancel_session(session_id):
     
     db_store.update_session_status(session_id, "cancelled")
     with db_store.get_db_connection() as conn:
-        conn.execute("UPDATE workflow_tasks SET status = 'cancelled' WHERE session_id = ? AND status IN ('pending', 'ready');", (session_id,))
+        conn.execute("UPDATE workflow_tasks SET status = 'cancelled', error_message = 'Session cancelled by user.' WHERE session_id = ? AND status IN ('pending', 'ready', 'running');", (session_id,))
         conn.commit()
         
     with state_lock:
@@ -2730,8 +2744,12 @@ def resume_session(session_id):
     session = db_store.get_session(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
+    if session["status"] == "running":
+        return jsonify({"error": "Session is already running"}), 409
     if session["status"] in ("completed", "cancelled"):
         return jsonify({"error": f"Cannot resume session in terminal '{session['status']}' state"}), 400
+    if session["status"] not in ("interrupted", "failed", "approval_needed"):
+        return jsonify({"error": f"Cannot resume session in '{session['status']}' state"}), 400
     
     last_cp = db_store.get_latest_checkpoint(session_id)
     if not last_cp:
@@ -2751,7 +2769,6 @@ def resume_session(session_id):
             return jsonify({"error": "Session is already being resumed or running"}), 409
 
     with state_lock:
-        workflow_state.clear()
         workflow_state.update(state_data)
         workflow_state["session_id"] = session_id
 
