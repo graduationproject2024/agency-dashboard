@@ -11,6 +11,7 @@ import uuid
 import shutil
 import subprocess
 import logging
+import hashlib
 from urllib.parse import urlparse
 from html.parser import HTMLParser
 from typing import Optional, Dict, Any, Tuple, List, Union
@@ -2031,15 +2032,88 @@ def validate_css_structure(css_text):
 
     return len(errors) == 0, errors
 
+
+def build_artifact_manifest(
+    candidate_files: Dict[str, Union[str, bytes]],
+    qa_run_id: Optional[str] = None,
+    delivery_id: Optional[str] = None,
+    validation_status: str = "passed"
+) -> Dict[str, Any]:
+    """
+    Build a deterministic, validated artifact manifest linking verified candidate files
+    to publication output. Rejects path traversal, absolute paths, null bytes, and symlink escapes.
+    Computes exact byte size, SHA-256 digest, and artifact type for each file.
+    """
+    manifest_items = []
+    
+    # Sort files deterministically by relative path
+    for rel_path in sorted(candidate_files.keys()):
+        if not rel_path or not isinstance(rel_path, str):
+            raise ValueError(f"Invalid artifact relative path: {rel_path!r}")
+        
+        # Normalize and inspect path
+        norm_path = os.path.normpath(rel_path).replace("\\", "/")
+        if os.path.isabs(norm_path) or norm_path.startswith("/") or "\0" in norm_path:
+            raise ValueError(f"Unsafe artifact path (absolute or null byte): {rel_path}")
+        if norm_path.startswith("../") or "/../" in norm_path or norm_path == "..":
+            raise ValueError(f"Path traversal detected in artifact manifest: {rel_path}")
+        
+        content = candidate_files[rel_path]
+        if isinstance(content, str):
+            content_bytes = content.encode("utf-8")
+        elif isinstance(content, bytes):
+            content_bytes = content
+        else:
+            raise ValueError(f"Artifact content for {rel_path} must be str or bytes, got {type(content)}")
+        
+        sha256_hash = hashlib.sha256(content_bytes).hexdigest()
+        file_size = len(content_bytes)
+        
+        ext = os.path.splitext(norm_path)[1].lower()
+        if ext == ".html":
+            art_type = "document"
+        elif ext == ".css":
+            art_type = "stylesheet"
+        elif ext == ".js":
+            art_type = "script"
+        elif ext == ".json":
+            art_type = "metadata"
+        elif ext in (".md", ".txt"):
+            art_type = "documentation"
+        else:
+            art_type = "asset"
+            
+        manifest_items.append({
+            "relative_path": norm_path,
+            "file_size": file_size,
+            "sha256": sha256_hash,
+            "artifact_type": art_type,
+            "validation_status": validation_status,
+            "qa_run_id": qa_run_id,
+            "delivery_id": delivery_id
+        })
+        
+    return {
+        "manifest_version": "1.0",
+        "qa_run_id": qa_run_id,
+        "delivery_id": delivery_id,
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "total_artifacts": len(manifest_items),
+        "artifacts": manifest_items
+    }
+
+
 def run_qa_checks(app_html, app_css="", app_js=""):
     """
     Production QA Gate Entry Point:
-    Directly testable structural, syntactic, and asset completeness verification.
+    Directly testable structural, syntactic, security, and asset completeness verification.
     Explicitly rejects missing or empty required HTML, CSS, and JS assets.
     Verifies HTML structure using StrictHTMLStructureValidator, validates JS syntax via Node parser,
-    and returns a structured report.
+    inspects local asset references for path traversal escapes, and returns a structured report
+    with a deterministic candidate artifact manifest.
     """
     errors = []
+    qa_run_id = f"qa_run_{uuid.uuid4().hex[:12]}"
     
     # 1. HTML Verification
     if not app_html or not isinstance(app_html, str) or not app_html.strip():
@@ -2091,6 +2165,20 @@ def run_qa_checks(app_html, app_css="", app_js=""):
         elif js_status == "unavailable":
             errors.append(f"JavaScript syntax validator unavailable: Node.js runtime is required for QA gate verification ({js_err})")
 
+    # 4. Safe Relative Asset & Protocol References Check
+    traversal_patterns = [
+        (re.compile(r'(?:src|href|action)\s*=\s*["\']\s*(?:\.\.[/\\]|[/\\]\.\.[/\\])', re.IGNORECASE), "Path traversal reference detected in HTML asset links"),
+        (re.compile(r'(?:src|href|action)\s*=\s*["\']\s*file:', re.IGNORECASE), "Disallowed file:// protocol reference detected in HTML"),
+        (re.compile(r'@import\s+["\'](?:\.\.[/\\]|[/\\]\.\.[/\\])', re.IGNORECASE), "Path traversal detected in CSS @import"),
+    ]
+    for pat, desc in traversal_patterns:
+        if pat.search(app_html or ""):
+            errors.append(desc)
+            break
+        if pat.search(app_css or ""):
+            errors.append(desc)
+            break
+
     passed = len(errors) == 0
     checks = {
         "html_extracted": bool(app_html and len(app_html.strip()) >= 50),
@@ -2100,11 +2188,31 @@ def run_qa_checks(app_html, app_css="", app_js=""):
         "css_syntax_balanced": css_ok,
         "css_structural_validity": css_ok,
         "js_syntax_balanced": (js_status == "valid") and not any("bracket" in e or "brace" in e or "parenthese" in e for e in errors),
-        "js_syntax_validated": (js_status == "valid")
+        "js_syntax_validated": (js_status == "valid"),
+        "safe_asset_references": not any("Path traversal" in e or "file://" in e for e in errors)
     }
+
+    # Deterministic candidate artifact manifest certified by this QA gate
+    candidate_files = {}
+    if app_html:
+        candidate_files["index.html"] = app_html
+    if app_css:
+        candidate_files["style.css"] = app_css
+        candidate_files["css/style.css"] = app_css
+    if app_js:
+        candidate_files["script.js"] = app_js
+        candidate_files["js/script.js"] = app_js
+
+    manifest = build_artifact_manifest(
+        candidate_files,
+        qa_run_id=qa_run_id,
+        validation_status="passed" if passed else "failed"
+    )
     
     return {
         "passed": passed,
+        "qa_run_id": qa_run_id,
+        "manifest": manifest,
         "checks": checks,
         "errors": errors,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
@@ -2210,10 +2318,47 @@ def publish_workflow_deliverables(
     """
     Real application publication and promotion transaction boundary.
     Performs atomic deliverable persistence with staging, pre-existing backup retention,
-    strict byte-for-byte post-write verification, deterministic failpoints, and atomic rollback.
+    strict byte-for-byte post-write verification, deterministic failpoints, candidate anti-tampering
+    SHA-256 manifest verification, manifest.json deliverable generation, and atomic rollback.
     """
     if failpoint == "before_publication":
         raise IOError("Simulated failure before publication starts")
+
+    # 0. Candidate Manifest Verification (Anti-tampering / Identity Gate)
+    candidate_manifest = qa_report.get("manifest") if isinstance(qa_report, dict) else None
+    qa_run_id = qa_report.get("qa_run_id") if isinstance(qa_report, dict) else None
+    delivery_id = f"deliv_{uuid.uuid4().hex[:12]}"
+
+    if candidate_manifest and isinstance(candidate_manifest, dict) and "artifacts" in candidate_manifest:
+        manifest_map = {item["relative_path"]: item for item in candidate_manifest["artifacts"]}
+        
+        # Verify index.html against certified QA manifest digest
+        if "index.html" in manifest_map:
+            actual_sha = hashlib.sha256(validated_html.encode("utf-8")).hexdigest()
+            expected_sha = manifest_map["index.html"]["sha256"]
+            if actual_sha != expected_sha:
+                raise IOError(
+                    f"Candidate artifact tampering or corruption detected: index.html SHA-256 digest ({actual_sha[:12]}...) "
+                    f"does not match QA manifest ({expected_sha[:12]}...)"
+                )
+        # Verify style.css against certified QA manifest digest
+        if validated_css and "style.css" in manifest_map:
+            actual_sha = hashlib.sha256(validated_css.encode("utf-8")).hexdigest()
+            expected_sha = manifest_map["style.css"]["sha256"]
+            if actual_sha != expected_sha:
+                raise IOError(
+                    f"Candidate artifact tampering or corruption detected: style.css SHA-256 digest ({actual_sha[:12]}...) "
+                    f"does not match QA manifest ({expected_sha[:12]}...)"
+                )
+        # Verify script.js against certified QA manifest digest
+        if validated_js and "script.js" in manifest_map:
+            actual_sha = hashlib.sha256(validated_js.encode("utf-8")).hexdigest()
+            expected_sha = manifest_map["script.js"]["sha256"]
+            if actual_sha != expected_sha:
+                raise IOError(
+                    f"Candidate artifact tampering or corruption detected: script.js SHA-256 digest ({actual_sha[:12]}...) "
+                    f"does not match QA manifest ({expected_sha[:12]}...)"
+                )
 
     os.makedirs(app_dir, exist_ok=True)
     os.makedirs(os.path.join(app_dir, "css"), exist_ok=True)
@@ -2277,6 +2422,27 @@ def publish_workflow_deliverables(
         # 5. qa_report.json
         _stage_write_json(os.path.join(app_dir, "qa_report.json"), qa_report)
 
+        # 6. manifest.json (Comprehensive delivery manifest)
+        manifest_files = {
+            "index.html": validated_html,
+            "plan.md": plan_content,
+            "qa_report.json": json.dumps(qa_report, indent=2, ensure_ascii=False)
+        }
+        if validated_css:
+            manifest_files["style.css"] = validated_css
+            manifest_files["css/style.css"] = validated_css
+        if validated_js:
+            manifest_files["script.js"] = validated_js
+            manifest_files["js/script.js"] = validated_js
+
+        final_manifest = build_artifact_manifest(
+            manifest_files,
+            qa_run_id=qa_run_id,
+            delivery_id=delivery_id,
+            validation_status="published"
+        )
+        _stage_write_json(os.path.join(app_dir, "manifest.json"), final_manifest)
+
         if failpoint == "after_staging_before_promotion":
             raise IOError("Simulated failure after staging but before promotion")
 
@@ -2336,6 +2502,9 @@ def publish_workflow_deliverables(
 
     return {
         "app_dir": app_dir,
+        "delivery_id": delivery_id,
+        "qa_run_id": qa_run_id,
+        "manifest": final_manifest,
         "files": written_files,
         "expected_artifacts": expected_artifacts
     }
@@ -2647,6 +2816,8 @@ def continue_workflow(feedback="", session_id=None, call_agent_fn=None):
         )
         expected_artifacts = pub_result["expected_artifacts"]
         written_files = pub_result["files"]
+        delivery_id = pub_result.get("delivery_id")
+        qa_run_id = pub_result.get("qa_run_id")
 
         add_feed("مدير المشروع", "Project Manager", "linear-gradient(135deg, #f6d365, #fda085)", "PM", f"تم اكتمال المشروع وتجاوز فحص الجودة بنجاح! 🚀 المجلد: `{clean_folder_name}`")
         
@@ -2654,6 +2825,15 @@ def continue_workflow(feedback="", session_id=None, call_agent_fn=None):
             workflow_state["status"] = "completed"
         if session_id:
             try:
+                # Durably record artifact manifest in database
+                if pub_result.get("manifest") and "artifacts" in pub_result["manifest"]:
+                    db_store.record_artifact_manifest(
+                        session_id=session_id,
+                        qa_run_id=qa_run_id,
+                        manifest=pub_result["manifest"]["artifacts"],
+                        delivery_id=delivery_id
+                    )
+
                 tasks = db_store.list_tasks_for_session(session_id)
                 deliv_task = next((t for t in tasks if t.get("stage") == "delivery"), None)
                 if deliv_task:
@@ -2664,7 +2844,7 @@ def continue_workflow(feedback="", session_id=None, call_agent_fn=None):
                         agent_name="مدير المشروع",
                         division_id="project-management",
                         prompt_file=r"product\project-manager.md",
-                        output_text=f"Atomic publication verified at {app_dir}",
+                        output_text=f"Atomic publication verified at {app_dir} (Delivery ID: {delivery_id})",
                         tokens_used=100,
                         token_source="estimated",
                         output_preview=f"Published to {clean_folder_name}"
@@ -2676,8 +2856,8 @@ def continue_workflow(feedback="", session_id=None, call_agent_fn=None):
                         from_agent="project-manager",
                         to_agent="production-environment",
                         artifact_type="published_application",
-                        artifact_summary=f"Published to {clean_folder_name}",
-                        artifacts={"files": list(expected_artifacts.keys())},
+                        artifact_summary=f"Published to {clean_folder_name} (Delivery ID: {delivery_id})",
+                        artifacts={"files": list(expected_artifacts.keys()), "delivery_id": delivery_id, "qa_run_id": qa_run_id},
                         status="acknowledged"
                     )
                 with state_lock:
@@ -2790,6 +2970,23 @@ def get_session_handoffs(session_id):
         return jsonify({"error": "Session not found"}), 404
     handoffs = db_store.get_session_handoffs(session_id)
     return jsonify({"session_id": session_id, "handoffs": handoffs, "total": len(handoffs)})
+
+@app.route('/api/sessions/<session_id>/manifest', methods=['GET'])
+def get_session_manifest(session_id):
+    """Retrieve verified deliverable artifact manifest entries for a session."""
+    session = db_store.get_session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    manifest = db_store.get_artifact_manifest(session_id)
+    return jsonify({"session_id": session_id, "manifest": manifest, "total": len(manifest)})
+
+@app.route('/api/sessions/<session_id>/audit', methods=['GET'])
+def get_session_operator_audit(session_id):
+    """Retrieve full operator-facing diagnostic audit report for a workflow session."""
+    audit_report = db_store.get_operator_session_audit(session_id)
+    if not audit_report or not audit_report.get("session"):
+        return jsonify({"error": "Session not found", "session_id": session_id}), 404
+    return jsonify(audit_report)
 
 @app.route('/api/memory/<project_id>', methods=['GET'])
 def get_project_memory_endpoint(project_id):

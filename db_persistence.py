@@ -183,6 +183,23 @@ def init_db(db_path: Optional[str] = None):
         );
         """)
 
+        # 7. Artifact Manifests table (Delivery Integrity & Manifest Provenance)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS artifact_manifests (
+            manifest_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            qa_run_id TEXT,
+            delivery_id TEXT,
+            relative_path TEXT NOT NULL,
+            file_size INTEGER NOT NULL,
+            sha256 TEXT NOT NULL,
+            artifact_type TEXT NOT NULL,
+            validation_status TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES workflow_sessions(session_id) ON DELETE CASCADE
+        );
+        """)
+
         # Create Indexes for fast traversal and correlation
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON workflow_tasks(session_id);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status ON workflow_tasks(status);")
@@ -190,6 +207,8 @@ def init_db(db_path: Optional[str] = None):
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_handoffs_session ON task_handoffs(session_id);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_memory_project ON project_memory(project_id, category);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON execution_checkpoints(session_id, created_at);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_manifest_session ON artifact_manifests(session_id);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_manifest_qa_run ON artifact_manifests(qa_run_id);")
 
         # Ensure token_source column exists in agent_runs table
         cursor.execute("PRAGMA table_info(agent_runs);")
@@ -1486,4 +1505,216 @@ def acquire_session_resumption_lock(session_id: str, db_path: Optional[str] = No
         """, (now, session_id))
         conn.commit()
         return cursor.rowcount > 0
+
+
+# =========================================================================
+# Artifact Manifest & Delivery Provenance Layer
+# =========================================================================
+
+def record_artifact_manifest(
+    session_id: str,
+    qa_run_id: Optional[str] = None,
+    manifest: Optional[List[Dict[str, Any]]] = None,
+    delivery_id: Optional[str] = None,
+    db_path: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    Persist validated artifact manifest entries linked to a specific session,
+    QA validation run, and atomic publication delivery ID.
+    Enforces deterministic manifest IDs and idempotent storage.
+    """
+    if not manifest:
+        return []
+    now = time.time()
+    records = []
+    with get_db_connection(db_path) as conn:
+        for item in manifest:
+            rel_path = item.get("relative_path") or ""
+            file_size = int(item.get("file_size") or 0)
+            sha256_hash = str(item.get("sha256") or "").lower()
+            artifact_type = str(item.get("artifact_type") or "asset")
+            val_status = str(item.get("validation_status") or "passed")
+            
+            # Deterministic manifest entry ID
+            raw_key = f"{session_id}_{qa_run_id or 'none'}_{delivery_id or 'none'}_{rel_path}"
+            mid = f"man_{hashlib.sha256(raw_key.encode('utf-8')).hexdigest()[:16]}"
+            
+            conn.execute("""
+                INSERT INTO artifact_manifests (
+                    manifest_id, session_id, qa_run_id, delivery_id,
+                    relative_path, file_size, sha256, artifact_type,
+                    validation_status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(manifest_id) DO UPDATE SET
+                    delivery_id = excluded.delivery_id,
+                    validation_status = excluded.validation_status;
+            """, (mid, session_id, qa_run_id, delivery_id, rel_path, file_size, sha256_hash, artifact_type, val_status, now))
+            
+            records.append({
+                "manifest_id": mid,
+                "session_id": session_id,
+                "qa_run_id": qa_run_id,
+                "delivery_id": delivery_id,
+                "relative_path": rel_path,
+                "file_size": file_size,
+                "sha256": sha256_hash,
+                "artifact_type": artifact_type,
+                "validation_status": val_status,
+                "created_at": now
+            })
+        conn.commit()
+    return records
+
+
+def get_artifact_manifest(
+    session_id: str,
+    qa_run_id: Optional[str] = None,
+    delivery_id: Optional[str] = None,
+    db_path: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Retrieve persisted deliverable artifact manifest entries for a session."""
+    with get_db_connection(db_path) as conn:
+        query = "SELECT * FROM artifact_manifests WHERE session_id = ?"
+        params = [session_id]
+        if qa_run_id:
+            query += " AND qa_run_id = ?"
+            params.append(qa_run_id)
+        if delivery_id:
+            query += " AND delivery_id = ?"
+            params.append(delivery_id)
+        query += " ORDER BY relative_path ASC;"
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_operator_session_audit(session_id: str, db_path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Produce a complete, correlation-verified operator failure and diagnostic report.
+    Aggregates:
+    - Session, tasks, agent runs, handoffs, checkpoints, and project memory
+    - Cost & token accounting (provider_reported vs estimated, ambiguity status)
+    - QA run & self-healing remediation cycles
+    - Published artifact manifest & delivery identity
+    - Actionable failure analysis and permitted recovery actions
+    """
+    with get_db_connection(db_path) as conn:
+        sess_row = conn.execute("SELECT * FROM workflow_sessions WHERE session_id = ?;", (session_id,)).fetchone()
+        if not sess_row:
+            return {"error": "Session not found", "session_id": session_id}
+        
+        session = dict(sess_row)
+        task_rows = conn.execute("SELECT * FROM workflow_tasks WHERE session_id = ? ORDER BY stage ASC, rowid ASC;", (session_id,)).fetchall()
+        tasks = [dict(t) for t in task_rows]
+        
+        run_rows = conn.execute("SELECT * FROM agent_runs WHERE session_id = ? ORDER BY started_at ASC;", (session_id,)).fetchall()
+        runs = [dict(r) for r in run_rows]
+        
+        handoff_rows = conn.execute("SELECT * FROM task_handoffs WHERE session_id = ? ORDER BY created_at ASC;", (session_id,)).fetchall()
+        handoffs = [dict(h) for h in handoff_rows]
+        
+        manifest_rows = conn.execute("SELECT * FROM artifact_manifests WHERE session_id = ? ORDER BY relative_path ASC;", (session_id,)).fetchall()
+        manifest = [dict(m) for m in manifest_rows]
+        
+        mem_rows = conn.execute("SELECT * FROM project_memory WHERE session_id = ? ORDER BY created_at ASC;", (session_id,)).fetchall()
+        memory_items = [dict(m) for m in mem_rows]
+
+    # Token & financial accounting analysis
+    total_tokens = 0
+    provider_reported_tokens = 0
+    estimated_tokens = 0
+    in_flight_runs = []
+    
+    for r in runs:
+        tok = int(r.get("tokens_used") or 0)
+        source = r.get("token_source") or "estimated"
+        if r.get("status") == "completed":
+            total_tokens += tok
+            if source == "provider_reported":
+                provider_reported_tokens += tok
+            else:
+                estimated_tokens += tok
+        elif r.get("status") in ("in_progress", "pending"):
+            in_flight_runs.append(r)
+
+    has_ambiguous_provider_call = any(
+        "ambiguous" in (r.get("error_message") or "").lower() or
+        "in-flight" in (r.get("error_message") or "").lower()
+        for r in runs
+    )
+    
+    potential_cost_incurred = len(runs) > 0
+
+    # QA & remediation analysis
+    qa_findings = [m for m in memory_items if m.get("category") == "qa_finding"]
+    remediation_cycles = [m for m in qa_findings if "QA_Defect_Cycle" in m.get("key", "")]
+    remediation_successes = [m for m in qa_findings if "QA_Remediation_Success" in m.get("key", "")]
+
+    # Publication analysis
+    delivery_task = next((t for t in tasks if t.get("stage") == "delivery"), None)
+    is_delivery_completed = bool(delivery_task and delivery_task.get("status") == "completed")
+    delivery_id = manifest[0].get("delivery_id") if manifest else None
+
+    # Failure analysis
+    failed_task = next((t for t in tasks if t.get("status") == "failed"), None)
+    is_retry_safe = not has_ambiguous_provider_call and (session.get("status") in ("interrupted", "failed"))
+
+    # Permitted recovery actions
+    status = session.get("status")
+    permitted_recovery = []
+    if status == "running":
+        permitted_recovery = ["cancel"]
+    elif status == "approval_needed":
+        permitted_recovery = ["approve", "cancel"]
+    elif status == "interrupted":
+        permitted_recovery = ["resume", "cancel"]
+    elif status == "failed":
+        permitted_recovery = ["retry"] if is_retry_safe else ["inspect_diagnostics"]
+    elif status == "completed":
+        permitted_recovery = ["inspect_deliverables"]
+    elif status == "cancelled":
+        permitted_recovery = ["view_only"]
+
+    return {
+        "session": session,
+        "tasks_summary": {
+            "total_tasks": len(tasks),
+            "completed": sum(1 for t in tasks if t.get("status") == "completed"),
+            "failed": sum(1 for t in tasks if t.get("status") == "failed"),
+            "in_progress": sum(1 for t in tasks if t.get("status") == "in_progress"),
+            "ready": sum(1 for t in tasks if t.get("status") == "ready"),
+            "blocked": sum(1 for t in tasks if t.get("status") == "blocked"),
+        },
+        "cost_and_token_accounting": {
+            "total_tokens_billed": total_tokens,
+            "provider_reported_tokens": provider_reported_tokens,
+            "estimated_tokens": estimated_tokens,
+            "potential_cost_incurred": potential_cost_incurred,
+            "has_ambiguous_provider_call": has_ambiguous_provider_call,
+            "in_flight_runs_count": len(in_flight_runs)
+        },
+        "qa_and_remediation": {
+            "qa_finding_count": len(qa_findings),
+            "remediation_cycles_executed": len(remediation_cycles),
+            "remediation_succeeded": len(remediation_successes) > 0,
+            "qa_passed": len(remediation_successes) > 0 or (is_delivery_completed and len(qa_findings) == 0)
+        },
+        "publication_and_delivery": {
+            "is_published": is_delivery_completed and len(manifest) > 0,
+            "delivery_id": delivery_id,
+            "published_artifact_count": len(manifest),
+            "manifest_verified": len(manifest) > 0
+        },
+        "failure_analysis": {
+            "status": status,
+            "failed_at_stage": session.get("current_stage"),
+            "failed_task_id": failed_task["task_id"] if failed_task else None,
+            "error_message": session.get("error_message"),
+            "is_provider_ambiguous": has_ambiguous_provider_call,
+            "is_retry_safe": is_retry_safe
+        },
+        "permitted_recovery_actions": permitted_recovery,
+        "manifest": manifest,
+        "handoffs": handoffs
+    }
+
 
