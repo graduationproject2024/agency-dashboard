@@ -166,6 +166,11 @@ jobs:
           echo "=== Running core integration, rollback, and reliability suites ==="
           python -m pytest tests/test_adversarial_rollback.py tests/test_workflow_integration.py tests/test_workflow_reliability.py tests/test_csrf_origin_policy.py tests/test_financial_accounting.py tests/test_security_http_filesystem.py tests/test_security_secrets.py tests/test_squad_triage.py tests/test_agent_security_and_divisions.py -v --tb=short
 
+      - name: Run Phase 2.4-H/I/J/K, Phase 2.5, and Phase 2.6 reliability & reconciliation suites
+        run: |
+          echo "=== Running modern acceptance, recovery, and production readiness suites ==="
+          python -m pytest tests/test_phase_2_4_h_independent_acceptance.py tests/test_phase_2_4_i_adversarial_runtime_recovery.py tests/test_phase_2_4_j_production_path_failure_injection.py tests/test_phase_2_4_k_production_recovery_and_accounting.py tests/test_phase_2_5_reconciliation_and_billing_integrity.py tests/test_phase_2_6_production_readiness_remediation.py -v --tb=short
+
       - name: Verify repository integrity post-test
         if: always()
         env:
@@ -297,3 +302,29 @@ jobs:
 
           print("[SUCCESS] Integrity gate passed: Zero persistent file or state mutations detected across test run.")
           EOF
+
+  windows-verify:
+    name: Windows Compatibility & Integrity Gate
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install flask pytest werkzeug requests
+
+      - name: Run Windows platform security & reserved devices tests
+        run: |
+          python -m pytest tests/test_adversarial_paths.py tests/test_agent_security_and_divisions.py tests/test_csrf_origin_policy.py -v --tb=short
+
+      - name: Run Phase 2.5 and Phase 2.6 production reliability & reconciliation suites on Windows
+        run: |
+          python -m pytest tests/test_phase_2_4_h_independent_acceptance.py tests/test_phase_2_4_k_production_recovery_and_accounting.py tests/test_phase_2_5_reconciliation_and_billing_integrity.py tests/test_phase_2_6_production_readiness_remediation.py -v --tb=short
+

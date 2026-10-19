@@ -46,6 +46,17 @@ from app import (
 import db_persistence as db_store
 
 
+@pytest.fixture(autouse=True)
+def isolate_test_budget(tmp_path, monkeypatch):
+    """Ensure all tests in Phase 2.5 operate against an isolated dummy budget file."""
+    temp_budget = str(tmp_path / "isolated_budget.json")
+    with open(temp_budget, "w", encoding="utf-8") as f:
+        json.dump({"tokens_used": 1000, "estimated_cost": 0.001, "transactions": []}, f)
+    monkeypatch.setenv("BUDGET_FILE", temp_budget)
+    monkeypatch.setenv("BUDGET_FILE_PATH", temp_budget)
+    monkeypatch.setattr("app.BUDGET_FILE", temp_budget, raising=False)
+
+
 # =========================================================================
 # Workstream A: Safe Incomplete-Rollback Reconciliation & Artifact Safety
 # =========================================================================
@@ -909,6 +920,10 @@ def test_workstream_d_preview_and_apply_http_flow_with_conflict(monkeypatch, tmp
 
     client = app.test_client()
 
+    # Configure operator/admin auth for Phase 2.6 security enforcement
+    monkeypatch.setenv("OPERATOR_AUTH_TOKEN", "op_test_token_123")
+    monkeypatch.setenv("ADMIN_AUTH_TOKEN", "admin_test_token_456")
+
     # 1. Preview
     res_prev = client.get(
         f"/api/sessions/{sid}/reconcile_rollback/preview",
@@ -922,7 +937,7 @@ def test_workstream_d_preview_and_apply_http_flow_with_conflict(monkeypatch, tmp
     # 2. Apply without force -> 409 Conflict!
     res_apply = client.post(
         f"/api/sessions/{sid}/reconcile_rollback/apply",
-        headers={"Origin": "http://127.0.0.1:8080", "Content-Type": "application/json"},
+        headers={"Origin": "http://127.0.0.1:8080", "Content-Type": "application/json", "X-Operator-Token": "admin_test_token_456"},
         json={"force": False}
     )
     assert res_apply.status_code == 409
@@ -932,7 +947,7 @@ def test_workstream_d_preview_and_apply_http_flow_with_conflict(monkeypatch, tmp
     # 3. Apply with force=True -> 200 OK!
     res_forced = client.post(
         f"/api/sessions/{sid}/reconcile_rollback/apply",
-        headers={"Origin": "http://127.0.0.1:8080", "Content-Type": "application/json"},
+        headers={"Origin": "http://127.0.0.1:8080", "Content-Type": "application/json", "X-Operator-Token": "admin_test_token_456"},
         json={"force": True}
     )
     assert res_forced.status_code == 200
@@ -950,6 +965,10 @@ def test_workstream_d_reconcile_usage_http_flow(monkeypatch, tmp_path):
     db_store.init_db(test_db)
     monkeypatch.setattr("db_persistence.DEFAULT_DB_FILENAME", os.path.basename(test_db))
     monkeypatch.setenv("DATABASE_PATH", test_db)
+    test_budget = str(tmp_path / "test_budget.json")
+    monkeypatch.setattr("app.BUDGET_FILE", test_budget)
+    monkeypatch.setenv("OPERATOR_AUTH_TOKEN", "op_test_token_123")
+    monkeypatch.setenv("ADMIN_AUTH_TOKEN", "admin_test_token_456")
 
     sid = "sess_usage_d3"
     db_store.create_session(session_id=sid, project_name="Usage HTTP", task_description="Desc", db_path=test_db)
@@ -972,7 +991,7 @@ def test_workstream_d_reconcile_usage_http_flow(monkeypatch, tmp_path):
 
     res = client.post(
         f"/api/runs/{run_id}/reconcile_usage",
-        headers={"Origin": "http://127.0.0.1:8080", "Content-Type": "application/json"},
+        headers={"Origin": "http://127.0.0.1:8080", "Content-Type": "application/json", "X-Operator-Token": "op_test_token_123"},
         json={"provider_tokens": 1750, "cost": 0.035, "provider_request_id": "req_http_1750"}
     )
     assert res.status_code == 200

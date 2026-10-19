@@ -249,6 +249,40 @@ def init_db(db_path: Optional[str] = None):
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_rollback_recovery_session ON rollback_recovery_records(session_id);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_rollback_recovery_status ON rollback_recovery_records(status);")
 
+        # 9. Reconciliation Journal table (Phase 2.6 Dual-Ledger Financial Reconciliation Outbox)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS reconciliation_journal (
+            journal_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            target_tokens INTEGER NOT NULL,
+            delta_tokens INTEGER NOT NULL,
+            delta_cost REAL NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('applied_db', 'completed', 'failed')),
+            provider_request_id TEXT,
+            created_at REAL NOT NULL,
+            completed_at REAL
+        );
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_rec_journal_run ON reconciliation_journal(run_id);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_rec_journal_status ON reconciliation_journal(status);")
+
+        # 10. Recovery Audit Log table (Phase 2.6 Security & Privileged Operation Audit)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS recovery_audit_log (
+            audit_id TEXT PRIMARY KEY,
+            timestamp REAL NOT NULL,
+            principal TEXT NOT NULL,
+            action TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            force_requested INTEGER NOT NULL,
+            authorized INTEGER NOT NULL,
+            outcome TEXT NOT NULL,
+            error_message TEXT
+        );
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_rec_audit_target ON recovery_audit_log(target_id);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_rec_audit_time ON recovery_audit_log(timestamp);")
+
         # Ensure token_source, provider_request_id, and reconciliation_status columns exist in agent_runs table
         cursor.execute("PRAGMA table_info(agent_runs);")
         run_cols = {row[1] for row in cursor.fetchall()}
@@ -734,6 +768,7 @@ def record_agent_run(
     input_preview: Optional[str] = None,
     output_preview: Optional[str] = None,
     error_message: Optional[str] = None,
+    provider_request_id: Optional[str] = None,
     db_path: Optional[str] = None
 ) -> str:
     run_id = f"run_{uuid.uuid4().hex[:12]}"
@@ -757,17 +792,21 @@ def record_agent_run(
         if existing_run:
             run_id = existing_run["run_id"]
             if "token_source" in cols:
-                cursor.execute("""
-                    UPDATE agent_runs
-                    SET status = ?,
-                        input_preview = COALESCE(?, input_preview),
-                        output_preview = COALESCE(?, output_preview),
-                        tokens_used = ?,
-                        token_source = ?,
-                        finished_at = ?,
-                        error_message = ?
-                    WHERE run_id = ?;
-                """, (status, safe_input, safe_output, tokens_used, token_source, fin, safe_error, run_id))
+                up_fields = [
+                    "status = ?",
+                    "input_preview = COALESCE(?, input_preview)",
+                    "output_preview = COALESCE(?, output_preview)",
+                    "tokens_used = ?",
+                    "token_source = ?",
+                    "finished_at = ?",
+                    "error_message = ?"
+                ]
+                up_params = [status, safe_input, safe_output, tokens_used, token_source, fin, safe_error]
+                if "provider_request_id" in cols and provider_request_id:
+                    up_fields.append("provider_request_id = COALESCE(?, provider_request_id)")
+                    up_params.append(provider_request_id)
+                up_params.append(run_id)
+                cursor.execute(f"UPDATE agent_runs SET {', '.join(up_fields)} WHERE run_id = ?;", up_params)
             else:
                 cursor.execute("""
                     UPDATE agent_runs
@@ -780,32 +819,29 @@ def record_agent_run(
                     WHERE run_id = ?;
                 """, (status, safe_input, safe_output, tokens_used, fin, safe_error, run_id))
         else:
+            ins_cols = [
+                "run_id", "task_id", "session_id", "agent_id", "agent_name",
+                "division_id", "prompt_file", "status", "input_preview",
+                "output_preview", "tokens_used"
+            ]
+            ins_vals = [
+                run_id, task_id, session_id, agent_id, agent_name,
+                division_id, prompt_file, status,
+                safe_input, safe_output, tokens_used
+            ]
             if "token_source" in cols:
-                cursor.execute("""
-                    INSERT INTO agent_runs (
-                        run_id, task_id, session_id, agent_id, agent_name,
-                        division_id, prompt_file, status, input_preview,
-                        output_preview, tokens_used, token_source, error_message, started_at, finished_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                """, (
-                    run_id, task_id, session_id, agent_id, agent_name,
-                    division_id, prompt_file, status,
-                    safe_input, safe_output,
-                    tokens_used, token_source, safe_error, now, fin
-                ))
-            else:
-                cursor.execute("""
-                    INSERT INTO agent_runs (
-                        run_id, task_id, session_id, agent_id, agent_name,
-                        division_id, prompt_file, status, input_preview,
-                        output_preview, tokens_used, error_message, started_at, finished_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                """, (
-                    run_id, task_id, session_id, agent_id, agent_name,
-                    division_id, prompt_file, status,
-                    safe_input, safe_output,
-                    tokens_used, safe_error, now, fin
-                ))
+                ins_cols.append("token_source")
+                ins_vals.append(token_source)
+            if "provider_request_id" in cols:
+                ins_cols.append("provider_request_id")
+                ins_vals.append(provider_request_id)
+            ins_cols.extend(["error_message", "started_at", "finished_at"])
+            ins_vals.extend([safe_error, now, fin])
+            placeholders = ", ".join(["?"] * len(ins_cols))
+            cursor.execute(
+                f"INSERT INTO agent_runs ({', '.join(ins_cols)}) VALUES ({placeholders});",
+                ins_vals
+            )
         conn.commit()
     return run_id
 
@@ -882,6 +918,7 @@ def complete_task_with_agent_run(
     input_preview: Optional[str] = None,
     output_preview: Optional[str] = None,
     error_message: Optional[str] = None,
+    provider_request_id: Optional[str] = None,
     db_path: Optional[str] = None
 ) -> Tuple[bool, str]:
     """
@@ -931,17 +968,21 @@ def complete_task_with_agent_run(
         if existing_run:
             run_id = existing_run["run_id"]
             if "token_source" in cols:
-                cursor.execute("""
-                    UPDATE agent_runs
-                    SET status = 'completed',
-                        input_preview = COALESCE(?, input_preview),
-                        output_preview = ?,
-                        tokens_used = ?,
-                        token_source = ?,
-                        finished_at = ?,
-                        error_message = ?
-                    WHERE run_id = ?;
-                """, (safe_input, safe_output, tokens_used, token_source, now, safe_error, run_id))
+                up_fields = [
+                    "status = 'completed'",
+                    "input_preview = COALESCE(?, input_preview)",
+                    "output_preview = ?",
+                    "tokens_used = ?",
+                    "token_source = ?",
+                    "finished_at = ?",
+                    "error_message = ?"
+                ]
+                up_params = [safe_input, safe_output, tokens_used, token_source, now, safe_error]
+                if "provider_request_id" in cols and provider_request_id:
+                    up_fields.append("provider_request_id = COALESCE(?, provider_request_id)")
+                    up_params.append(provider_request_id)
+                up_params.append(run_id)
+                cursor.execute(f"UPDATE agent_runs SET {', '.join(up_fields)} WHERE run_id = ?;", up_params)
             else:
                 cursor.execute("""
                     UPDATE agent_runs
@@ -956,16 +997,20 @@ def complete_task_with_agent_run(
         elif existing_completed_run:
             run_id = existing_completed_run["run_id"]
             if "token_source" in cols:
-                cursor.execute("""
-                    UPDATE agent_runs
-                    SET input_preview = COALESCE(?, input_preview),
-                        output_preview = ?,
-                        tokens_used = ?,
-                        token_source = ?,
-                        finished_at = ?,
-                        error_message = ?
-                    WHERE run_id = ?;
-                """, (safe_input, safe_output, tokens_used, token_source, now, safe_error, run_id))
+                up_fields = [
+                    "input_preview = COALESCE(?, input_preview)",
+                    "output_preview = ?",
+                    "tokens_used = ?",
+                    "token_source = ?",
+                    "finished_at = ?",
+                    "error_message = ?"
+                ]
+                up_params = [safe_input, safe_output, tokens_used, token_source, now, safe_error]
+                if "provider_request_id" in cols and provider_request_id:
+                    up_fields.append("provider_request_id = COALESCE(?, provider_request_id)")
+                    up_params.append(provider_request_id)
+                up_params.append(run_id)
+                cursor.execute(f"UPDATE agent_runs SET {', '.join(up_fields)} WHERE run_id = ?;", up_params)
             else:
                 cursor.execute("""
                     UPDATE agent_runs
@@ -977,32 +1022,29 @@ def complete_task_with_agent_run(
                     WHERE run_id = ?;
                 """, (safe_input, safe_output, tokens_used, now, safe_error, run_id))
         else:
+            ins_cols = [
+                "run_id", "task_id", "session_id", "agent_id", "agent_name",
+                "division_id", "prompt_file", "status", "input_preview",
+                "output_preview", "tokens_used"
+            ]
+            ins_vals = [
+                run_id, task_id, session_id, agent_id, agent_name,
+                division_id, prompt_file, 'completed',
+                safe_input, safe_output, tokens_used
+            ]
             if "token_source" in cols:
-                cursor.execute("""
-                    INSERT INTO agent_runs (
-                        run_id, task_id, session_id, agent_id, agent_name,
-                        division_id, prompt_file, status, input_preview,
-                        output_preview, tokens_used, token_source, error_message, started_at, finished_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                """, (
-                    run_id, task_id, session_id, agent_id, agent_name,
-                    division_id, prompt_file, 'completed',
-                    safe_input, safe_output,
-                    tokens_used, token_source, safe_error, now, now
-                ))
-            else:
-                cursor.execute("""
-                    INSERT INTO agent_runs (
-                        run_id, task_id, session_id, agent_id, agent_name,
-                        division_id, prompt_file, status, input_preview,
-                        output_preview, tokens_used, error_message, started_at, finished_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                """, (
-                    run_id, task_id, session_id, agent_id, agent_name,
-                    division_id, prompt_file, 'completed',
-                    safe_input, safe_output,
-                    tokens_used, safe_error, now, now
-                ))
+                ins_cols.append("token_source")
+                ins_vals.append(token_source)
+            if "provider_request_id" in cols:
+                ins_cols.append("provider_request_id")
+                ins_vals.append(provider_request_id)
+            ins_cols.extend(["error_message", "started_at", "finished_at"])
+            ins_vals.extend([safe_error, now, now])
+            placeholders = ", ".join(["?"] * len(ins_cols))
+            cursor.execute(
+                f"INSERT INTO agent_runs ({', '.join(ins_cols)}) VALUES ({placeholders});",
+                ins_vals
+            )
 
         # Update workflow_tasks atomically
         cursor.execute("""
@@ -1402,12 +1444,14 @@ def can_resume_session(session_id: str, db_path: Optional[str] = None) -> bool:
     chk = get_latest_checkpoint(session_id, db_path)
     return chk is not None
 
-def reconcile_interrupted_sessions(db_path: Optional[str] = None) -> int:
+def reconcile_interrupted_sessions(db_path: Optional[str] = None, budget_path: Optional[str] = None) -> int:
     """
     Called upon server startup to reconcile any sessions left in 'running' state
     due to unexpected server restart or power loss. Never falsely marks them as completed.
     Safely reconciles interrupted running tasks via bounded retry without duplicating token costs.
-    Also cleans up stale running tasks belonging to cancelled or failed sessions.
+    Also cleans up stale running tasks belonging to cancelled or failed sessions,
+    cleans up abandoned staging files from interrupted restorations (Phase 2.6-B1),
+    and drains any pending reconciliation outbox entries to the budget ledger (Phase 2.6-A2).
     Returns the integer count of reconciled sessions.
     """
     interrupted_ids = []
@@ -1628,8 +1672,40 @@ def reconcile_interrupted_sessions(db_path: Optional[str] = None) -> int:
                                 updated_at = ?
                             WHERE recovery_id = ?;
                         """, (time.time(), r_id))
+
+                # Phase 2.6-B1: Scan project app directories from rollback records to prune abandoned .restoring_* files
+                distinct_app_dirs = conn.execute("SELECT DISTINCT app_dir FROM rollback_recovery_records;").fetchall()
+                for row in distinct_app_dirs:
+                    d = row["app_dir"]
+                    if d and os.path.isdir(d):
+                        cleanup_abandoned_restore_staging(d, max_age_seconds=60.0)
+
         except Exception as rec_err:
             logging.warning("Error reconciling rollback recovery records: %s", rec_err)
+
+        # 6. Drain pending reconciliation journal entries (Phase 2.6-A2 Dual-Ledger Outbox)
+        try:
+            j_table = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reconciliation_journal';").fetchone()
+            if j_table:
+                pending_journals = conn.execute("SELECT * FROM reconciliation_journal WHERE status = 'applied_db';").fetchall()
+                target_budget = budget_path or os.environ.get("BUDGET_FILE_PATH") or os.environ.get("BUDGET_FILE") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "budget.json")
+                for pj in pending_journals:
+                    try:
+                        project_reconciliation_to_budget(
+                            budget_path=target_budget,
+                            journal_id=pj["journal_id"],
+                            run_id=pj["run_id"],
+                            delta_tokens=pj["delta_tokens"],
+                            delta_cost=pj["delta_cost"]
+                        )
+                        conn.execute(
+                            "UPDATE reconciliation_journal SET status = 'completed', completed_at = ? WHERE journal_id = ?;",
+                            (time.time(), pj["journal_id"])
+                        )
+                    except Exception as drain_err:
+                        logging.warning("Error draining reconciliation journal %s: %s", pj["journal_id"], drain_err)
+        except Exception as j_err:
+            logging.warning("Error checking reconciliation journal: %s", j_err)
 
         conn.commit()
     return len(interrupted_ids)
@@ -2440,35 +2516,246 @@ def apply_rollback_reconciliation(
     }
 
 
+# =========================================================================
+# Phase 2.6: Production Readiness Helpers & Dual-Ledger Outbox
+# =========================================================================
+
+RESTORING_FILE_PATTERN = re.compile(r'^(?:.+)?\.restoring_[a-f0-9]{6,}$')
+
+def cleanup_abandoned_restore_staging(app_dir: str, max_age_seconds: float = 60.0) -> int:
+    """
+    Phase 2.6-B1: Safely cleans up orphaned temporary staging files (.restoring_*)
+    left by crashes during file restoration.
+    Constraints:
+    - Never deletes files outside verified app_dir.
+    - Never follows symlinks.
+    - Never removes active staging files (st_mtime younger than max_age_seconds).
+    - Never removes user files or files not matching the exact staging pattern.
+    - Safe to run repeatedly.
+    Returns integer count of unlinked abandoned files.
+    """
+    if not app_dir or not os.path.isdir(app_dir):
+        return 0
+
+    canonical_root = os.path.realpath(app_dir)
+    cleaned_count = 0
+    now = time.time()
+
+    try:
+        with os.scandir(canonical_root) as it:
+            for entry in it:
+                try:
+                    # Never follow symlinks
+                    if entry.is_symlink():
+                        continue
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    if not RESTORING_FILE_PATTERN.match(entry.name):
+                        continue
+
+                    # Verify canonical containment
+                    entry_real = os.path.realpath(entry.path)
+                    if os.path.commonpath([canonical_root, entry_real]) != canonical_root:
+                        continue
+
+                    # Check age: only remove if older than max_age_seconds
+                    st = entry.stat(follow_symlinks=False)
+                    if (now - st.st_mtime) >= max_age_seconds:
+                        try:
+                            os.remove(entry.path)
+                            cleaned_count += 1
+                            logging.info("Cleaned abandoned staging file: %s", entry.name)
+                        except OSError as oe:
+                            logging.warning("Failed to remove staging file %s: %s", entry.name, oe)
+                except (OSError, ValueError):
+                    continue
+    except Exception as scan_err:
+        logging.warning("Error scanning app_dir for staging cleanup: %s", scan_err)
+
+    return cleaned_count
+
+
+def _atomic_write_json_direct(filepath: str, data: Any):
+    """Atomically write JSON data with fsync durability before replace."""
+    tmp_path = f"{filepath}.tmp_{uuid.uuid4().hex[:6]}"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, filepath)
+
+
+def project_reconciliation_to_budget(
+    budget_path: str,
+    journal_id: str,
+    run_id: str,
+    delta_tokens: int,
+    delta_cost: float
+) -> Dict[str, Any]:
+    """
+    Phase 2.6-A2: Projects reconciliation delta into budget ledger idempotently.
+    Checks budget['transactions'] for ref_journal_id to prevent duplicate accounting.
+    Uses atomic persistence with fsync.
+    """
+    if not os.path.exists(budget_path):
+        default_data = {
+            "tokens_used": 0,
+            "estimated_cost": 0.0,
+            "budget_limit": 50.0,
+            "transactions": []
+        }
+        _atomic_write_json_direct(budget_path, default_data)
+
+    try:
+        with open(budget_path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+            budget = json.loads(content) if content else {}
+    except Exception as e:
+        raise IOError(f"Failed to read budget file at {budget_path}: {e}")
+
+    txs = budget.get("transactions", [])
+    # Idempotency check: if already applied to budget ledger, do not duplicate
+    for tx in txs:
+        if tx.get("ref_journal_id") == journal_id:
+            return {"projected": True, "already_applied": True, "budget": budget}
+
+    curr_tokens = budget.get("tokens_used", 0)
+    curr_cost = budget.get("estimated_cost", 0.0)
+
+    new_tokens = max(0, curr_tokens + delta_tokens)
+    new_cost = max(0.0, round(curr_cost + delta_cost, 4))
+
+    budget["tokens_used"] = new_tokens
+    budget["estimated_cost"] = new_cost
+
+    new_tx = {
+        "id": int(time.time() * 1000) + len(txs),
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "agent": "Financial Reconciler",
+        "department": "إدارة الميزانية والتدقيق",
+        "task": f"تسوية استهلاك {run_id}",
+        "tokens": delta_tokens,
+        "cost": round(delta_cost, 4),
+        "source": "provider_confirmed",
+        "ref_journal_id": journal_id,
+        "ref_run_id": run_id
+    }
+    txs.insert(0, new_tx)
+    budget["transactions"] = txs[:60]
+
+    _atomic_write_json_direct(budget_path, budget)
+    return {"projected": True, "already_applied": False, "budget": budget}
+
+
+def record_recovery_audit_event(
+    principal: str,
+    action: str,
+    target_id: str,
+    force_requested: bool,
+    authorized: bool,
+    outcome: str,
+    error_message: Optional[str] = None,
+    db_path: Optional[str] = None
+) -> str:
+    """
+    Phase 2.6-C: Durably records an audit event for recovery or administrative operations in SQLite.
+    Captures operator identity, action, target, authorization decision, outcome, and error.
+    Never logs secrets, API keys, or raw authentication tokens.
+    """
+    audit_id = f"aud_{uuid.uuid4().hex[:12]}"
+    now = time.time()
+    safe_error = sanitize_memory_content(error_message[:300]) if error_message else None
+    with get_db_connection(db_path) as conn:
+        conn.execute("""
+            INSERT INTO recovery_audit_log (
+                audit_id, timestamp, principal, action, target_id,
+                force_requested, authorized, outcome, error_message
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """, (
+            audit_id, now, principal or "anonymous", action, target_id,
+            1 if force_requested else 0,
+            1 if authorized else 0,
+            outcome, safe_error
+        ))
+        conn.commit()
+    return audit_id
+
+
 def reconcile_provider_run_usage(
     run_id: str,
     provider_lookup_fn: Optional[Any] = None,
-    db_path: Optional[str] = None
+    db_path: Optional[str] = None,
+    budget_path: Optional[str] = None,
+    failpoint: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Reconciles usage and billing for an agent run using authoritative provider lookup data.
+    Phase 2.6-A2: Reconciles usage and billing for an agent run using authoritative provider lookup data
+    and synchronizes the financial ledger via transactional outbox journal.
     Guarantees:
     - Never auto-replays generative model prompts.
     - Idempotent: repeated calls do not double-count or alter already-confirmed runs.
     - Preserves explicit provider-reported 0 tokens.
     - Rejects negative or malformed usage.
     - Reconciles tokens_used, token_source ('provider_confirmed'), reconciliation_status ('completed'/'unresolved'/'failed').
-    - Updates run and ledger under a durable transaction boundary.
+    - Updates SQLite agent_runs and outbox journal under a durable transaction boundary.
+    - Projects delta into budget.json idempotently; resumes incomplete outbox entries upon retry or restart.
     """
+    eff_budget_path = budget_path or os.environ.get("BUDGET_FILE_PATH") or os.environ.get("BUDGET_FILE") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "budget.json")
+
     with get_db_connection(db_path) as conn:
         cursor = conn.cursor()
         cursor.execute("PRAGMA table_info(agent_runs);")
         cols = {row[1] for row in cursor.fetchall()}
-        
+
+        j_table = cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reconciliation_journal';").fetchone()
+
         row = cursor.execute("SELECT * FROM agent_runs WHERE run_id = ?;", (run_id,)).fetchone()
         if not row:
             return {"success": False, "error": "Run not found", "run_id": run_id}
-        
+
         run_data = dict(row)
         rec_status = run_data.get("reconciliation_status") or "none"
 
-        # Idempotency check: if already completed, return existing verified data without re-accounting
-        if rec_status == "completed":
+        # Check for existing in-flight or completed outbox journal entry
+        journal_row = None
+        if j_table:
+            journal_row = cursor.execute(
+                "SELECT * FROM reconciliation_journal WHERE run_id = ? ORDER BY created_at DESC LIMIT 1;",
+                (run_id,)
+            ).fetchone()
+
+        # If outbox entry was committed to DB but budget projection was pending when process crashed:
+        if journal_row and journal_row["status"] == "applied_db":
+            proj = project_reconciliation_to_budget(
+                budget_path=eff_budget_path,
+                journal_id=journal_row["journal_id"],
+                run_id=run_id,
+                delta_tokens=journal_row["delta_tokens"],
+                delta_cost=journal_row["delta_cost"]
+            )
+            if failpoint == "after_budget_before_journal_complete":
+                raise IOError("Crash simulated after budget projection before journal completion")
+
+            conn.execute(
+                "UPDATE reconciliation_journal SET status = 'completed', completed_at = ? WHERE journal_id = ?;",
+                (time.time(), journal_row["journal_id"])
+            )
+            conn.commit()
+            return {
+                "success": True,
+                "already_reconciled": False,
+                "resumed_from_outbox": True,
+                "run_id": run_id,
+                "provider_request_id": journal_row["provider_request_id"],
+                "tokens_used": journal_row["target_tokens"],
+                "token_source": "provider_confirmed",
+                "reconciliation_status": "completed",
+                "cost": proj.get("budget", {}).get("estimated_cost"),
+                "message": "Authoritative provider usage successfully reconciled from persistent outbox."
+            }
+
+        # Idempotency check: if already completed and outbox is drained
+        if rec_status == "completed" and (not journal_row or journal_row["status"] == "completed"):
             return {
                 "success": True,
                 "already_reconciled": True,
@@ -2482,7 +2769,6 @@ def reconcile_provider_run_usage(
         provider_req_id = run_data.get("provider_request_id")
 
         if provider_lookup_fn is None:
-            # No lookup provider provided - mark unresolved and return limitation
             if "reconciliation_status" in cols:
                 conn.execute(
                     "UPDATE agent_runs SET reconciliation_status = 'unresolved' WHERE run_id = ?;",
@@ -2590,10 +2876,32 @@ def reconcile_provider_run_usage(
                 "error": f"Negative provider token value rejected: {confirmed_tokens}"
             }
 
-        # Valid confirmed tokens (including explicit 0)!
+        # Valid confirmed tokens
         resolved_req_id = lookup_result.get("provider_request_id") or provider_req_id
-        
-        # Atomically update agent_runs under durable transaction boundary
+
+        prior_tokens = run_data.get("tokens_used", 0)
+        delta_tokens = confirmed_tokens - prior_tokens
+        calc_cost = round((delta_tokens / 1_000_000.0) * 0.15, 6)
+        delta_cost = float(lookup_result.get("cost", calc_cost)) if lookup_result.get("cost") is not None else calc_cost
+        journal_id = f"rec_{run_id}_{confirmed_tokens}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+
+        if failpoint == "before_db_commit":
+            raise IOError("Crash simulated before SQLite commit")
+
+        # Concurrency safety: check if another thread reconciled this run while we performed lookup
+        current_run = conn.execute("SELECT tokens_used, token_source, reconciliation_status FROM agent_runs WHERE run_id = ?;", (run_id,)).fetchone()
+        if current_run and current_run["reconciliation_status"] == "completed":
+            return {
+                "success": True,
+                "already_reconciled": True,
+                "run_id": run_id,
+                "tokens_used": current_run["tokens_used"],
+                "token_source": current_run["token_source"],
+                "reconciliation_status": "completed",
+                "message": "Run usage was previously reconciled with authoritative provider data."
+            }
+
+        # Atomically update agent_runs AND record outbox journal in SQLite
         update_fields = [
             "tokens_used = ?",
             "token_source = 'provider_confirmed'",
@@ -2608,7 +2916,38 @@ def reconcile_provider_run_usage(
         params.append(run_id)
         sql = f"UPDATE agent_runs SET {', '.join(update_fields)} WHERE run_id = ?;"
         conn.execute(sql, params)
+
+        if j_table:
+            conn.execute("""
+                INSERT INTO reconciliation_journal (
+                    journal_id, run_id, target_tokens, delta_tokens, delta_cost,
+                    status, provider_request_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, 'applied_db', ?, ?);
+            """, (journal_id, run_id, confirmed_tokens, delta_tokens, delta_cost, resolved_req_id, time.time()))
+
         conn.commit()
+
+        if failpoint == "after_db_before_budget":
+            raise IOError("Crash simulated after DB commit before budget update")
+
+        # Project delta to budget ledger
+        project_reconciliation_to_budget(
+            budget_path=eff_budget_path,
+            journal_id=journal_id,
+            run_id=run_id,
+            delta_tokens=delta_tokens,
+            delta_cost=delta_cost
+        )
+
+        if failpoint == "after_budget_before_journal_complete":
+            raise IOError("Crash simulated after budget projection before journal completion")
+
+        if j_table:
+            conn.execute(
+                "UPDATE reconciliation_journal SET status = 'completed', completed_at = ? WHERE journal_id = ?;",
+                (time.time(), journal_id)
+            )
+            conn.commit()
 
         return {
             "success": True,
@@ -2617,6 +2956,8 @@ def reconcile_provider_run_usage(
             "tokens_used": confirmed_tokens,
             "token_source": "provider_confirmed",
             "reconciliation_status": "completed",
+            "delta_tokens": delta_tokens,
+            "delta_cost": delta_cost,
             "cost": lookup_result.get("cost"),
             "message": "Authoritative provider usage successfully reconciled."
         }

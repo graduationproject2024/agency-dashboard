@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import logging
 import hashlib
+import hmac
 from urllib.parse import urlparse
 from html.parser import HTMLParser
 from typing import Optional, Dict, Any, Tuple, List, Union
@@ -1431,12 +1432,13 @@ def get_last_agent_execution() -> Optional[Dict[str, Any]]:
     """Return the usage metadata from the most recent agent execution in the current thread."""
     return getattr(_last_agent_execution_ctx, "data", None)
 
-def set_last_agent_execution(tokens_used: int, token_source: str, provider: str = "unknown"):
+def set_last_agent_execution(tokens_used: int, token_source: str, provider: str = "unknown", provider_request_id: Optional[str] = None):
     """Durable in-memory record of provider usage metadata for orchestration layers."""
     _last_agent_execution_ctx.data = {
         "tokens_used": max(int(tokens_used), 0),
         "token_source": token_source,
-        "provider": provider
+        "provider": provider,
+        "provider_request_id": provider_request_id
     }
 
 def call_agent_gemini(system_prompt, full_prompt, api_key, role_name, preferred_model='gemini-3.5-flash-lite'):
@@ -1475,8 +1477,10 @@ def call_agent_gemini(system_prompt, full_prompt, api_key, role_name, preferred_
                 with state_lock:
                     task_name = workflow_state.get('current_task', 'تطبيق ويب')
                 
+                # Phase 2.6-A1: Extract genuine provider request ID from HTTP headers or payload
+                provider_req_id = res.headers.get('x-goog-request-id') or res.headers.get('x-request-id') or res_json.get('id')
                 source_tag = "provider_reported" if is_reported else "estimated"
-                set_last_agent_execution(token_count, source_tag, "gemini")
+                set_last_agent_execution(token_count, source_tag, "gemini", provider_request_id=provider_req_id)
 
                 # Record token usage ONCE with source tag
                 record_token_usage(
@@ -1607,6 +1611,8 @@ def call_agent(agent_file, role_name, short_name, color, prompt, context_text=""
             else:
                 reply = res_json['choices'][0]['message']['content']
                 usage = res_json.get('usage', {})
+                # Phase 2.6-A1: Extract genuine provider request ID from OpenRouter response
+                provider_req_id = res_json.get('id') or res.headers.get('x-request-id')
                 if 'total_tokens' in usage:
                     try:
                         tok_cnt = max(0, int(usage.get('total_tokens') or 0))
@@ -1615,7 +1621,7 @@ def call_agent(agent_file, role_name, short_name, color, prompt, context_text=""
                     with state_lock:
                         cur_task = workflow_state.get('current_task', 'مهمة برمجية')
                     record_token_usage(role_name, short_name, cur_task, tok_cnt, source="provider_reported")
-                    set_last_agent_execution(tok_cnt, "provider_reported", "openrouter")
+                    set_last_agent_execution(tok_cnt, "provider_reported", "openrouter", provider_request_id=provider_req_id)
                     tokens_recorded = True
 
         # If not recorded yet, calculate estimated tokens and record ONCE
@@ -1624,7 +1630,7 @@ def call_agent(agent_file, role_name, short_name, color, prompt, context_text=""
             with state_lock:
                 cur_task = workflow_state.get('current_task', 'مهمة برمجية')
             record_token_usage(role_name, short_name, cur_task, tokens_est, source="estimated")
-            set_last_agent_execution(tokens_est, "estimated", provider)
+            set_last_agent_execution(tokens_est, "estimated", provider, provider_request_id=None)
             
         add_feed(role_name, role_name, color, short_name, "أنهيت عملي. المخرجات متوفرة الآن.")
         
@@ -3052,6 +3058,58 @@ def is_valid_session_id(session_id: str) -> bool:
     """Validate that session_id contains only safe alphanumeric characters, hyphens, or underscores (1-64 chars)."""
     return bool(session_id and isinstance(session_id, str) and SESSION_ID_REGEX.match(session_id))
 
+RUN_ID_REGEX = re.compile(r'^[a-zA-Z0-9_\-]{1,64}$')
+
+def is_valid_run_id(run_id: Any) -> bool:
+    """
+    Phase 2.6-B2: Validate that run_id contains only safe alphanumeric characters,
+    hyphens, or underscores (1-64 chars). Guards against traversal and injection.
+    """
+    return bool(run_id and isinstance(run_id, str) and RUN_ID_REGEX.match(run_id))
+
+def authenticate_operator(req, require_admin: bool = False) -> Tuple[bool, Optional[str], Optional[str]]:
+    """
+    Phase 2.6-C: Authenticate operator identity and authorize recovery actions.
+    Credentials configured via environment variables or settings:
+      OPERATOR_AUTH_TOKEN
+      ADMIN_AUTH_TOKEN
+    Fails closed if credentials are absent or invalid.
+    Returns (is_authorized, principal, error_message).
+    """
+    settings = load_settings()
+    env_op = os.environ.get("OPERATOR_AUTH_TOKEN")
+    env_admin = os.environ.get("ADMIN_AUTH_TOKEN")
+    sett_op = settings.get("operator_auth_token")
+    sett_admin = settings.get("admin_auth_token")
+
+    op_token = env_op or sett_op
+    admin_token = env_admin or sett_admin
+
+    auth_header = req.headers.get("Authorization", "")
+    token = None
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:].strip()
+    if not token:
+        token = req.headers.get("X-Operator-Token") or req.headers.get("X-Admin-Token")
+
+    if not token:
+        return False, None, "Missing operator authentication credentials"
+
+    if not op_token and not admin_token:
+        return False, None, "Operator authentication is not configured on this server"
+
+    is_admin = bool(admin_token and hmac.compare_digest(token, admin_token))
+    is_operator = bool(op_token and hmac.compare_digest(token, op_token))
+
+    if not is_admin and not is_operator:
+        return False, None, "Invalid operator authentication credentials"
+
+    if require_admin and not is_admin:
+        return False, "operator", "Elevated administrator privileges required for this operation"
+
+    principal = "admin" if is_admin else "operator"
+    return True, principal, None
+
 @app.route('/api/sessions', methods=['GET'])
 def list_sessions():
     """List recent persistent workflow sessions."""
@@ -3137,28 +3195,57 @@ def preview_rollback_reconciliation_endpoint(session_id):
 @app.route('/api/sessions/<session_id>/reconcile_rollback/apply', methods=['POST'])
 def apply_rollback_reconciliation_endpoint(session_id):
     """
-    Authorized execution of incomplete rollback reconciliation.
-    Strictly validates origin, prevents concurrent execution, and refuses automatic
-    overwrite if newer user edits or conflicts are detected (unless force=True).
+    Phase 2.6-C: Authorized execution of incomplete rollback reconciliation.
+    Strictly validates origin, authenticates operator, prevents concurrent execution,
+    requires elevated admin privileges for force=True, and refuses automatic overwrite
+    if newer user edits or conflicts are detected.
+    Records all authorization attempts and outcomes to durable recovery audit log.
     """
     if not is_safe_origin(request):
         return jsonify({"error": "Forbidden: Invalid origin"}), 403
     if not is_valid_session_id(session_id):
         return jsonify({"error": "Invalid session identifier format"}), 400
-    session = db_store.get_session(session_id)
-    if not session:
-        return jsonify({"error": "Session not found", "session_id": session_id}), 404
 
     data = request.get_json(silent=True) or {}
     recovery_ids = data.get("recovery_ids")
     operator_action = data.get("operator_action", "restore_safe")
     force = bool(data.get("force", False))
 
+    # Authenticate and Authorize operator before any state mutation
+    is_auth, principal, auth_err = authenticate_operator(request, require_admin=force)
+    if not is_auth:
+        status_code = 403 if principal == "operator" else 401
+        db_store.record_recovery_audit_event(
+            principal=principal or "anonymous",
+            action="reconcile_rollback_apply",
+            target_id=session_id,
+            force_requested=force,
+            authorized=False,
+            outcome="denied",
+            error_message=auth_err
+        )
+        return jsonify({"error": auth_err}), status_code
+
+    session = db_store.get_session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found", "session_id": session_id}), 404
+
     res = db_store.apply_rollback_reconciliation(
         session_id=session_id,
         recovery_ids=recovery_ids,
         operator_action=operator_action,
         force=force
+    )
+
+    outcome = "success" if res.get("success") else ("conflicted" if res.get("conflicts_count", 0) > 0 else "failed")
+    db_store.record_recovery_audit_event(
+        principal=principal or "unknown",
+        action="reconcile_rollback_apply",
+        target_id=session_id,
+        force_requested=force,
+        authorized=True,
+        outcome=outcome,
+        error_message=res.get("error")
     )
 
     if not res.get("success"):
@@ -3174,12 +3261,28 @@ def apply_rollback_reconciliation_endpoint(session_id):
 @app.route('/api/runs/<run_id>/reconcile_usage', methods=['POST'])
 def reconcile_run_usage_endpoint(run_id):
     """
-    Reconciles an agent run using authoritative provider usage/billing data.
+    Phase 2.6-A2 & C: Reconciles an agent run using authoritative provider usage/billing data.
+    Enforces safe origin, run ID regex validation, operator authentication,
+    and durable transactional outbox projection to budget.json.
     """
     if not is_safe_origin(request):
         return jsonify({"error": "Forbidden: Invalid origin"}), 403
-    if not run_id or not isinstance(run_id, str):
-        return jsonify({"error": "Invalid run identifier"}), 400
+    if not is_valid_run_id(run_id):
+        return jsonify({"error": "Invalid run identifier format"}), 400
+
+    # Authenticate operator before write
+    is_auth, principal, auth_err = authenticate_operator(request, require_admin=False)
+    if not is_auth:
+        db_store.record_recovery_audit_event(
+            principal=principal or "anonymous",
+            action="reconcile_usage",
+            target_id=run_id,
+            force_requested=False,
+            authorized=False,
+            outcome="denied",
+            error_message=auth_err
+        )
+        return jsonify({"error": auth_err}), 401
 
     data = request.get_json(silent=True) or {}
     provider_tokens = data.get("provider_tokens")
@@ -3197,7 +3300,23 @@ def reconcile_run_usage_endpoint(run_id):
             }
         lookup_fn = _authoritative_lookup
 
-    res = db_store.reconcile_provider_run_usage(run_id, provider_lookup_fn=lookup_fn)
+    res = db_store.reconcile_provider_run_usage(
+        run_id,
+        provider_lookup_fn=lookup_fn,
+        budget_path=BUDGET_FILE
+    )
+
+    outcome = "success" if res.get("success") else ("unresolved" if res.get("reconciliation_status") == "unresolved" else "failed")
+    db_store.record_recovery_audit_event(
+        principal=principal or "unknown",
+        action="reconcile_usage",
+        target_id=run_id,
+        force_requested=False,
+        authorized=True,
+        outcome=outcome,
+        error_message=res.get("error")
+    )
+
     if not res.get("success"):
         return jsonify(res), 400
     return jsonify(res)

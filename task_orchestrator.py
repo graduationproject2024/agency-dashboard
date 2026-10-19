@@ -486,14 +486,18 @@ def execute_single_task(
         # Propagate provider usage metadata if returned directly or via provider execution context
         tokens_used = None
         token_source = "estimated"
+        provider_request_id = None
         if isinstance(output_res, tuple) and len(output_res) >= 3:
             output = output_res[0]
             tokens_used = output_res[1]
             token_source = output_res[2]
+            if len(output_res) >= 4:
+                provider_request_id = output_res[3]
         elif isinstance(output_res, dict) and "output" in output_res:
             output = output_res["output"]
             tokens_used = output_res.get("tokens_used")
             token_source = output_res.get("token_source")
+            provider_request_id = output_res.get("provider_request_id")
             if token_source is None:
                 token_source = "provider_reported" if tokens_used is not None else "estimated"
         else:
@@ -504,6 +508,7 @@ def execute_single_task(
                 if meta and meta.get("tokens_used") is not None:
                     tokens_used = meta["tokens_used"]
                     token_source = meta.get("token_source", "provider_reported")
+                    provider_request_id = meta.get("provider_request_id")
             except Exception:
                 pass
         
@@ -525,6 +530,7 @@ def execute_single_task(
             output_text=output,
             tokens_used=tokens_used,
             token_source=token_source,
+            provider_request_id=provider_request_id,
             input_preview=full_context[:400],
             output_preview=output[:400],
             db_path=db_path
