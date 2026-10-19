@@ -851,6 +851,11 @@ def complete_task_with_agent_run(
     if not output_text or not str(output_text).strip():
         raise ValueError(f"Cannot mark task {task_id} completed without valid non-empty output_text.")
 
+    try:
+        tokens_used = max(0, int(tokens_used or 0))
+    except (ValueError, TypeError):
+        tokens_used = 0
+
     now = time.time()
     safe_input = sanitize_memory_content(input_preview[:500]) if input_preview else None
     effective_out_prev = output_preview or output_text
@@ -867,6 +872,15 @@ def complete_task_with_agent_run(
             WHERE task_id = ? AND session_id = ? AND status = 'running'
             ORDER BY started_at DESC LIMIT 1;
         """, (task_id, session_id)).fetchone()
+
+        # Check if a completed run already exists for this task to avoid duplicate run rows on repeated callbacks
+        existing_completed_run = None
+        if not existing_run:
+            existing_completed_run = cursor.execute("""
+                SELECT run_id FROM agent_runs 
+                WHERE task_id = ? AND session_id = ? AND status = 'completed'
+                ORDER BY finished_at DESC LIMIT 1;
+            """, (task_id, session_id)).fetchone()
 
         cursor.execute("PRAGMA table_info(agent_runs);")
         cols = {row[1] for row in cursor.fetchall()}
@@ -890,6 +904,29 @@ def complete_task_with_agent_run(
                     UPDATE agent_runs
                     SET status = 'completed',
                         input_preview = COALESCE(?, input_preview),
+                        output_preview = ?,
+                        tokens_used = ?,
+                        finished_at = ?,
+                        error_message = ?
+                    WHERE run_id = ?;
+                """, (safe_input, safe_output, tokens_used, now, safe_error, run_id))
+        elif existing_completed_run:
+            run_id = existing_completed_run["run_id"]
+            if "token_source" in cols:
+                cursor.execute("""
+                    UPDATE agent_runs
+                    SET input_preview = COALESCE(?, input_preview),
+                        output_preview = ?,
+                        tokens_used = ?,
+                        token_source = ?,
+                        finished_at = ?,
+                        error_message = ?
+                    WHERE run_id = ?;
+                """, (safe_input, safe_output, tokens_used, token_source, now, safe_error, run_id))
+            else:
+                cursor.execute("""
+                    UPDATE agent_runs
+                    SET input_preview = COALESCE(?, input_preview),
                         output_preview = ?,
                         tokens_used = ?,
                         finished_at = ?,

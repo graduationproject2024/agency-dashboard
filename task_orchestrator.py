@@ -493,13 +493,15 @@ def execute_single_task(
         elif isinstance(output_res, dict) and "output" in output_res:
             output = output_res["output"]
             tokens_used = output_res.get("tokens_used")
-            token_source = output_res.get("token_source", "estimated")
+            token_source = output_res.get("token_source")
+            if token_source is None:
+                token_source = "provider_reported" if tokens_used is not None else "estimated"
         else:
             output = output_res
             try:
                 from app import get_last_agent_execution
                 meta = get_last_agent_execution()
-                if meta and meta.get("tokens_used"):
+                if meta and meta.get("tokens_used") is not None:
                     tokens_used = meta["tokens_used"]
                     token_source = meta.get("token_source", "provider_reported")
             except Exception:

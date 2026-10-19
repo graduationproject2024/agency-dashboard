@@ -2052,11 +2052,29 @@ def build_artifact_manifest(
             raise ValueError(f"Invalid artifact relative path: {rel_path!r}")
         
         # Normalize and inspect path
+        if not rel_path or not isinstance(rel_path, str) or "\0" in rel_path:
+            raise ValueError(f"Invalid artifact relative path: {rel_path!r}")
+
         norm_path = os.path.normpath(rel_path).replace("\\", "/")
-        if os.path.isabs(norm_path) or norm_path.startswith("/") or "\0" in norm_path:
-            raise ValueError(f"Unsafe artifact path (absolute or null byte): {rel_path}")
-        if norm_path.startswith("../") or "/../" in norm_path or norm_path == "..":
+        if (os.path.isabs(norm_path) or norm_path.startswith("/") or
+                rel_path.startswith("\\\\") or rel_path.startswith("//") or norm_path.startswith("//")):
+            raise ValueError(f"Unsafe artifact path (absolute or UNC): {rel_path}")
+        if ":" in norm_path or ":" in rel_path:
+            raise ValueError(f"Unsafe artifact path (drive escape or alternate stream): {rel_path}")
+        if (norm_path == ".." or norm_path.startswith("../") or 
+                "/../" in norm_path or norm_path.endswith("/..")):
             raise ValueError(f"Path traversal detected in artifact manifest: {rel_path}")
+
+        # Reject Windows reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
+        reserved_devices = {
+            "CON", "PRN", "AUX", "NUL",
+            "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+            "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
+        }
+        for segment in norm_path.split("/"):
+            base_part = segment.split(".")[0].upper()
+            if base_part in reserved_devices:
+                raise ValueError(f"Unsafe artifact path (reserved device name): {rel_path}")
         
         content = candidate_files[rel_path]
         if isinstance(content, str):
@@ -2169,6 +2187,7 @@ def run_qa_checks(app_html, app_css="", app_js=""):
     traversal_patterns = [
         (re.compile(r'(?:src|href|action)\s*=\s*["\']\s*(?:\.\.[/\\]|[/\\]\.\.[/\\])', re.IGNORECASE), "Path traversal reference detected in HTML asset links"),
         (re.compile(r'(?:src|href|action)\s*=\s*["\']\s*file:', re.IGNORECASE), "Disallowed file:// protocol reference detected in HTML"),
+        (re.compile(r'(?:src|href|action)\s*=\s*["\']\s*(?:(?:javascript|vbscript):|data:\s*text/html)', re.IGNORECASE), "Disallowed dangerous URL scheme detected in HTML attributes"),
         (re.compile(r'@import\s+["\'](?:\.\.[/\\]|[/\\]\.\.[/\\])', re.IGNORECASE), "Path traversal detected in CSS @import"),
     ]
     for pat, desc in traversal_patterns:
@@ -2724,7 +2743,10 @@ def continue_workflow(feedback="", session_id=None, call_agent_fn=None):
                     candidate_code={"html": app_html, "css": app_css, "js": app_js},
                     attempt_num=remediation_count
                 )
-                db_store.claim_task(rem_task_id)
+                claimed = db_store.claim_task(rem_task_id)
+                if not claimed:
+                    add_feed("مهندس الجودة", "QA Auditor", "orange", "CLAIM", f"تنبيه: مهمة المعالجة {rem_task_id} قيد التنفيذ أو تم حجزها بالفعل من قبل عامل آخر.")
+                    break
                 rem_task = db_store.get_task(rem_task_id)
                 session_obj = db_store.get_session(session_id)
                 
@@ -2749,21 +2771,28 @@ def continue_workflow(feedback="", session_id=None, call_agent_fn=None):
                     if j_m:
                         app_js = "\n\n".join([j.strip() for j in j_m if j.strip()])
                     
-                    app_html = inject_asset_links(app_html, app_css, app_js)
-                    qa_report = run_qa_checks(app_html, app_css, app_js)
+                    if not h_m and not c_m and not j_m:
+                        qa_report["errors"].append(f"Remediation agent returned no parseable code blocks (attempt {remediation_count})")
+                    else:
+                        app_html = inject_asset_links(app_html, app_css, app_js)
+                        qa_report = run_qa_checks(app_html, app_css, app_js)
+                        with state_lock:
+                            workflow_state["qa_report"] = qa_report
+                            workflow_state["outputs"]["development"] = rem_output
+                            
+                        if qa_report["passed"]:
+                            add_feed("مهندس الجودة", "QA Auditor", "linear-gradient(135deg, #11998e, #38ef7d)", "HEALED", f"✅ نجحت دورة المعالجة الذاتية (محاولة {remediation_count}) وتجاوز الكود كافة الفحوصات!")
+                            sess_obj = db_store.get_session(session_id)
+                            proj_name = sess_obj.get("project_name") or str(cur_task)[:40].strip() if sess_obj else str(cur_task)[:40].strip()
+                            success_content = "All structural and syntax defects were successfully resolved by self-healing."
+                            db_store.add_project_memory(proj_name, session_id, "qa_finding", f"QA_Remediation_Success_{remediation_count}", success_content, "engineering-senior-developer")
+                            if cur_task != proj_name:
+                                db_store.add_project_memory(cur_task, session_id, "qa_finding", f"QA_Remediation_Success_{remediation_count}", success_content, "engineering-senior-developer")
+                            break
+                else:
+                    qa_report["errors"].append(f"Remediation execution failed (attempt {remediation_count}): {rem_err or 'unknown error'}")
                     with state_lock:
                         workflow_state["qa_report"] = qa_report
-                        workflow_state["outputs"]["development"] = rem_output
-                        
-                    if qa_report["passed"]:
-                        add_feed("مهندس الجودة", "QA Auditor", "linear-gradient(135deg, #11998e, #38ef7d)", "HEALED", f"✅ نجحت دورة المعالجة الذاتية (محاولة {remediation_count}) وتجاوز الكود كافة الفحوصات!")
-                        sess_obj = db_store.get_session(session_id)
-                        proj_name = sess_obj.get("project_name") or str(cur_task)[:40].strip() if sess_obj else str(cur_task)[:40].strip()
-                        success_content = "All structural and syntax defects were successfully resolved by self-healing."
-                        db_store.add_project_memory(proj_name, session_id, "qa_finding", f"QA_Remediation_Success_{remediation_count}", success_content, "engineering-senior-developer")
-                        if cur_task != proj_name:
-                            db_store.add_project_memory(cur_task, session_id, "qa_finding", f"QA_Remediation_Success_{remediation_count}", success_content, "engineering-senior-developer")
-                        break
 
         # If still failing after bounded retries, fail closed!
         if not qa_report["passed"]:
@@ -2819,10 +2848,6 @@ def continue_workflow(feedback="", session_id=None, call_agent_fn=None):
         delivery_id = pub_result.get("delivery_id")
         qa_run_id = pub_result.get("qa_run_id")
 
-        add_feed("مدير المشروع", "Project Manager", "linear-gradient(135deg, #f6d365, #fda085)", "PM", f"تم اكتمال المشروع وتجاوز فحص الجودة بنجاح! 🚀 المجلد: `{clean_folder_name}`")
-        
-        with state_lock:
-            workflow_state["status"] = "completed"
         if session_id:
             try:
                 # Durably record artifact manifest in database
@@ -2865,7 +2890,18 @@ def continue_workflow(feedback="", session_id=None, call_agent_fn=None):
                 db_store.save_session_checkpoint(session_id, "delivery_completed", state_snap)
                 db_store.update_session_status(session_id, "completed", checkpoint_step="delivery_completed")
             except Exception as pe:
-                logging.warning("Delivery completion persistence warning: %s", pe)
+                logging.error("Delivery completion persistence failed, rolling back files: %s", pe)
+                for fpath in written_files:
+                    try:
+                        if os.path.exists(fpath):
+                            os.remove(fpath)
+                    except Exception as rb_e:
+                        logging.warning("Rollback file removal error for %s: %s", fpath, rb_e)
+                raise IOError(f"Database delivery persistence failed: {pe}") from pe
+
+        with state_lock:
+            workflow_state["status"] = "completed"
+        add_feed("مدير المشروع", "Project Manager", "linear-gradient(135deg, #f6d365, #fda085)", "PM", f"تم اكتمال المشروع وتجاوز فحص الجودة بنجاح! 🚀 المجلد: `{clean_folder_name}`")
         update_stats()
         
     except Exception as e:
@@ -3076,7 +3112,7 @@ def resume_session(session_id):
     elif cp_step in ("engineering_completed", "engineering_started", "post_prd_running", "development", "qa", "animation", "seo"):
         data = request.get_json(silent=True) or {}
         feedback = str(data.get('feedback', '')).strip()
-        threading.Thread(target=continue_workflow, args=(feedback,), daemon=True).start()
+        threading.Thread(target=continue_workflow, args=(feedback,), kwargs={"session_id": session_id}, daemon=True).start()
         return jsonify({
             "message": f"Session resumed successfully from {cp_step}",
             "session_id": session_id,

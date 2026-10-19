@@ -697,14 +697,15 @@ button { background: #38bdf8; color: #0f172a; font-weight: bold; border: none; p
                 # 3. Send keyboard Space jump action
                 page.keyboard.press("Space")
                 page.wait_for_function(f"parseInt(document.getElementById('score-display').innerText) > {score_before_jump}", timeout=3000)
-                assert int(page.locator("#score-display").inner_text()) > score_before_jump
+                score_after_jump = int(page.locator("#score-display").inner_text())
+                assert score_after_jump > score_before_jump
 
                 # 4. Click Restart and assert reset
                 page.locator("#btn-restart").click()
-                time.sleep(0.1)
+                time.sleep(0.05)
                 # The game ticks immediately but score was reset
                 current_score = int(page.locator("#score-display").inner_text())
-                assert current_score < score_before_jump
+                assert current_score < score_after_jump
 
                 # 5. Zero errors
                 assert len(page_errors) == 0, f"Page errors: {page_errors}"
