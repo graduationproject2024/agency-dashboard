@@ -1291,7 +1291,10 @@ def record_token_usage(agent_name, dept_name, task_name, tokens_count, source="p
     """
     with budget_lock:
         budget = load_budget()
-        tokens_count = max(int(tokens_count), 0)
+        try:
+            tokens_count = max(int(tokens_count or 0), 0)
+        except (ValueError, TypeError):
+            tokens_count = 0
         budget["tokens_used"] = budget.get("tokens_used", 0) + tokens_count
         
         # Gemini Flash token pricing estimate: ~$0.15 per 1M tokens
@@ -1458,10 +1461,16 @@ def call_agent_gemini(system_prompt, full_prompt, api_key, role_name, preferred_
             res_json = res.json()
             if 'error' not in res_json and 'candidates' in res_json and len(res_json['candidates']) > 0:
                 reply = res_json['candidates'][0]['content']['parts'][0]['text']
-                token_count = res_json.get('usageMetadata', {}).get('totalTokenCount', 0)
-                is_reported = bool(token_count)
-                if not token_count:
+                usage_meta = res_json.get('usageMetadata', {})
+                if 'totalTokenCount' in usage_meta:
+                    try:
+                        token_count = max(0, int(usage_meta['totalTokenCount'] or 0))
+                    except (ValueError, TypeError):
+                        token_count = 0
+                    is_reported = True
+                else:
                     token_count = max(1, (len(system_prompt or "") + len(full_prompt or "") + len(reply or "")) // 4)
+                    is_reported = False
                 
                 with state_lock:
                     task_name = workflow_state.get('current_task', 'تطبيق ويب')
@@ -1598,8 +1607,11 @@ def call_agent(agent_file, role_name, short_name, color, prompt, context_text=""
             else:
                 reply = res_json['choices'][0]['message']['content']
                 usage = res_json.get('usage', {})
-                tok_cnt = usage.get('total_tokens')
-                if tok_cnt:
+                if 'total_tokens' in usage:
+                    try:
+                        tok_cnt = max(0, int(usage.get('total_tokens') or 0))
+                    except (ValueError, TypeError):
+                        tok_cnt = 0
                     with state_lock:
                         cur_task = workflow_state.get('current_task', 'مهمة برمجية')
                     record_token_usage(role_name, short_name, cur_task, tok_cnt, source="provider_reported")
@@ -2045,17 +2057,22 @@ def build_artifact_manifest(
     Computes exact byte size, SHA-256 digest, and artifact type for each file.
     """
     manifest_items = []
+    seen_paths_lower = set()
+    MAX_ARTIFACT_SIZE = 25 * 1024 * 1024  # 25 MB max per artifact
     
     # Sort files deterministically by relative path
     for rel_path in sorted(candidate_files.keys()):
-        if not rel_path or not isinstance(rel_path, str):
-            raise ValueError(f"Invalid artifact relative path: {rel_path!r}")
-        
-        # Normalize and inspect path
         if not rel_path or not isinstance(rel_path, str) or "\0" in rel_path:
             raise ValueError(f"Invalid artifact relative path: {rel_path!r}")
+        
+        import unicodedata
+        norm_unicode = unicodedata.normalize("NFC", rel_path)
+        norm_path = os.path.normpath(norm_unicode).replace("\\", "/")
+        lower_path = norm_path.lower()
+        if lower_path in seen_paths_lower:
+            raise ValueError(f"Case-insensitive or Unicode normalization artifact collision: {rel_path}")
+        seen_paths_lower.add(lower_path)
 
-        norm_path = os.path.normpath(rel_path).replace("\\", "/")
         if (os.path.isabs(norm_path) or norm_path.startswith("/") or
                 rel_path.startswith("\\\\") or rel_path.startswith("//") or norm_path.startswith("//")):
             raise ValueError(f"Unsafe artifact path (absolute or UNC): {rel_path}")
@@ -2084,8 +2101,11 @@ def build_artifact_manifest(
         else:
             raise ValueError(f"Artifact content for {rel_path} must be str or bytes, got {type(content)}")
         
-        sha256_hash = hashlib.sha256(content_bytes).hexdigest()
         file_size = len(content_bytes)
+        if file_size > MAX_ARTIFACT_SIZE:
+            raise ValueError(f"Artifact {rel_path} exceeds maximum allowed size ({file_size} > {MAX_ARTIFACT_SIZE} bytes)")
+        
+        sha256_hash = hashlib.sha256(content_bytes).hexdigest()
         
         ext = os.path.splitext(norm_path)[1].lower()
         if ext == ".html":
@@ -2332,7 +2352,8 @@ def publish_workflow_deliverables(
     validated_js: str,
     qa_report: dict,
     workflow_outputs: dict,
-    failpoint: Optional[str] = None
+    failpoint: Optional[str] = None,
+    defer_backup_cleanup: bool = False
 ) -> Dict[str, Any]:
     """
     Real application publication and promotion transaction boundary.
@@ -2513,8 +2534,9 @@ def publish_workflow_deliverables(
             raise IOError(f"Persistence error: {persist_err}; Rollback errors: {'; '.join(rollback_failures)}") from persist_err
         raise persist_err
 
-    # Clean up backup files on success
-    cleanup_backups(pre_existing_backups)
+    # Clean up backup files on success unless deferred across SQLite persistence boundary
+    if not defer_backup_cleanup:
+        cleanup_backups(pre_existing_backups)
 
     if failpoint == "after_promotion_before_workflow_record":
         raise IOError("Simulated failure after promotion but before workflow records success")
@@ -2525,7 +2547,8 @@ def publish_workflow_deliverables(
         "qa_run_id": qa_run_id,
         "manifest": final_manifest,
         "files": written_files,
-        "expected_artifacts": expected_artifacts
+        "expected_artifacts": expected_artifacts,
+        "pre_existing_backups": pre_existing_backups
     }
 
 
@@ -2841,12 +2864,14 @@ def continue_workflow(feedback="", session_id=None, call_agent_fn=None):
             validated_js=validated_js,
             qa_report=qa_report,
             workflow_outputs=workflow_state.get('outputs', {}),
-            failpoint=failpoint
+            failpoint=failpoint,
+            defer_backup_cleanup=True
         )
         expected_artifacts = pub_result["expected_artifacts"]
         written_files = pub_result["files"]
         delivery_id = pub_result.get("delivery_id")
         qa_run_id = pub_result.get("qa_run_id")
+        pre_existing_backups = pub_result.get("pre_existing_backups", {})
 
         if session_id:
             try:
@@ -2889,15 +2914,23 @@ def continue_workflow(feedback="", session_id=None, call_agent_fn=None):
                     state_snap = copy.deepcopy(workflow_state)
                 db_store.save_session_checkpoint(session_id, "delivery_completed", state_snap)
                 db_store.update_session_status(session_id, "completed", checkpoint_step="delivery_completed")
+                cleanup_backups(pre_existing_backups)
             except Exception as pe:
-                logging.error("Delivery completion persistence failed, rolling back files: %s", pe)
+                logging.error("Delivery completion persistence failed, restoring pre-existing backups and rolling back files: %s", pe)
                 for fpath in written_files:
                     try:
-                        if os.path.exists(fpath):
+                        if fpath in pre_existing_backups:
+                            bak_path = pre_existing_backups[fpath]
+                            if os.path.exists(bak_path):
+                                os.replace(bak_path, fpath)
+                        elif os.path.exists(fpath):
                             os.remove(fpath)
                     except Exception as rb_e:
-                        logging.warning("Rollback file removal error for %s: %s", fpath, rb_e)
+                        logging.warning("Rollback file restoration/removal error for %s: %s", fpath, rb_e)
+                cleanup_backups(pre_existing_backups)
                 raise IOError(f"Database delivery persistence failed: {pe}") from pe
+        else:
+            cleanup_backups(pre_existing_backups)
 
         with state_lock:
             workflow_state["status"] = "completed"
@@ -2966,6 +2999,12 @@ def get_state():
             state_copy["persistence_error"] = str(e)
     return jsonify(state_copy)
 
+SESSION_ID_REGEX = re.compile(r'^[a-zA-Z0-9_\-]{1,64}$')
+
+def is_valid_session_id(session_id: str) -> bool:
+    """Validate that session_id contains only safe alphanumeric characters, hyphens, or underscores (1-64 chars)."""
+    return bool(session_id and isinstance(session_id, str) and SESSION_ID_REGEX.match(session_id))
+
 @app.route('/api/sessions', methods=['GET'])
 def list_sessions():
     """List recent persistent workflow sessions."""
@@ -2976,6 +3015,8 @@ def list_sessions():
 @app.route('/api/sessions/<session_id>', methods=['GET'])
 def get_session_detail(session_id):
     """Retrieve full detail for a single workflow session."""
+    if not is_valid_session_id(session_id):
+        return jsonify({"error": "Invalid session identifier format"}), 400
     session = db_store.get_session(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
@@ -2992,6 +3033,8 @@ def get_session_detail(session_id):
 @app.route('/api/sessions/<session_id>/tasks', methods=['GET'])
 def get_session_tasks(session_id):
     """Retrieve all structured tasks for a workflow session."""
+    if not is_valid_session_id(session_id):
+        return jsonify({"error": "Invalid session identifier format"}), 400
     session = db_store.get_session(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
@@ -3001,6 +3044,8 @@ def get_session_tasks(session_id):
 @app.route('/api/sessions/<session_id>/handoffs', methods=['GET'])
 def get_session_handoffs(session_id):
     """Retrieve all agent-to-agent collaboration handoffs."""
+    if not is_valid_session_id(session_id):
+        return jsonify({"error": "Invalid session identifier format"}), 400
     session = db_store.get_session(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
@@ -3010,6 +3055,8 @@ def get_session_handoffs(session_id):
 @app.route('/api/sessions/<session_id>/manifest', methods=['GET'])
 def get_session_manifest(session_id):
     """Retrieve verified deliverable artifact manifest entries for a session."""
+    if not is_valid_session_id(session_id):
+        return jsonify({"error": "Invalid session identifier format"}), 400
     session = db_store.get_session(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
@@ -3019,6 +3066,8 @@ def get_session_manifest(session_id):
 @app.route('/api/sessions/<session_id>/audit', methods=['GET'])
 def get_session_operator_audit(session_id):
     """Retrieve full operator-facing diagnostic audit report for a workflow session."""
+    if not is_valid_session_id(session_id):
+        return jsonify({"error": "Invalid session identifier format"}), 400
     audit_report = db_store.get_operator_session_audit(session_id)
     if not audit_report or not audit_report.get("session"):
         return jsonify({"error": "Session not found", "session_id": session_id}), 404
@@ -3037,6 +3086,8 @@ def cancel_session(session_id):
     """Manually cancel a running or paused workflow session."""
     if not is_safe_origin(request):
         return jsonify({"error": "Forbidden: Invalid origin"}), 403
+    if not is_valid_session_id(session_id):
+        return jsonify({"error": "Invalid session identifier format"}), 400
     session = db_store.get_session(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
@@ -3060,6 +3111,8 @@ def resume_session(session_id):
     """Resume an interrupted or waiting workflow session from its last verified checkpoint."""
     if not is_safe_origin(request):
         return jsonify({"error": "Forbidden: Invalid origin"}), 403
+    if not is_valid_session_id(session_id):
+        return jsonify({"error": "Invalid session identifier format"}), 400
     session = db_store.get_session(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
@@ -3081,9 +3134,9 @@ def resume_session(session_id):
         if workflow_state.get("status") == "running" and workflow_state.get("session_id") != session_id:
             return jsonify({"error": "Another workflow is currently running"}), 409
 
-    # Atomically lock session in SQLite if it was interrupted or failed to coordinate workers
-    if session["status"] in ("interrupted", "failed"):
-        locked = db_store.acquire_session_resumption_lock(session_id)
+    # Atomically lock session in SQLite if it was interrupted, failed, or approval_needed to coordinate workers
+    if session["status"] in ("interrupted", "failed", "approval_needed"):
+        locked = db_store.acquire_session_resumption_lock(session_id, allow_approval_needed=True)
         if not locked:
             return jsonify({"error": "Session is already being resumed or running"}), 409
 

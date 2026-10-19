@@ -27,6 +27,20 @@ def get_db_path(custom_path: Optional[str] = None) -> str:
 
 from contextlib import contextmanager
 
+def _retry_on_db_lock(func, max_retries=5, initial_delay=0.05):
+    delay = initial_delay
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except sqlite3.OperationalError as e:
+            err_msg = str(e).lower()
+            if ("locked" in err_msg or "busy" in err_msg) and attempt < max_retries - 1:
+                logging.warning("SQLite busy/locked (attempt %d/%d), retrying in %.2fs: %s", attempt + 1, max_retries, delay, e)
+                time.sleep(delay)
+                delay = min(delay * 2, 1.0)
+            else:
+                raise
+
 def get_db_connection(db_path: Optional[str] = None):
     """
     Open thread-isolated SQLite connection with foreign keys and WAL mode.
@@ -38,6 +52,7 @@ def get_db_connection(db_path: Optional[str] = None):
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.execute("PRAGMA journal_mode = WAL;")
+    conn.execute("PRAGMA busy_timeout = 30000;")
     return _DbConnectionContext(conn)
 
 class _DbConnectionContext:
@@ -48,17 +63,20 @@ class _DbConnectionContext:
     def __exit__(self, exc_type, exc_val, exc_tb):
         try:
             if exc_type is None:
-                self._conn.commit()
+                _retry_on_db_lock(self._conn.commit)
             else:
-                self._conn.rollback()
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
         finally:
             self._conn.close()
     def cursor(self):
         return self._conn.cursor()
     def execute(self, *args, **kwargs):
-        return self._conn.execute(*args, **kwargs)
+        return _retry_on_db_lock(lambda: self._conn.execute(*args, **kwargs))
     def commit(self):
-        return self._conn.commit()
+        return _retry_on_db_lock(self._conn.commit)
     def close(self):
         return self._conn.close()
 
@@ -1527,19 +1545,21 @@ def reconcile_interrupted_sessions(db_path: Optional[str] = None) -> int:
     return len(interrupted_ids)
 
 
-def acquire_session_resumption_lock(session_id: str, db_path: Optional[str] = None) -> bool:
+def acquire_session_resumption_lock(session_id: str, db_path: Optional[str] = None, allow_approval_needed: bool = False) -> bool:
     """
-    Atomically acquire a resumption lock on an interrupted or failed session
+    Atomically acquire a resumption lock on an interrupted, failed, or approval_needed session
     to prevent multiple concurrent recovery workers from resuming the same session.
     Returns True if lock acquired, False if already running or not in resumable state.
     """
     now = time.time()
+    allowed_statuses = ('interrupted', 'failed', 'approval_needed') if allow_approval_needed else ('interrupted', 'failed')
+    placeholders = ",".join(["?"] * len(allowed_statuses))
     with get_db_connection(db_path) as conn:
-        cursor = conn.execute("""
+        cursor = conn.execute(f"""
             UPDATE workflow_sessions
             SET status = 'running', updated_at = ?
-            WHERE session_id = ? AND status IN ('interrupted', 'failed');
-        """, (now, session_id))
+            WHERE session_id = ? AND status IN ({placeholders});
+        """, [now, session_id] + list(allowed_statuses))
         conn.commit()
         return cursor.rowcount > 0
 
