@@ -3,6 +3,7 @@ import json
 import time
 import re
 import logging
+import hashlib
 from typing import Dict, List, Optional, Any, Callable, Tuple
 
 import db_persistence as db
@@ -461,7 +462,19 @@ def execute_single_task(
     
     # 3. Execute agent call
     try:
-        output = call_agent_fn(
+        # Pre-flight durable marker: records that provider call is in-flight
+        db.record_agent_run_start(
+            task_id=task_id,
+            session_id=session_id,
+            agent_id=agent_id,
+            agent_name=role_name,
+            division_id=task["division_id"],
+            prompt_file=prompt_file,
+            input_preview=full_context[:400],
+            db_path=db_path
+        )
+
+        output_res = call_agent_fn(
             prompt_file,
             role_name,
             short_name,
@@ -470,24 +483,46 @@ def execute_single_task(
             full_context
         )
         
+        # Propagate provider usage metadata if returned directly or via provider execution context
+        tokens_used = None
+        token_source = "estimated"
+        if isinstance(output_res, tuple) and len(output_res) >= 3:
+            output = output_res[0]
+            tokens_used = output_res[1]
+            token_source = output_res[2]
+        elif isinstance(output_res, dict) and "output" in output_res:
+            output = output_res["output"]
+            tokens_used = output_res.get("tokens_used")
+            token_source = output_res.get("token_source", "estimated")
+        else:
+            output = output_res
+            try:
+                from app import get_last_agent_execution
+                meta = get_last_agent_execution()
+                if meta and meta.get("tokens_used"):
+                    tokens_used = meta["tokens_used"]
+                    token_source = meta.get("token_source", "provider_reported")
+            except Exception:
+                pass
+        
         if not output or not str(output).strip():
             raise RuntimeError(f"Agent {agent_id} returned empty or invalid output.")
-            
-        # 4. Mark task completed
-        db.update_task_status(task_id, "completed", output_text=output, db_path=db_path)
-        
-        # 5. Record agent run
-        tokens_est = max(1, (len(task.get("input_context") or "") + len(full_context or "") + len(output or "")) // 4)
-        db.record_agent_run(
+
+        if tokens_used is None:
+            tokens_used = max(1, (len(task.get("input_context") or "") + len(full_context or "") + len(output or "")) // 4)
+            token_source = "estimated"
+
+        # 4 & 5. Atomically complete task AND persist durable agent run in a single transaction
+        db.complete_task_with_agent_run(
             task_id=task_id,
             session_id=session_id,
             agent_id=agent_id,
             agent_name=role_name,
             division_id=task["division_id"],
             prompt_file=prompt_file,
-            status="completed",
-            tokens_used=tokens_est,
-            token_source="estimated",
+            output_text=output,
+            tokens_used=tokens_used,
+            token_source=token_source,
             input_preview=full_context[:400],
             output_preview=output[:400],
             db_path=db_path
@@ -697,34 +732,40 @@ def create_remediation_task(
 ) -> str:
     """
     Dynamically inject a remediation task into the DAG for bounded self-healing.
-    Assigned to the responsible agent (senior developer).
+    Uses deterministic task IDs and atomic database upsert to prevent duplicate tasks under concurrency.
     """
     title = f"إصلاح أخطاء فحص الجودة (محاولة {attempt_num} من 2)"
-    # Idempotency check: if remediation task already exists for this session/attempt, return existing ID
-    existing_tasks = db.list_tasks_for_session(session_id, db_path=db_path)
-    for t in existing_tasks:
-        if t.get("title") == title:
-            return t["task_id"]
+    h = hashlib.sha256(f"{session_id}_{original_task_id}_{attempt_num}".encode("utf-8")).hexdigest()[:12]
+    remed_task_id = f"task_remed_{h}"
 
-    errors_str = "\n- ".join(qa_errors)
-    input_ctx = (
-        f"فحص الجودة البرمجية كشف عن الأخطاء التالية التي يجب إصلاحها فوراً:\n- {errors_str}\n\n"
-        f"الأكواد الحالية:\n"
-        f"```html\n{candidate_code.get('html', '')}\n```\n\n"
-        f"```css\n{candidate_code.get('css', '')}\n```\n\n"
-        f"```javascript\n{candidate_code.get('js', '')}\n```\n\n"
-        f"المطلوب: قم بإصلاح الأخطاء المذكورة فوراً، وأرجع كود HTML الكامل المصحح داخل ```html وكود CSS داخل ```css وكود JS داخل ```javascript."
-    )
-    remediation_task_id = db.create_task(
-        session_id=session_id,
-        title=title,
-        division_id="engineering",
-        assigned_agent_id="engineering-senior-developer",
-        stage="development",
-        dependencies=[original_task_id],
-        input_context=input_ctx,
-        max_retries=1,
-        db_path=db_path
-    )
-    return remediation_task_id
+    with db.get_db_connection(db_path) as conn:
+        existing = conn.execute(
+            "SELECT task_id FROM workflow_tasks WHERE task_id = ? OR (session_id = ? AND title = ?);",
+            (remed_task_id, session_id, title)
+        ).fetchone()
+        if existing:
+            return existing["task_id"]
+
+        errors_str = "\n- ".join(qa_errors)
+        input_ctx = (
+            f"فحص الجودة البرمجية كشف عن الأخطاء التالية التي يجب إصلاحها فوراً:\n- {errors_str}\n\n"
+            f"الأكواد الحالية:\n"
+            f"```html\n{candidate_code.get('html', '')}\n```\n\n"
+            f"```css\n{candidate_code.get('css', '')}\n```\n\n"
+            f"```javascript\n{candidate_code.get('js', '')}\n```\n\n"
+            f"المطلوب: قم بإصلاح الأخطاء المذكورة فوراً، وأرجع كود HTML الكامل المصحح داخل ```html وكود CSS داخل ```css وكود JS داخل ```javascript."
+        )
+        deps_json = json.dumps([original_task_id])
+        conn.execute("""
+            INSERT OR IGNORE INTO workflow_tasks (
+                task_id, session_id, parent_task_id, title, division_id,
+                assigned_agent_id, stage, status, dependencies_json, input_context, max_retries
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """, (
+            remed_task_id, session_id, original_task_id, title, "engineering",
+            "engineering-senior-developer", "development", "ready", deps_json, input_ctx, 1
+        ))
+        conn.commit()
+
+    return remed_task_id
 

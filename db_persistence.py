@@ -197,6 +197,32 @@ def init_db(db_path: Optional[str] = None):
         if "token_source" not in run_cols:
             cursor.execute("ALTER TABLE agent_runs ADD COLUMN token_source TEXT DEFAULT 'estimated';")
 
+        # Ensure workflow_sessions check constraint includes 'interrupted'
+        cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='workflow_sessions';")
+        sess_table = cursor.fetchone()
+        if sess_table and "interrupted" not in sess_table[0]:
+            cursor.execute("PRAGMA foreign_keys=OFF;")
+            cursor.execute("""
+            CREATE TABLE workflow_sessions_migrated (
+                session_id TEXT PRIMARY KEY,
+                project_name TEXT NOT NULL,
+                task_description TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('created', 'running', 'approval_needed', 'completed', 'failed', 'cancelled', 'interrupted')),
+                squad_archetype TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                completed_at REAL,
+                current_stage TEXT,
+                checkpoint_step TEXT,
+                error_message TEXT,
+                metadata_json TEXT
+            );
+            """)
+            cursor.execute("INSERT INTO workflow_sessions_migrated SELECT * FROM workflow_sessions;")
+            cursor.execute("DROP TABLE workflow_sessions;")
+            cursor.execute("ALTER TABLE workflow_sessions_migrated RENAME TO workflow_sessions;")
+            cursor.execute("PRAGMA foreign_keys=ON;")
+
         conn.commit()
 
 
@@ -658,32 +684,66 @@ def record_agent_run(
         cursor = conn.cursor()
         cursor.execute("PRAGMA table_info(agent_runs);")
         cols = {row[1] for row in cursor.fetchall()}
-        if "token_source" in cols:
-            conn.execute("""
-                INSERT INTO agent_runs (
-                    run_id, task_id, session_id, agent_id, agent_name,
-                    division_id, prompt_file, status, input_preview,
-                    output_preview, tokens_used, token_source, error_message, started_at, finished_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-            """, (
-                run_id, task_id, session_id, agent_id, agent_name,
-                division_id, prompt_file, status,
-                safe_input, safe_output,
-                tokens_used, token_source, safe_error, now, fin
-            ))
+        
+        # Check if an in-flight running agent_run exists for this task
+        existing_run = cursor.execute("""
+            SELECT run_id FROM agent_runs 
+            WHERE task_id = ? AND session_id = ? AND status = 'running'
+            ORDER BY started_at DESC LIMIT 1;
+        """, (task_id, session_id)).fetchone()
+
+        if existing_run:
+            run_id = existing_run["run_id"]
+            if "token_source" in cols:
+                cursor.execute("""
+                    UPDATE agent_runs
+                    SET status = ?,
+                        input_preview = COALESCE(?, input_preview),
+                        output_preview = COALESCE(?, output_preview),
+                        tokens_used = ?,
+                        token_source = ?,
+                        finished_at = ?,
+                        error_message = ?
+                    WHERE run_id = ?;
+                """, (status, safe_input, safe_output, tokens_used, token_source, fin, safe_error, run_id))
+            else:
+                cursor.execute("""
+                    UPDATE agent_runs
+                    SET status = ?,
+                        input_preview = COALESCE(?, input_preview),
+                        output_preview = COALESCE(?, output_preview),
+                        tokens_used = ?,
+                        finished_at = ?,
+                        error_message = ?
+                    WHERE run_id = ?;
+                """, (status, safe_input, safe_output, tokens_used, fin, safe_error, run_id))
         else:
-            conn.execute("""
-                INSERT INTO agent_runs (
+            if "token_source" in cols:
+                cursor.execute("""
+                    INSERT INTO agent_runs (
+                        run_id, task_id, session_id, agent_id, agent_name,
+                        division_id, prompt_file, status, input_preview,
+                        output_preview, tokens_used, token_source, error_message, started_at, finished_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """, (
                     run_id, task_id, session_id, agent_id, agent_name,
-                    division_id, prompt_file, status, input_preview,
-                    output_preview, tokens_used, error_message, started_at, finished_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-            """, (
-                run_id, task_id, session_id, agent_id, agent_name,
-                division_id, prompt_file, status,
-                safe_input, safe_output,
-                tokens_used, safe_error, now, fin
-            ))
+                    division_id, prompt_file, status,
+                    safe_input, safe_output,
+                    tokens_used, token_source, safe_error, now, fin
+                ))
+            else:
+                cursor.execute("""
+                    INSERT INTO agent_runs (
+                        run_id, task_id, session_id, agent_id, agent_name,
+                        division_id, prompt_file, status, input_preview,
+                        output_preview, tokens_used, error_message, started_at, finished_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """, (
+                    run_id, task_id, session_id, agent_id, agent_name,
+                    division_id, prompt_file, status,
+                    safe_input, safe_output,
+                    tokens_used, safe_error, now, fin
+                ))
         conn.commit()
     return run_id
 
@@ -694,6 +754,187 @@ def list_agent_runs(session_id: str, task_id: Optional[str] = None, db_path: Opt
         else:
             rows = conn.execute("SELECT * FROM agent_runs WHERE session_id = ? ORDER BY started_at ASC;", (session_id,)).fetchall()
         return [dict(r) for r in rows]
+
+
+def record_agent_run_start(
+    task_id: str,
+    session_id: str,
+    agent_id: str,
+    agent_name: str,
+    division_id: str,
+    prompt_file: str,
+    input_preview: Optional[str] = None,
+    db_path: Optional[str] = None
+) -> str:
+    """
+    Durable pre-flight record created right before an external agent/provider is invoked.
+    Allows recovery to distinguish:
+    - Task claimed but provider never called (no agent_run row)
+    - External call in-flight when process crashed (agent_run row in 'running' status)
+    """
+    run_id = f"run_{uuid.uuid4().hex[:12]}"
+    now = time.time()
+    safe_input = sanitize_memory_content(input_preview[:500]) if input_preview else None
+    with get_db_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(agent_runs);")
+        cols = {row[1] for row in cursor.fetchall()}
+        if "token_source" in cols:
+            conn.execute("""
+                INSERT INTO agent_runs (
+                    run_id, task_id, session_id, agent_id, agent_name,
+                    division_id, prompt_file, status, input_preview,
+                    tokens_used, token_source, started_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """, (
+                run_id, task_id, session_id, agent_id, agent_name,
+                division_id, prompt_file, 'running', safe_input,
+                0, 'estimated', now
+            ))
+        else:
+            conn.execute("""
+                INSERT INTO agent_runs (
+                    run_id, task_id, session_id, agent_id, agent_name,
+                    division_id, prompt_file, status, input_preview,
+                    tokens_used, started_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """, (
+                run_id, task_id, session_id, agent_id, agent_name,
+                division_id, prompt_file, 'running', safe_input,
+                0, now
+            ))
+        conn.commit()
+    return run_id
+
+
+def complete_task_with_agent_run(
+    task_id: str,
+    session_id: str,
+    agent_id: str,
+    agent_name: str,
+    division_id: str,
+    prompt_file: str,
+    output_text: str,
+    tokens_used: int = 0,
+    token_source: str = "estimated",
+    input_preview: Optional[str] = None,
+    output_preview: Optional[str] = None,
+    error_message: Optional[str] = None,
+    db_path: Optional[str] = None
+) -> Tuple[bool, str]:
+    """
+    Atomically finalize a task and record its durable agent run within a single SQLite transaction.
+    Guarantees that a task cannot become 'completed' without its corresponding execution evidence,
+    token accounting, and deliverable output.
+    Also evaluates and unblocks dependent tasks whose prerequisites are now fully satisfied.
+    Returns (success, run_id).
+    """
+    if not output_text or not str(output_text).strip():
+        raise ValueError(f"Cannot mark task {task_id} completed without valid non-empty output_text.")
+
+    now = time.time()
+    safe_input = sanitize_memory_content(input_preview[:500]) if input_preview else None
+    effective_out_prev = output_preview or output_text
+    safe_output = sanitize_memory_content(effective_out_prev[:500]) if effective_out_prev else None
+    safe_error = sanitize_memory_content(error_message) if error_message else None
+    run_id = f"run_{uuid.uuid4().hex[:12]}"
+
+    with get_db_connection(db_path) as conn:
+        cursor = conn.cursor()
+        
+        # Check if an in-flight running agent_run exists for this task
+        existing_run = cursor.execute("""
+            SELECT run_id FROM agent_runs 
+            WHERE task_id = ? AND session_id = ? AND status = 'running'
+            ORDER BY started_at DESC LIMIT 1;
+        """, (task_id, session_id)).fetchone()
+
+        cursor.execute("PRAGMA table_info(agent_runs);")
+        cols = {row[1] for row in cursor.fetchall()}
+
+        if existing_run:
+            run_id = existing_run["run_id"]
+            if "token_source" in cols:
+                cursor.execute("""
+                    UPDATE agent_runs
+                    SET status = 'completed',
+                        input_preview = COALESCE(?, input_preview),
+                        output_preview = ?,
+                        tokens_used = ?,
+                        token_source = ?,
+                        finished_at = ?,
+                        error_message = ?
+                    WHERE run_id = ?;
+                """, (safe_input, safe_output, tokens_used, token_source, now, safe_error, run_id))
+            else:
+                cursor.execute("""
+                    UPDATE agent_runs
+                    SET status = 'completed',
+                        input_preview = COALESCE(?, input_preview),
+                        output_preview = ?,
+                        tokens_used = ?,
+                        finished_at = ?,
+                        error_message = ?
+                    WHERE run_id = ?;
+                """, (safe_input, safe_output, tokens_used, now, safe_error, run_id))
+        else:
+            if "token_source" in cols:
+                cursor.execute("""
+                    INSERT INTO agent_runs (
+                        run_id, task_id, session_id, agent_id, agent_name,
+                        division_id, prompt_file, status, input_preview,
+                        output_preview, tokens_used, token_source, error_message, started_at, finished_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """, (
+                    run_id, task_id, session_id, agent_id, agent_name,
+                    division_id, prompt_file, 'completed',
+                    safe_input, safe_output,
+                    tokens_used, token_source, safe_error, now, now
+                ))
+            else:
+                cursor.execute("""
+                    INSERT INTO agent_runs (
+                        run_id, task_id, session_id, agent_id, agent_name,
+                        division_id, prompt_file, status, input_preview,
+                        output_preview, tokens_used, error_message, started_at, finished_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """, (
+                    run_id, task_id, session_id, agent_id, agent_name,
+                    division_id, prompt_file, 'completed',
+                    safe_input, safe_output,
+                    tokens_used, safe_error, now, now
+                ))
+
+        # Update workflow_tasks atomically
+        cursor.execute("""
+            UPDATE workflow_tasks
+            SET status = 'completed',
+                output_text = ?,
+                error_message = NULL,
+                completed_at = COALESCE(completed_at, ?)
+            WHERE task_id = ?;
+        """, (output_text, now, task_id))
+
+        # Evaluate pending dependent tasks in the same session
+        pending_tasks = cursor.execute(
+            "SELECT task_id, dependencies_json FROM workflow_tasks WHERE session_id = ? AND status = 'pending';",
+            (session_id,)
+        ).fetchall()
+        for pt in pending_tasks:
+            pt_id = pt["task_id"]
+            deps = json.loads(pt["dependencies_json"] or "[]")
+            if deps:
+                placeholders = ",".join(["?"] * len(deps))
+                completed_deps = cursor.execute(
+                    f"SELECT COUNT(*) as count FROM workflow_tasks WHERE session_id = ? AND task_id IN ({placeholders}) AND status = 'completed';",
+                    [session_id] + deps
+                ).fetchone()["count"]
+                if completed_deps == len(deps):
+                    cursor.execute("UPDATE workflow_tasks SET status = 'ready' WHERE task_id = ?;", (pt_id,))
+
+        conn.commit()
+
+    return True, run_id
 
 
 # =========================================================================
@@ -727,30 +968,64 @@ def record_task_handoff(
     payload_json = json.dumps(stored_payload, ensure_ascii=False)
     
     with get_db_connection(db_path) as conn:
-        # Enforce DAG invariant: failed, cancelled, or blocked tasks cannot produce successful handoffs
-        src_task = conn.execute("SELECT status FROM workflow_tasks WHERE task_id = ?;", (from_task_id,)).fetchone()
-        if src_task and src_task["status"] in ("failed", "cancelled", "blocked") and status in ("delivered", "acknowledged"):
-            raise ValueError(f"Cannot record successful handoff from {src_task['status']} task {from_task_id}")
+        cursor = conn.cursor()
 
-        # Enforce deterministic identity and idempotency for handoff records
-        existing = conn.execute(
-            "SELECT handoff_id FROM task_handoffs WHERE session_id = ? AND from_task_id = ? AND to_task_id = ?;",
-            (session_id, from_task_id, to_task_id)
-        ).fetchone()
+        # 1. Source task verification if it exists in DB
+        src_task = cursor.execute("SELECT session_id, status FROM workflow_tasks WHERE task_id = ?;", (from_task_id,)).fetchone()
+        if src_task:
+            if src_task["session_id"] != session_id:
+                raise ValueError(
+                    f"Cross-session handoff rejected: source task {from_task_id} belongs to session {src_task['session_id']}, not {session_id}"
+                )
+            if status in ("delivered", "acknowledged"):
+                if src_task["status"] in ("failed", "cancelled", "blocked"):
+                    raise ValueError(f"Cannot record successful handoff from {src_task['status']} task {from_task_id}")
+                if src_task["status"] != "completed":
+                    raise ValueError(
+                        f"Cannot record successful handoff from incomplete task {from_task_id} (status: {src_task['status']}). Source task must be 'completed'."
+                    )
 
-        if existing:
-            handoff_id = existing["handoff_id"]
-            conn.execute("""
-                UPDATE task_handoffs
-                SET from_agent_id = ?, to_agent_id = ?, artifact_type = ?,
-                    artifact_summary = ?, status = ?, created_at = ?
-                WHERE handoff_id = ?;
-            """, (src_agent, dst_agent, artifact_type, payload_json, status, now, handoff_id))
-        else:
-            h = hashlib.sha256(f"{session_id}_{from_task_id}_{to_task_id}".encode("utf-8")).hexdigest()[:16]
-            handoff_id = f"hoff_{h}"
-            conn.execute("""
+        # 2. Destination task verification if it exists in DB
+        if to_task_id:
+            dst_task = cursor.execute(
+                "SELECT session_id, dependencies_json FROM workflow_tasks WHERE task_id = ?;", 
+                (to_task_id,)
+            ).fetchone()
+            if dst_task:
+                if dst_task["session_id"] != session_id:
+                    raise ValueError(
+                        f"Cross-session handoff rejected: destination task {to_task_id} belongs to session {dst_task['session_id']}, not {session_id}"
+                    )
+                if from_task_id != to_task_id:
+                    deps = json.loads(dst_task["dependencies_json"] or "[]")
+                    if deps and from_task_id not in deps:
+                        raise ValueError(
+                            f"Invalid handoff: destination task {to_task_id} does not depend on source task {from_task_id} in DAG"
+                        )
+
+        # 3. Enforce deterministic identity and idempotency for handoff records via atomic upsert
+        h = hashlib.sha256(f"{session_id}_{from_task_id}_{to_task_id}".encode("utf-8")).hexdigest()[:16]
+        handoff_id = f"hoff_{h}"
+
+        try:
+            cursor.execute("""
                 INSERT INTO task_handoffs (
+                    handoff_id, session_id, from_task_id, to_task_id,
+                    from_agent_id, to_agent_id, artifact_type,
+                    artifact_summary, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(handoff_id) DO UPDATE SET
+                    from_agent_id = excluded.from_agent_id,
+                    to_agent_id = excluded.to_agent_id,
+                    artifact_type = excluded.artifact_type,
+                    artifact_summary = excluded.artifact_summary,
+                    status = excluded.status,
+                    created_at = excluded.created_at;
+            """, (handoff_id, session_id, from_task_id, to_task_id, src_agent, dst_agent, artifact_type, payload_json, status, now))
+        except sqlite3.OperationalError:
+            # Fallback for legacy SQLite engines without ON CONFLICT support
+            cursor.execute("""
+                INSERT OR REPLACE INTO task_handoffs (
                     handoff_id, session_id, from_task_id, to_task_id,
                     from_agent_id, to_agent_id, artifact_type,
                     artifact_summary, status, created_at
@@ -1090,6 +1365,13 @@ def reconcile_interrupted_sessions(db_path: Optional[str] = None) -> int:
                     ORDER BY finished_at DESC LIMIT 1;
                 """, (tid,)).fetchone()
                 
+                # Check if an in-flight provider call was ongoing when process died
+                in_flight_run = conn.execute("""
+                    SELECT run_id, started_at FROM agent_runs
+                    WHERE task_id = ? AND status = 'running'
+                    ORDER BY started_at DESC LIMIT 1;
+                """, (tid,)).fetchone()
+                
                 if completed_run and completed_run["output_preview"]:
                     # Task completed execution before process shutdown; restore output and mark completed
                     out = completed_run["output_preview"]
@@ -1101,8 +1383,44 @@ def reconcile_interrupted_sessions(db_path: Optional[str] = None) -> int:
                             completed_at = ?
                         WHERE task_id = ?;
                     """, (out, time.time(), tid))
+                    
+                    # Unblock any dependent tasks
+                    pts = conn.execute(
+                        "SELECT task_id, dependencies_json FROM workflow_tasks WHERE session_id = ? AND status = 'pending';",
+                        (sid,)
+                    ).fetchall()
+                    for pt in pts:
+                        deps = json.loads(pt["dependencies_json"] or "[]")
+                        if deps:
+                            placeholders = ",".join(["?"] * len(deps))
+                            completed_cnt = conn.execute(
+                                f"SELECT COUNT(*) as count FROM workflow_tasks WHERE session_id = ? AND task_id IN ({placeholders}) AND status = 'completed';",
+                                [sid] + deps
+                            ).fetchone()["count"]
+                            if completed_cnt == len(deps):
+                                conn.execute("UPDATE workflow_tasks SET status = 'ready' WHERE task_id = ?;", (pt["task_id"],))
+
+                elif in_flight_run:
+                    # An external provider request was in-flight when the process died.
+                    # Outcome is ambiguous! Do NOT blindly rerun billable request without confirmation.
+                    conn.execute("""
+                        UPDATE agent_runs
+                        SET status = 'failed',
+                            error_message = 'Provider outcome ambiguous: external call was in-flight during crash',
+                            finished_at = ?
+                        WHERE run_id = ?;
+                    """, (time.time(), in_flight_run["run_id"]))
+                    conn.execute("""
+                        UPDATE workflow_tasks
+                        SET status = 'failed',
+                            error_message = 'Provider outcome unknown: external request was in-flight when process terminated. Not automatically rerunning billable request.',
+                            completed_at = ?
+                        WHERE task_id = ?;
+                    """, (time.time(), tid))
+                    session_should_fail = True
+
                 elif retries < max_retries:
-                    # Bounded retry: reset to ready for safe resumption
+                    # Task was claimed but provider call was never dispatched: safe to retry!
                     conn.execute("""
                         UPDATE workflow_tasks
                         SET status = 'ready',
@@ -1129,6 +1447,25 @@ def reconcile_interrupted_sessions(db_path: Optional[str] = None) -> int:
                         error_message = 'Interrupted session failed: core task exceeded maximum restart retry limit.'
                     WHERE session_id = ?;
                 """, (sid,))
+
+        # 4. Consistency check: any task marked 'completed' in an interrupted session
+        # MUST have corresponding durable execution evidence in agent_runs.
+        # If execution evidence is missing, reset to ready so it cannot be falsely completed without evidence.
+        orphan_tasks = conn.execute("""
+            SELECT t.task_id, t.session_id FROM workflow_tasks t
+            WHERE t.status = 'completed' AND t.session_id IN (
+                SELECT session_id FROM workflow_sessions WHERE status IN ('running', 'interrupted')
+            ) AND NOT EXISTS (
+                SELECT 1 FROM agent_runs r WHERE r.task_id = t.task_id AND r.status = 'completed'
+            );
+        """).fetchall()
+        for ot in orphan_tasks:
+            conn.execute("""
+                UPDATE workflow_tasks
+                SET status = 'ready',
+                    error_message = 'Recovered from crash: missing durable agent execution evidence. Reset to ready for verified execution.'
+                WHERE task_id = ?;
+            """, (ot["task_id"],))
 
         conn.commit()
     return len(interrupted_ids)

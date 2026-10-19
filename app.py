@@ -13,6 +13,7 @@ import subprocess
 import logging
 from urllib.parse import urlparse
 from html.parser import HTMLParser
+from typing import Optional, Dict, Any, Tuple, List, Union
 import db_persistence as db_store
 import task_orchestrator as orch
 
@@ -1420,6 +1421,20 @@ def add_feed(name, role, color, initial, text):
 
 # --- LLM Providers & Agent Execution ---
 
+_last_agent_execution_ctx = threading.local()
+
+def get_last_agent_execution() -> Optional[Dict[str, Any]]:
+    """Return the usage metadata from the most recent agent execution in the current thread."""
+    return getattr(_last_agent_execution_ctx, "data", None)
+
+def set_last_agent_execution(tokens_used: int, token_source: str, provider: str = "unknown"):
+    """Durable in-memory record of provider usage metadata for orchestration layers."""
+    _last_agent_execution_ctx.data = {
+        "tokens_used": max(int(tokens_used), 0),
+        "token_source": token_source,
+        "provider": provider
+    }
+
 def call_agent_gemini(system_prompt, full_prompt, api_key, role_name, preferred_model='gemini-3.5-flash-lite'):
     """
     Call Google Gemini REST API directly. Returns (reply, token_count, True).
@@ -1445,18 +1460,21 @@ def call_agent_gemini(system_prompt, full_prompt, api_key, role_name, preferred_
                 token_count = res_json.get('usageMetadata', {}).get('totalTokenCount', 0)
                 is_reported = bool(token_count)
                 if not token_count:
-                    token_count = (len(system_prompt) + len(full_prompt) + len(reply)) // 4
+                    token_count = max(1, (len(system_prompt or "") + len(full_prompt or "") + len(reply or "")) // 4)
                 
                 with state_lock:
                     task_name = workflow_state.get('current_task', 'تطبيق ويب')
                 
+                source_tag = "provider_reported" if is_reported else "estimated"
+                set_last_agent_execution(token_count, source_tag, "gemini")
+
                 # Record token usage ONCE with source tag
                 record_token_usage(
                     role_name,
                     "البرمجة والتطوير",
                     task_name,
                     token_count,
-                    source="provider_reported" if is_reported else "estimated"
+                    source=source_tag
                 )
                 return reply, token_count, True
                 
@@ -1469,17 +1487,20 @@ def call_agent_gemini(system_prompt, full_prompt, api_key, role_name, preferred_
             
     raise RuntimeError(f"فشل الاتصال بـ Gemini: {last_err}")
 
-def call_agent(agent_file, role_name, short_name, color, prompt, context_text=""):
+def call_agent(agent_file, role_name, short_name, color, prompt, context_text="", return_metadata=False):
     """
     Orchestrate specialized agent invocation with honest failure handling.
-    Returns string response or raises RuntimeError on genuine failure.
+    Returns string response (or (reply, tokens_used, token_source) if return_metadata=True).
+    Raises RuntimeError on genuine failure.
     """
     default_prompt = f"أنت {role_name} محترف."
     system_prompt, loaded_ok, load_err = safe_load_agent_prompt(agent_file, fallback_prompt=default_prompt)
     if not loaded_ok and load_err:
         logging.warning("Agent prompt load fallback for %s (%s): %s", role_name, agent_file, load_err)
             
-    full_prompt = f"{prompt}\n\nالسياق:\n{context_text}" if context_text else prompt
+    prompt_str = str(prompt or "")
+    context_str = str(context_text or "")
+    full_prompt = f"{prompt_str}\n\nالسياق:\n{context_str}" if context_str else prompt_str
     settings = load_settings()
     provider = settings.get('provider', 'gemini')
     api_key = get_api_key(provider)
@@ -1581,16 +1602,22 @@ def call_agent(agent_file, role_name, short_name, color, prompt, context_text=""
                     with state_lock:
                         cur_task = workflow_state.get('current_task', 'مهمة برمجية')
                     record_token_usage(role_name, short_name, cur_task, tok_cnt, source="provider_reported")
+                    set_last_agent_execution(tok_cnt, "provider_reported", "openrouter")
                     tokens_recorded = True
 
         # If not recorded yet, calculate estimated tokens and record ONCE
         if not tokens_recorded:
-            tokens_est = (len(prompt) + len(context_text) + len(reply)) // 4
+            tokens_est = max(1, (len(prompt_str) + len(context_str) + len(reply or "")) // 4)
             with state_lock:
                 cur_task = workflow_state.get('current_task', 'مهمة برمجية')
             record_token_usage(role_name, short_name, cur_task, tokens_est, source="estimated")
+            set_last_agent_execution(tokens_est, "estimated", provider)
             
         add_feed(role_name, role_name, color, short_name, "أنهيت عملي. المخرجات متوفرة الآن.")
+        
+        if return_metadata:
+            meta = get_last_agent_execution() or {"tokens_used": 0, "token_source": "estimated"}
+            return reply, meta["tokens_used"], meta["token_source"]
         return reply
 
     except Exception as e:
@@ -2169,6 +2196,150 @@ def inject_asset_links(html, css_content, js_content):
     return html
 
 
+def publish_workflow_deliverables(
+    app_dir: str,
+    task_title: str,
+    validated_html: str,
+    validated_css: str,
+    validated_js: str,
+    qa_report: dict,
+    workflow_outputs: dict,
+    failpoint: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Real application publication and promotion transaction boundary.
+    Performs atomic deliverable persistence with staging, pre-existing backup retention,
+    strict byte-for-byte post-write verification, deterministic failpoints, and atomic rollback.
+    """
+    if failpoint == "before_publication":
+        raise IOError("Simulated failure before publication starts")
+
+    os.makedirs(app_dir, exist_ok=True)
+    os.makedirs(os.path.join(app_dir, "css"), exist_ok=True)
+    os.makedirs(os.path.join(app_dir, "js"), exist_ok=True)
+
+    written_files = []
+    expected_artifacts = {}  # target_path -> expected_bytes
+    pre_existing_backups = {}  # path -> backup_path
+
+    try:
+        def _stage_write_file(target_path, content, encoding="utf-8"):
+            content_bytes = content.encode(encoding)
+            expected_artifacts[target_path] = content_bytes
+            if target_path not in written_files:
+                written_files.append(target_path)
+            if os.path.exists(target_path) and target_path not in pre_existing_backups:
+                bak = target_path + f".pre_{uuid.uuid4().hex[:8]}.bak"
+                import shutil
+                shutil.copy2(target_path, bak)
+                pre_existing_backups[target_path] = bak
+            atomic_write_file(target_path, content, encoding)
+
+        def _stage_write_json(target_path, data):
+            content = json.dumps(data, indent=2, ensure_ascii=False)
+            content_bytes = content.encode("utf-8")
+            expected_artifacts[target_path] = content_bytes
+            if target_path not in written_files:
+                written_files.append(target_path)
+            if os.path.exists(target_path) and target_path not in pre_existing_backups:
+                bak = target_path + f".pre_{uuid.uuid4().hex[:8]}.bak"
+                import shutil
+                shutil.copy2(target_path, bak)
+                pre_existing_backups[target_path] = bak
+            atomic_write_json(target_path, data)
+
+        # 1. index.html
+        html_path = os.path.join(app_dir, "index.html")
+        _stage_write_file(html_path, validated_html)
+
+        # 2. style.css and css/style.css
+        if validated_css:
+            for c_path in ["style.css", "css/style.css"]:
+                _stage_write_file(os.path.join(app_dir, c_path), validated_css)
+
+        # 3. script.js and js/script.js
+        if validated_js:
+            for j_path in ["script.js", "js/script.js"]:
+                _stage_write_file(os.path.join(app_dir, j_path), validated_js)
+
+        # 4. plan.md
+        plan_content = (
+            f"# المنتج النهائي لمشروع: {task_title}\n\n"
+            f"## 1. دراسة الجدوى (الاستراتيجية)\n{workflow_outputs.get('strategy', '')}\n\n"
+            f"## 2. وثيقة المتطلبات (PRD)\n{workflow_outputs.get('product', '')}\n\n"
+            f"## 3. الهيكلة الهندسية (Architecture)\n{workflow_outputs.get('engineering', '')}\n\n"
+            f"## 4. تصميم الواجهات (UI/UX)\n{workflow_outputs.get('design', '')}\n\n"
+            f"## 5. تقرير فحص الجودة (QA Report)\n{json.dumps(qa_report, indent=2, ensure_ascii=False)}\n\n"
+        )
+        _stage_write_file(os.path.join(app_dir, "plan.md"), plan_content)
+
+        # 5. qa_report.json
+        _stage_write_json(os.path.join(app_dir, "qa_report.json"), qa_report)
+
+        if failpoint == "after_staging_before_promotion":
+            raise IOError("Simulated failure after staging but before promotion")
+
+        # Post-write verification: every published deliverable exists, non-empty, byte match
+        for fpath, expected_bytes in expected_artifacts.items():
+            if not os.path.exists(fpath):
+                raise IOError(f"Deliverable file verification failed: {os.path.basename(fpath)} is missing")
+            if os.path.getsize(fpath) == 0:
+                raise IOError(f"Deliverable file verification failed: {os.path.basename(fpath)} is empty")
+            with open(fpath, 'rb') as f:
+                persisted_bytes = f.read()
+            if persisted_bytes != expected_bytes:
+                raise IOError(f"Persisted artifact {os.path.basename(fpath)} does not match the QA-validated candidate (byte mismatch)")
+
+        if failpoint == "during_promotion":
+            raise IOError("Simulated failure during promotion")
+
+    except Exception as persist_err:
+        rollback_failures = []
+        failed_restorations = {}
+
+        all_rollback_targets = list(written_files)
+        for p in pre_existing_backups:
+            if p not in all_rollback_targets:
+                all_rollback_targets.append(p)
+
+        # Rollback: restore pre-existing files, delete newly created files
+        for fpath in all_rollback_targets:
+            try:
+                if fpath in pre_existing_backups:
+                    bak_path = pre_existing_backups[fpath]
+                    os.replace(bak_path, fpath)
+                elif os.path.exists(fpath):
+                    os.remove(fpath)
+            except Exception as rb_err:
+                if fpath in pre_existing_backups:
+                    bak_path = pre_existing_backups[fpath]
+                    failed_restorations[fpath] = (bak_path, str(rb_err))
+                    rollback_failures.append(
+                        f"Failed to rollback {os.path.basename(fpath)} (restoration failed, retained recovery backup at {bak_path}): {rb_err}"
+                    )
+                else:
+                    rollback_failures.append(f"Failed to rollback {os.path.basename(fpath)}: {rb_err}")
+
+        clean_errs = cleanup_backups(pre_existing_backups, failed_restorations)
+        rollback_failures.extend(clean_errs)
+
+        if rollback_failures:
+            raise IOError(f"Persistence error: {persist_err}; Rollback errors: {'; '.join(rollback_failures)}") from persist_err
+        raise persist_err
+
+    # Clean up backup files on success
+    cleanup_backups(pre_existing_backups)
+
+    if failpoint == "after_promotion_before_workflow_record":
+        raise IOError("Simulated failure after promotion but before workflow records success")
+
+    return {
+        "app_dir": app_dir,
+        "files": written_files,
+        "expected_artifacts": expected_artifacts
+    }
+
+
 def continue_workflow(feedback=""):
     with state_lock:
         workflow_state["status"] = "running"
@@ -2453,125 +2624,19 @@ def continue_workflow(feedback=""):
             task_title = workflow_state.get('current_task', 'تطبيق_جديد')
         app_dir, clean_folder_name = get_project_folder_name(task_title)
         
-        os.makedirs(app_dir, exist_ok=True)
-        os.makedirs(os.path.join(app_dir, "css"), exist_ok=True)
-        os.makedirs(os.path.join(app_dir, "js"), exist_ok=True)
-        
-        written_files = []
-        expected_artifacts = {}  # target_path -> expected_bytes
-        # Track pre-existing files so rollback restores rather than deletes them
-        pre_existing_backups = {}  # path -> backup_path
-        try:
-            def _stage_write_file(target_path, content, encoding="utf-8"):
-                """Write with pre-existing file backup and expected bytes registration."""
-                content_bytes = content.encode(encoding)
-                expected_artifacts[target_path] = content_bytes
-                if target_path not in written_files:
-                    written_files.append(target_path)
-                if os.path.exists(target_path) and target_path not in pre_existing_backups:
-                    bak = target_path + f".pre_{uuid.uuid4().hex[:8]}.bak"
-                    import shutil
-                    shutil.copy2(target_path, bak)
-                    pre_existing_backups[target_path] = bak
-                atomic_write_file(target_path, content, encoding)
-
-            def _stage_write_json(target_path, data):
-                """Write JSON with pre-existing file backup and expected bytes registration."""
-                content = json.dumps(data, indent=2, ensure_ascii=False)
-                content_bytes = content.encode("utf-8")
-                expected_artifacts[target_path] = content_bytes
-                if target_path not in written_files:
-                    written_files.append(target_path)
-                if os.path.exists(target_path) and target_path not in pre_existing_backups:
-                    bak = target_path + f".pre_{uuid.uuid4().hex[:8]}.bak"
-                    import shutil
-                    shutil.copy2(target_path, bak)
-                    pre_existing_backups[target_path] = bak
-                atomic_write_json(target_path, data)
-
-            # 1. index.html
-            html_path = os.path.join(app_dir, "index.html")
-            _stage_write_file(html_path, validated_html)
-            
-            # 2. style.css and css/style.css
-            if validated_css:
-                for c_path in ["style.css", "css/style.css"]:
-                    target_p = os.path.join(app_dir, c_path)
-                    _stage_write_file(target_p, validated_css)
-                    
-            # 3. script.js and js/script.js
-            if validated_js:
-                for j_path in ["script.js", "js/script.js"]:
-                    target_p = os.path.join(app_dir, j_path)
-                    _stage_write_file(target_p, validated_js)
-                    
-            # 4. plan.md
-            plan_content = (
-                f"# المنتج النهائي لمشروع: {task_title}\n\n"
-                f"## 1. دراسة الجدوى (الاستراتيجية)\n{workflow_state['outputs'].get('strategy', '')}\n\n"
-                f"## 2. وثيقة المتطلبات (PRD)\n{workflow_state['outputs'].get('product', '')}\n\n"
-                f"## 3. الهيكلة الهندسية (Architecture)\n{workflow_state['outputs'].get('engineering', '')}\n\n"
-                f"## 4. تصميم الواجهات (UI/UX)\n{workflow_state['outputs'].get('design', '')}\n\n"
-                f"## 5. تقرير فحص الجودة (QA Report)\n{json.dumps(qa_report, indent=2, ensure_ascii=False)}\n\n"
-            )
-            plan_path = os.path.join(app_dir, "plan.md")
-            _stage_write_file(plan_path, plan_content)
-
-            # 5. qa_report.json
-            qa_json_path = os.path.join(app_dir, "qa_report.json")
-            _stage_write_json(qa_json_path, qa_report)
-
-            # Post-write verification: every published deliverable (including duplicate copies)
-            # exists, is non-empty, and is byte-for-byte identical to the validated candidate.
-            for fpath, expected_bytes in expected_artifacts.items():
-                if not os.path.exists(fpath):
-                    raise IOError(f"Deliverable file verification failed: {os.path.basename(fpath)} is missing")
-                if os.path.getsize(fpath) == 0:
-                    raise IOError(f"Deliverable file verification failed: {os.path.basename(fpath)} is empty")
-                with open(fpath, 'rb') as f:
-                    persisted_bytes = f.read()
-                if persisted_bytes != expected_bytes:
-                    raise IOError(f"Persisted artifact {os.path.basename(fpath)} does not match the QA-validated candidate (byte mismatch)")
-
-        except Exception as persist_err:
-            rollback_failures = []
-            failed_restorations = {}
-
-            # Ensure all attempted writes and all backed-up files are processed during rollback
-            all_rollback_targets = list(written_files)
-            for p in pre_existing_backups:
-                if p not in all_rollback_targets:
-                    all_rollback_targets.append(p)
-
-            # Rollback: restore pre-existing files, delete newly created files
-            for fpath in all_rollback_targets:
-                try:
-                    if fpath in pre_existing_backups:
-                        bak_path = pre_existing_backups[fpath]
-                        os.replace(bak_path, fpath)
-                    elif os.path.exists(fpath):
-                        os.remove(fpath)
-                except Exception as rb_err:
-                    if fpath in pre_existing_backups:
-                        bak_path = pre_existing_backups[fpath]
-                        failed_restorations[fpath] = (bak_path, str(rb_err))
-                        rollback_failures.append(
-                            f"Failed to rollback {os.path.basename(fpath)} (restoration failed, retained recovery backup at {bak_path}): {rb_err}"
-                        )
-                    else:
-                        rollback_failures.append(f"Failed to rollback {os.path.basename(fpath)}: {rb_err}")
-
-            # Clean up obsolete backups ONLY if restoration did not fail for that file.
-            # CRITICAL SAFETY INVARIANT: If restoration failed, the backup is the ONLY surviving copy of user data. NEVER delete it!
-            clean_errs = cleanup_backups(pre_existing_backups, failed_restorations)
-            rollback_failures.extend(clean_errs)
-
-            if rollback_failures:
-                raise IOError(f"Persistence error: {persist_err}; Rollback errors: {'; '.join(rollback_failures)}") from persist_err
-            raise persist_err
-
-        # Clean up backup files on success
-        cleanup_backups(pre_existing_backups)
+        failpoint = os.environ.get("TEST_PUBLICATION_FAILPOINT")
+        pub_result = publish_workflow_deliverables(
+            app_dir=app_dir,
+            task_title=task_title,
+            validated_html=validated_html,
+            validated_css=validated_css,
+            validated_js=validated_js,
+            qa_report=qa_report,
+            workflow_outputs=workflow_state.get('outputs', {}),
+            failpoint=failpoint
+        )
+        expected_artifacts = pub_result["expected_artifacts"]
+        written_files = pub_result["files"]
 
         add_feed("مدير المشروع", "Project Manager", "linear-gradient(135deg, #f6d365, #fda085)", "PM", f"تم اكتمال المشروع وتجاوز فحص الجودة بنجاح! 🚀 المجلد: `{clean_folder_name}`")
         
@@ -2834,6 +2899,10 @@ def approve():
             return jsonify({"error": "No pending approval required"}), 400
         if req_session_id and workflow_state.get("session_id") and req_session_id != workflow_state.get("session_id"):
             return jsonify({"error": "Approval request session mismatch"}), 400
+        if req_session_id:
+            sess_db = db_store.get_session(req_session_id)
+            if sess_db and sess_db.get("status") in ("cancelled", "failed"):
+                return jsonify({"error": f"Cannot approve {sess_db['status']} session"}), 409
         workflow_state["status"] = "running"
             
     feedback = str(data.get('feedback', '')).strip()
