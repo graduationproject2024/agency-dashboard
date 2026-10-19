@@ -2942,7 +2942,10 @@ def continue_workflow(feedback="", session_id=None, call_agent_fn=None):
             workflow_state["status"] = "failed"
             workflow_state["blockers"].append(str(e))
         if session_id:
-            db_store.update_session_status(session_id, "failed", error_message=str(e))
+            try:
+                db_store.update_session_status(session_id, "failed", error_message=str(e))
+            except Exception as db_err:
+                logging.warning("Failed to update session status to failed for %s: %s", session_id, db_err)
         update_stats()
         add_feed("النظام", "System", "red", "ERR", f"توقف سير العمل: {str(e)}")
 

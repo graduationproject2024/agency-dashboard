@@ -81,66 +81,67 @@ def _serve_directory_ephemerally(directory: str):
 # Workstream A: Crash-Consistent Delivery & Recovery
 # =========================================================================
 
-def test_workstream_a_pre_existing_backup_preserved_on_persistence_failure(tmp_path):
+def test_workstream_a_pre_existing_backup_preserved_on_persistence_failure(monkeypatch, tmp_path):
     """
-    Workstream A: When publish_workflow_deliverables is called with defer_backup_cleanup=True,
-    pre-existing files that are overwritten have backups preserved.
-    If SQLite persistence fails, pre-existing files are restored from backup and newly created files are deleted.
+    Workstream A: Real production failure-handling path in continue_workflow.
+    When persistence fails at the database boundary, the production error handler
+    restores pre-existing files from backup, deletes newly created deliverables,
+    leaves unrelated files untouched, and transitions session to failed.
     """
-    app_dir = str(tmp_path / "app_pre_existing")
+    test_gen_dir = str(tmp_path / "gen_apps_ws_a")
+    os.makedirs(test_gen_dir, exist_ok=True)
+    monkeypatch.setattr("app.GENERATED_APPS_DIR", test_gen_dir)
+
+    def clinic_adapter(prompt_file, role_name, short_name, color, prompt, context_text=""):
+        if "developer" in prompt_file:
+            html = "<!DOCTYPE html><html><body><h1>New Valid App</h1></body></html>"
+            css = "body { color: blue; }"
+            js = "console.log('App loaded');"
+            return f"```html\n{html}\n```\n```css\n{css}\n```\n```javascript\n{js}\n```"
+        return "المرحلة منجزة بنجاح"
+
+    task_name = "تطبيق_استعادة_حقيقي"
+    run_workflow(task_name, call_agent_fn=clinic_adapter)
+    with state_lock:
+        sid = workflow_state["session_id"]
+        assert workflow_state["status"] == "approval_needed"
+
+    app_dir, _ = agency_app.get_project_folder_name(task_name)
     os.makedirs(app_dir, exist_ok=True)
     index_file = os.path.join(app_dir, "index.html")
     with open(index_file, "w", encoding="utf-8") as f:
-        f.write("<!DOCTYPE html><html><head><title>Original User App</title></head><body>Original Content</body></html>")
+        f.write("ORIGINAL_USER_CONTENT_PRE_EXISTING_ABC")
 
-    validated_html = "<!DOCTYPE html><html><head><title>New App</title></head><body>New Content</body></html>"
-    qa_rep = run_qa_checks(validated_html)
+    unrelated_file = os.path.join(app_dir, "user_notes.txt")
+    with open(unrelated_file, "w", encoding="utf-8") as f:
+        f.write("DO_NOT_TOUCH_USER_NOTES")
 
-    # Publish with deferred backup cleanup
-    pub_res = publish_workflow_deliverables(
-        app_dir=app_dir,
-        task_title="Test App",
-        validated_html=validated_html,
-        validated_css="",
-        validated_js="",
-        qa_report=qa_rep,
-        workflow_outputs={},
-        defer_backup_cleanup=True
-    )
-
-    written_files = pub_res["files"]
-    pre_existing_backups = pub_res.get("pre_existing_backups", {})
-    assert index_file in pre_existing_backups
-    bak_path = pre_existing_backups[index_file]
-    assert os.path.exists(bak_path)
-
-    # Verify that new content is temporarily in place
-    with open(index_file, "r", encoding="utf-8") as f:
-        assert "New Content" in f.read()
-
-    # Simulate database persistence failure -> perform the atomic rollback
-    try:
+    # Inject genuine persistence failure at the database manifest boundary
+    def fail_manifest(*args, **kwargs):
         raise sqlite3.OperationalError("Simulated database failure during manifest persistence")
-    except Exception:
-        # Rollback logic from continue_workflow:
-        for fpath in written_files:
-            if fpath in pre_existing_backups:
-                b_path = pre_existing_backups[fpath]
-                if os.path.exists(b_path):
-                    os.replace(b_path, fpath)
-            elif os.path.exists(fpath):
-                os.remove(fpath)
-        cleanup_backups(pre_existing_backups)
+    monkeypatch.setattr(db_store, "record_artifact_manifest", fail_manifest)
 
-    # Verify that original content was restored byte-for-byte!
+    # Invoke real production entry point!
+    continue_workflow(feedback="معتمد", session_id=sid, call_agent_fn=clinic_adapter)
+
+    # Verify real production failure handler ran
+    with state_lock:
+        assert workflow_state["status"] == "failed"
+
+    persisted_sess = db_store.get_session(sid)
+    assert persisted_sess["status"] == "failed"
+
+    # Verify pre-existing index.html was restored byte-for-byte by production code
     with open(index_file, "r", encoding="utf-8") as f:
-        restored = f.read()
-    assert "Original Content" in restored
-    assert "New Content" not in restored
+        assert f.read() == "ORIGINAL_USER_CONTENT_PRE_EXISTING_ABC"
 
-    # Verify newly created files (like plan.md) were removed
+    # Verify unrelated file was preserved
+    with open(unrelated_file, "r", encoding="utf-8") as f:
+        assert f.read() == "DO_NOT_TOUCH_USER_NOTES"
+
+    # Verify newly created deliverables (plan.md, style.css) were removed by production rollback
     assert not os.path.exists(os.path.join(app_dir, "plan.md"))
-    assert not os.path.exists(bak_path)
+    assert not os.path.exists(os.path.join(app_dir, "style.css"))
 
 
 # =========================================================================
@@ -241,23 +242,36 @@ print("LOCKED" if locked else "BUSY")
 
 def test_workstream_b_sqlite_busy_retry_under_contention(tmp_path):
     """
-    Workstream B: Under SQLite lock contention, _retry_on_db_lock waits and retries
-    with bounded exponential backoff rather than failing immediately.
+    Workstream B: Under genuine SQLite lock contention with real connections,
+    _retry_on_db_lock waits and retries until transient lock is released, then succeeds.
     """
     test_db = str(tmp_path / "contention.db")
     db_store.init_db(test_db)
 
-    attempts = {"count": 0}
+    ready = threading.Event()
+    def lock_holder():
+        c = sqlite3.connect(test_db, timeout=1.0)
+        c.execute("BEGIN IMMEDIATE;")
+        c.execute("UPDATE workflow_sessions SET updated_at = 1 WHERE session_id = 'nonexistent';")
+        ready.set()
+        time.sleep(0.3)
+        c.commit()
+        c.close()
 
-    def flaky_db_call():
-        attempts["count"] += 1
-        if attempts["count"] < 3:
-            raise sqlite3.OperationalError("database is locked")
-        return "success"
+    t = threading.Thread(target=lock_holder)
+    t.start()
+    ready.wait()
 
-    result = db_store._retry_on_db_lock(flaky_db_call, max_retries=5, initial_delay=0.01)
-    assert result == "success"
-    assert attempts["count"] == 3
+    start = time.time()
+    sid = "sess_real_contention"
+    db_store.create_session(session_id=sid, project_name="Real Contention Test", task_description="Test", db_path=test_db)
+    t.join()
+    elapsed = time.time() - start
+
+    assert elapsed >= 0.25, f"Expected to wait for real lock release, took {elapsed}s"
+    sess = db_store.get_session(sid, db_path=test_db)
+    assert sess is not None
+    assert sess["session_id"] == sid
 
 
 # =========================================================================
