@@ -2353,7 +2353,8 @@ def publish_workflow_deliverables(
     qa_report: dict,
     workflow_outputs: dict,
     failpoint: Optional[str] = None,
-    defer_backup_cleanup: bool = False
+    defer_backup_cleanup: bool = False,
+    session_id: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Real application publication and promotion transaction boundary.
@@ -2524,6 +2525,18 @@ def publish_workflow_deliverables(
                     rollback_failures.append(
                         f"Failed to rollback {os.path.basename(fpath)} (restoration failed, retained recovery backup at {bak_path}): {rb_err}"
                     )
+                    if session_id:
+                        try:
+                            db_store.record_incomplete_rollback(
+                                session_id=session_id,
+                                delivery_id=delivery_id,
+                                app_dir=app_dir,
+                                target_path=fpath,
+                                backup_path=bak_path,
+                                error_message=str(rb_err)
+                            )
+                        except Exception as rec_err:
+                            logging.error("Failed to record incomplete rollback: %s", rec_err)
                 else:
                     rollback_failures.append(f"Failed to rollback {os.path.basename(fpath)}: {rb_err}")
 
@@ -2865,7 +2878,8 @@ def continue_workflow(feedback="", session_id=None, call_agent_fn=None):
             qa_report=qa_report,
             workflow_outputs=workflow_state.get('outputs', {}),
             failpoint=failpoint,
-            defer_backup_cleanup=True
+            defer_backup_cleanup=True,
+            session_id=session_id
         )
         expected_artifacts = pub_result["expected_artifacts"]
         written_files = pub_result["files"]
@@ -2939,6 +2953,18 @@ def continue_workflow(feedback="", session_id=None, call_agent_fn=None):
                             rollback_failures.append(
                                 f"Failed to rollback {os.path.basename(fpath)} (restoration failed, retained recovery backup at {bak_path}): {rb_e}"
                             )
+                            if session_id:
+                                try:
+                                    db_store.record_incomplete_rollback(
+                                        session_id=session_id,
+                                        delivery_id=delivery_id,
+                                        app_dir=app_dir,
+                                        target_path=fpath,
+                                        backup_path=bak_path,
+                                        error_message=str(rb_e)
+                                    )
+                                except Exception as rec_e:
+                                    logging.error("Failed to record incomplete rollback in continue_workflow: %s", rec_e)
                         else:
                             rollback_failures.append(f"Failed to rollback {os.path.basename(fpath)}: {rb_e}")
 
@@ -3093,6 +3119,88 @@ def get_session_operator_audit(session_id):
     if not audit_report or not audit_report.get("session"):
         return jsonify({"error": "Session not found", "session_id": session_id}), 404
     return jsonify(audit_report)
+
+@app.route('/api/sessions/<session_id>/reconcile_rollback/preview', methods=['GET'])
+def preview_rollback_reconciliation_endpoint(session_id):
+    """
+    Produce non-destructive preview of incomplete rollback reconciliation for operator audit.
+    """
+    if not is_valid_session_id(session_id):
+        return jsonify({"error": "Invalid session identifier format"}), 400
+    session = db_store.get_session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found", "session_id": session_id}), 404
+
+    preview = db_store.preview_rollback_reconciliation(session_id)
+    return jsonify(preview)
+
+@app.route('/api/sessions/<session_id>/reconcile_rollback/apply', methods=['POST'])
+def apply_rollback_reconciliation_endpoint(session_id):
+    """
+    Authorized execution of incomplete rollback reconciliation.
+    Strictly validates origin, prevents concurrent execution, and refuses automatic
+    overwrite if newer user edits or conflicts are detected (unless force=True).
+    """
+    if not is_safe_origin(request):
+        return jsonify({"error": "Forbidden: Invalid origin"}), 403
+    if not is_valid_session_id(session_id):
+        return jsonify({"error": "Invalid session identifier format"}), 400
+    session = db_store.get_session(session_id)
+    if not session:
+        return jsonify({"error": "Session not found", "session_id": session_id}), 404
+
+    data = request.get_json(silent=True) or {}
+    recovery_ids = data.get("recovery_ids")
+    operator_action = data.get("operator_action", "restore_safe")
+    force = bool(data.get("force", False))
+
+    res = db_store.apply_rollback_reconciliation(
+        session_id=session_id,
+        recovery_ids=recovery_ids,
+        operator_action=operator_action,
+        force=force
+    )
+
+    if not res.get("success"):
+        if res.get("conflicts_count", 0) > 0:
+            return jsonify({
+                "error": "Conflict detected: newer user edits exist on disk. Automatic overwrite refused.",
+                "details": res
+            }), 409
+        return jsonify({"error": res.get("error", "Reconciliation failed"), "details": res}), 400
+
+    return jsonify(res)
+
+@app.route('/api/runs/<run_id>/reconcile_usage', methods=['POST'])
+def reconcile_run_usage_endpoint(run_id):
+    """
+    Reconciles an agent run using authoritative provider usage/billing data.
+    """
+    if not is_safe_origin(request):
+        return jsonify({"error": "Forbidden: Invalid origin"}), 403
+    if not run_id or not isinstance(run_id, str):
+        return jsonify({"error": "Invalid run identifier"}), 400
+
+    data = request.get_json(silent=True) or {}
+    provider_tokens = data.get("provider_tokens")
+    cost = data.get("cost")
+    provider_req_id = data.get("provider_request_id")
+
+    lookup_fn = None
+    if provider_tokens is not None:
+        def _authoritative_lookup(rid, req_id):
+            return {
+                "found": True,
+                "tokens": provider_tokens,
+                "cost": cost,
+                "provider_request_id": provider_req_id or req_id
+            }
+        lookup_fn = _authoritative_lookup
+
+    res = db_store.reconcile_provider_run_usage(run_id, provider_lookup_fn=lookup_fn)
+    if not res.get("success"):
+        return jsonify(res), 400
+    return jsonify(res)
 
 @app.route('/api/memory/<project_id>', methods=['GET'])
 def get_project_memory_endpoint(project_id):

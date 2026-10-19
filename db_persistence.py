@@ -218,6 +218,25 @@ def init_db(db_path: Optional[str] = None):
         );
         """)
 
+        # 8. Rollback Recovery Records table (Phase 2.5 Incomplete Rollback Reconciliation)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS rollback_recovery_records (
+            recovery_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            delivery_id TEXT,
+            app_dir TEXT NOT NULL,
+            relative_path TEXT NOT NULL,
+            backup_path TEXT NOT NULL,
+            original_sha256 TEXT,
+            candidate_sha256 TEXT,
+            status TEXT NOT NULL CHECK(status IN ('pending', 'in_progress', 'restored', 'conflicted', 'failed', 'completed')),
+            error_message TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES workflow_sessions(session_id) ON DELETE CASCADE
+        );
+        """)
+
         # Create Indexes for fast traversal and correlation
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON workflow_tasks(session_id);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status ON workflow_tasks(status);")
@@ -227,12 +246,18 @@ def init_db(db_path: Optional[str] = None):
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_checkpoints_session ON execution_checkpoints(session_id, created_at);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_manifest_session ON artifact_manifests(session_id);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_manifest_qa_run ON artifact_manifests(qa_run_id);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_rollback_recovery_session ON rollback_recovery_records(session_id);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_rollback_recovery_status ON rollback_recovery_records(status);")
 
-        # Ensure token_source column exists in agent_runs table
+        # Ensure token_source, provider_request_id, and reconciliation_status columns exist in agent_runs table
         cursor.execute("PRAGMA table_info(agent_runs);")
         run_cols = {row[1] for row in cursor.fetchall()}
         if "token_source" not in run_cols:
             cursor.execute("ALTER TABLE agent_runs ADD COLUMN token_source TEXT DEFAULT 'estimated';")
+        if "provider_request_id" not in run_cols:
+            cursor.execute("ALTER TABLE agent_runs ADD COLUMN provider_request_id TEXT;")
+        if "reconciliation_status" not in run_cols:
+            cursor.execute("ALTER TABLE agent_runs ADD COLUMN reconciliation_status TEXT DEFAULT 'none';")
 
         # Ensure workflow_sessions check constraint includes 'interrupted'
         cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='workflow_sessions';")
@@ -1541,6 +1566,71 @@ def reconcile_interrupted_sessions(db_path: Optional[str] = None) -> int:
                 WHERE task_id = ?;
             """, (ot["task_id"],))
 
+        # 5. Crash-Consistent Recovery for In-Flight Rollback Records (Phase 2.5)
+        # Reconcile any rollback_recovery_records stuck in 'in_progress' or 'restored'
+        try:
+            r_table = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='rollback_recovery_records';").fetchone()
+            if r_table:
+                in_flight_recoveries = conn.execute("""
+                    SELECT * FROM rollback_recovery_records
+                    WHERE status IN ('in_progress', 'restored');
+                """).fetchall()
+
+                for rec in in_flight_recoveries:
+                    r_id = rec["recovery_id"]
+                    r_app_dir = rec["app_dir"]
+                    r_rel_path = rec["relative_path"]
+                    r_bak_path = rec["backup_path"]
+
+                    try:
+                        r_target = validate_project_artifact_path(r_app_dir, r_rel_path)
+                    except Exception:
+                        continue
+
+                    bak_exists = os.path.exists(r_bak_path)
+                    bak_sha = None
+                    if bak_exists:
+                        try:
+                            with open(r_bak_path, "rb") as bf:
+                                bak_sha = hashlib.sha256(bf.read()).hexdigest()
+                        except Exception:
+                            pass
+
+                    tgt_exists = os.path.exists(r_target)
+                    tgt_sha = None
+                    if tgt_exists:
+                        try:
+                            with open(r_target, "rb") as tf:
+                                tgt_sha = hashlib.sha256(tf.read()).hexdigest()
+                        except Exception:
+                            pass
+
+                    if tgt_exists and bak_sha and tgt_sha == bak_sha:
+                        # Target file was already restored before process died!
+                        # Complete the recovery record and safely unlink the backup file
+                        conn.execute("""
+                            UPDATE rollback_recovery_records
+                            SET status = 'completed', error_message = NULL, updated_at = ?
+                            WHERE recovery_id = ?;
+                        """, (time.time(), r_id))
+                        try:
+                            if os.path.exists(r_bak_path):
+                                os.remove(r_bak_path)
+                        except Exception:
+                            pass
+                    else:
+                        # Target was not restored or differs from backup:
+                        # Reset status to 'pending' so it can be resumed by operator
+                        conn.execute("""
+                            UPDATE rollback_recovery_records
+                            SET status = 'pending',
+                                error_message = 'Interrupted during recovery. Reset to pending for verified operator execution.',
+                                updated_at = ?
+                            WHERE recovery_id = ?;
+                        """, (time.time(), r_id))
+        except Exception as rec_err:
+            logging.warning("Error reconciling rollback recovery records: %s", rec_err)
+
         conn.commit()
     return len(interrupted_ids)
 
@@ -1649,9 +1739,10 @@ def get_operator_session_audit(session_id: str, db_path: Optional[str] = None) -
     Produce a complete, correlation-verified operator failure and diagnostic report.
     Aggregates:
     - Session, tasks, agent runs, handoffs, checkpoints, and project memory
-    - Cost & token accounting (provider_reported vs estimated, ambiguity status)
+    - Cost & token accounting (provider_reported, provider_confirmed, estimated, ambiguity status)
     - QA run & self-healing remediation cycles
     - Published artifact manifest & delivery identity
+    - Incomplete rollback recovery tracking and conflict detection
     - Actionable failure analysis and permitted recovery actions
     """
     with get_db_connection(db_path) as conn:
@@ -1675,16 +1766,32 @@ def get_operator_session_audit(session_id: str, db_path: Optional[str] = None) -
         mem_rows = conn.execute("SELECT * FROM project_memory WHERE session_id = ? ORDER BY created_at ASC;", (session_id,)).fetchall()
         memory_items = [dict(m) for m in mem_rows]
 
+        # Query rollback recovery records
+        rollback_records = []
+        try:
+            r_table = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='rollback_recovery_records';").fetchone()
+            if r_table:
+                r_rows = conn.execute("SELECT * FROM rollback_recovery_records WHERE session_id = ? ORDER BY created_at ASC;", (session_id,)).fetchall()
+                rollback_records = [dict(r) for r in r_rows]
+        except Exception:
+            rollback_records = []
+
     # Token & financial accounting analysis
     total_tokens = 0
     provider_reported_tokens = 0
+    provider_confirmed_tokens = 0
     estimated_tokens = 0
     in_flight_runs = []
+    provider_reconciliation_pending = False
     
     for r in runs:
         tok = int(r.get("tokens_used") or 0)
         source = r.get("token_source") or "estimated"
-        if r.get("status") == "completed":
+        rec_st = r.get("reconciliation_status")
+        if source == "provider_confirmed":
+            provider_confirmed_tokens += tok
+            total_tokens += tok
+        elif r.get("status") == "completed":
             total_tokens += tok
             if source == "provider_reported":
                 provider_reported_tokens += tok
@@ -1692,6 +1799,9 @@ def get_operator_session_audit(session_id: str, db_path: Optional[str] = None) -
                 estimated_tokens += tok
         elif r.get("status") in ("in_progress", "pending"):
             in_flight_runs.append(r)
+
+        if rec_st in ("pending", "none") and ("ambiguous" in (r.get("error_message") or "").lower() or r.get("status") == "failed"):
+            provider_reconciliation_pending = True
 
     has_ambiguous_provider_call = any(
         "ambiguous" in (r.get("error_message") or "").lower() or
@@ -1711,10 +1821,20 @@ def get_operator_session_audit(session_id: str, db_path: Optional[str] = None) -
     is_delivery_completed = bool(delivery_task and delivery_task.get("status") == "completed")
     delivery_id = manifest[0].get("delivery_id") if manifest else None
 
+    # Rollback recovery state analysis
+    has_rollback_records = len(rollback_records) > 0
+    recovery_required = any(r.get("status") in ("pending", "in_progress") for r in rollback_records)
+    recovery_in_progress = any(r.get("status") == "in_progress" for r in rollback_records)
+    recovery_completed = has_rollback_records and all(r.get("status") == "completed" for r in rollback_records)
+    artifact_conflict_detected = any(r.get("status") == "conflicted" for r in rollback_records)
+    backup_retained = any(os.path.exists(r.get("backup_path", "")) for r in rollback_records)
+
     # Failure analysis
     failed_task = next((t for t in tasks if t.get("status") == "failed"), None)
-    rollback_failed = "rollback error" in (session.get("error_message") or "").lower()
-    is_retry_safe = not has_ambiguous_provider_call and not rollback_failed and (session.get("status") in ("interrupted", "failed"))
+    rollback_failed = ("rollback error" in (session.get("error_message") or "").lower()) and not recovery_completed
+    if rollback_failed:
+        backup_retained = True
+    is_retry_safe = not has_ambiguous_provider_call and not rollback_failed and not recovery_required and not artifact_conflict_detected and (session.get("status") in ("interrupted", "failed"))
 
     # Permitted recovery actions
     status = session.get("status")
@@ -1726,7 +1846,9 @@ def get_operator_session_audit(session_id: str, db_path: Optional[str] = None) -
     elif status == "interrupted":
         permitted_recovery = ["resume", "cancel"]
     elif status == "failed":
-        if rollback_failed:
+        if artifact_conflict_detected:
+            permitted_recovery = ["inspect_diagnostics", "resolve_conflict_manually"]
+        elif rollback_failed or recovery_required:
             permitted_recovery = ["inspect_diagnostics", "reconcile_incomplete_rollback"]
         else:
             permitted_recovery = ["retry"] if is_retry_safe else ["inspect_diagnostics"]
@@ -1748,9 +1870,12 @@ def get_operator_session_audit(session_id: str, db_path: Optional[str] = None) -
         "cost_and_token_accounting": {
             "total_tokens_billed": total_tokens,
             "provider_reported_tokens": provider_reported_tokens,
+            "provider_confirmed_tokens": provider_confirmed_tokens,
             "estimated_tokens": estimated_tokens,
             "potential_cost_incurred": potential_cost_incurred,
             "has_ambiguous_provider_call": has_ambiguous_provider_call,
+            "provider_reconciliation_pending": provider_reconciliation_pending,
+            "permitted_accounting_actions": ["reconcile_provider_usage"] if (provider_reconciliation_pending or has_ambiguous_provider_call) else [],
             "in_flight_runs_count": len(in_flight_runs)
         },
         "qa_and_remediation": {
@@ -1765,18 +1890,735 @@ def get_operator_session_audit(session_id: str, db_path: Optional[str] = None) -
             "published_artifact_count": len(manifest),
             "manifest_verified": len(manifest) > 0
         },
+        "rollback_recovery": {
+            "records": rollback_records,
+            "recovery_required": recovery_required or rollback_failed,
+            "recovery_in_progress": recovery_in_progress,
+            "recovery_completed": recovery_completed,
+            "artifact_conflict_detected": artifact_conflict_detected,
+            "backup_retained": backup_retained
+        },
         "failure_analysis": {
             "status": status,
             "failed_at_stage": session.get("current_stage"),
             "failed_task_id": failed_task["task_id"] if failed_task else None,
             "error_message": session.get("error_message"),
             "is_provider_ambiguous": has_ambiguous_provider_call,
+            "provider_reconciliation_pending": provider_reconciliation_pending,
             "rollback_failed": rollback_failed,
+            "recovery_required": recovery_required or rollback_failed,
+            "recovery_in_progress": recovery_in_progress,
+            "recovery_completed": recovery_completed,
+            "artifact_conflict_detected": artifact_conflict_detected,
+            "backup_retained": backup_retained,
             "is_retry_safe": is_retry_safe
         },
         "permitted_recovery_actions": permitted_recovery,
         "manifest": manifest,
         "handoffs": handoffs
     }
+
+
+# =========================================================================
+# Phase 2.5: Incomplete Rollback Discovery, Preview & Safe Reconciliation
+# =========================================================================
+
+WINDOWS_RESERVED_DEVICE_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
+}
+
+def validate_project_artifact_path(app_dir: str, rel_path: str) -> str:
+    """
+    Validate that rel_path is a safe relative artifact path strictly confined inside app_dir.
+    Rejects:
+    - Empty paths and null bytes
+    - Absolute paths, drive prefixes (e.g. C:, D:), UNC paths (\\\\server\\share)
+    - Path traversal ('..')
+    - Alternate data streams (':')
+    - Windows reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
+    - Symlink escapes resolving outside app_dir
+    Returns the resolved absolute path.
+    Raises ValueError on violation.
+    """
+    if not rel_path or not isinstance(rel_path, str) or not rel_path.strip():
+        raise ValueError("Artifact path must be a non-empty string.")
+    if "\0" in rel_path:
+        raise ValueError("Artifact path contains illegal null byte.")
+    
+    # Check for drive prefixes (e.g. C:) or UNC paths
+    drive, _ = os.path.splitdrive(rel_path)
+    if drive or rel_path.startswith(("\\\\", "//")):
+        raise ValueError(f"Drive prefixes and UNC paths are forbidden: '{rel_path}'")
+    
+    # Check for alternate data streams (contain ':')
+    if ":" in rel_path:
+        raise ValueError(f"Alternate data streams are forbidden: '{rel_path}'")
+
+    # Reject absolute paths
+    if os.path.isabs(rel_path) or rel_path.startswith(("/", "\\")):
+        raise ValueError(f"Absolute artifact paths are forbidden: '{rel_path}'")
+
+    # Normalize separators
+    normalized = rel_path.replace("\\", "/").strip("/")
+    parts = normalized.split("/")
+
+    # Check each part for traversal or reserved names
+    for part in parts:
+        if not part or part == ".":
+            continue
+        if part == "..":
+            raise ValueError(f"Path traversal ('..') is forbidden: '{rel_path}'")
+        
+        # Check Windows reserved device names (e.g. NUL, CON, COM1.txt, etc.)
+        stem = part.split(".")[0].upper()
+        if stem in WINDOWS_RESERVED_DEVICE_NAMES or part.upper() in WINDOWS_RESERVED_DEVICE_NAMES:
+            raise ValueError(f"Windows reserved device name forbidden: '{part}' in '{rel_path}'")
+
+    canonical_app_dir = os.path.realpath(os.path.abspath(app_dir))
+    target_abs = os.path.abspath(os.path.join(canonical_app_dir, *parts))
+    canonical_target = os.path.realpath(target_abs)
+
+    # Ensure target is strictly within app_dir
+    try:
+        common = os.path.commonpath([canonical_app_dir, canonical_target])
+    except ValueError as e:
+        raise ValueError(f"Artifact path lies outside permitted project root: {e}")
+
+    if common != canonical_app_dir:
+        raise ValueError(f"Path escape detected: '{rel_path}' resolves outside project root '{app_dir}'")
+
+    return target_abs
+
+
+def record_incomplete_rollback(
+    session_id: str,
+    delivery_id: Optional[str],
+    app_dir: str,
+    target_path: str,
+    backup_path: str,
+    original_sha256: Optional[str] = None,
+    candidate_sha256: Optional[str] = None,
+    error_message: Optional[str] = None,
+    db_path: Optional[str] = None
+) -> str:
+    """
+    Durably records an incomplete or failed rollback artifact.
+    Computes original_sha256 from backup if present and candidate_sha256 from target if present.
+    Ensures safe path confinement and valid record status ('pending').
+    """
+    # Validate relative path
+    rel_path = os.path.relpath(target_path, app_dir)
+    validated_target = validate_project_artifact_path(app_dir, rel_path)
+
+    now = time.time()
+    recovery_id = f"rec_{uuid.uuid4().hex[:12]}"
+
+    # Compute digests if not provided
+    if not original_sha256 and os.path.exists(backup_path):
+        try:
+            with open(backup_path, "rb") as bf:
+                original_sha256 = hashlib.sha256(bf.read()).hexdigest()
+        except Exception:
+            pass
+
+    if not candidate_sha256 and os.path.exists(validated_target):
+        try:
+            with open(validated_target, "rb") as tf:
+                candidate_sha256 = hashlib.sha256(tf.read()).hexdigest()
+        except Exception:
+            pass
+
+    safe_error = sanitize_memory_content(error_message) if error_message else None
+
+    with get_db_connection(db_path) as conn:
+        conn.execute("""
+            INSERT INTO rollback_recovery_records (
+                recovery_id, session_id, delivery_id, app_dir, relative_path,
+                backup_path, original_sha256, candidate_sha256, status,
+                error_message, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?);
+        """, (
+            recovery_id, session_id, delivery_id, os.path.abspath(app_dir),
+            rel_path.replace("\\", "/"), os.path.abspath(backup_path),
+            original_sha256, candidate_sha256, safe_error, now, now
+        ))
+        conn.commit()
+
+    return recovery_id
+
+
+def preview_rollback_reconciliation(
+    session_id: str,
+    db_path: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Produces a non-destructive audit preview for incomplete rollback reconciliation.
+    Inspects disk and durable metadata:
+    - Original artifact relative path and canonical absolute path
+    - Backup file existence and SHA-256 digest
+    - Current target file existence and SHA-256 digest
+    - Candidate and expected original digests
+    - Comparison:
+      - 'already_restored': current matches backup SHA
+      - 'safe_to_restore': current matches candidate SHA or is missing
+      - 'conflicted': current exists and matches neither (newer user edits!)
+      - 'backup_missing': backup file deleted or unreadable
+    - Proposed action and supporting evidence
+    - Never mutates files or session state.
+    """
+    with get_db_connection(db_path) as conn:
+        sess_row = conn.execute("SELECT * FROM workflow_sessions WHERE session_id = ?;", (session_id,)).fetchone()
+        if not sess_row:
+            return {"error": "Session not found", "session_id": session_id}
+        
+        records = conn.execute(
+            "SELECT * FROM rollback_recovery_records WHERE session_id = ? ORDER BY created_at ASC;",
+            (session_id,)
+        ).fetchall()
+        rec_list = [dict(r) for r in records]
+
+    artifacts_preview = []
+    has_conflicts = False
+    all_safe = True
+
+    for r in rec_list:
+        rec_id = r["recovery_id"]
+        r_app_dir = r["app_dir"]
+        rel_path = r["relative_path"]
+        bak_path = r["backup_path"]
+        orig_sha = r["original_sha256"]
+        cand_sha = r["candidate_sha256"]
+        db_status = r["status"]
+
+        # Validate path
+        try:
+            target_path = validate_project_artifact_path(r_app_dir, rel_path)
+        except Exception as pe:
+            artifacts_preview.append({
+                "recovery_id": rec_id,
+                "relative_path": rel_path,
+                "status": "invalid_path",
+                "error": str(pe),
+                "is_safe": False,
+                "proposed_action": "reject_unsafe_path"
+            })
+            has_conflicts = True
+            all_safe = False
+            continue
+
+        backup_exists = os.path.exists(bak_path)
+        backup_sha = None
+        if backup_exists:
+            try:
+                with open(bak_path, "rb") as bf:
+                    backup_sha = hashlib.sha256(bf.read()).hexdigest()
+            except Exception:
+                pass
+
+        target_exists = os.path.exists(target_path)
+        target_sha = None
+        if target_exists:
+            try:
+                with open(target_path, "rb") as tf:
+                    target_sha = hashlib.sha256(tf.read()).hexdigest()
+            except Exception:
+                pass
+
+        # Determine content state and proposed action
+        if not backup_exists or not backup_sha:
+            content_state = "backup_missing"
+            proposed_action = "manual_investigation"
+            is_safe = False
+            evidence = "Retained recovery backup is missing or unreadable on disk."
+            has_conflicts = True
+            all_safe = False
+        elif target_exists and target_sha == backup_sha:
+            content_state = "already_restored"
+            proposed_action = "cleanup_backup_only"
+            is_safe = True
+            evidence = "Current file SHA-256 matches backup digest; original content is already restored."
+        elif not target_exists or (cand_sha and target_sha == cand_sha):
+            content_state = "matches_candidate" if target_exists else "target_missing"
+            proposed_action = "restore_backup"
+            is_safe = True
+            evidence = "Current file matches uncommitted candidate deliverable or is missing; safe to restore original backup."
+        else:
+            # File exists, but differs from BOTH backup and candidate!
+            # Newer user edit or external modification!
+            content_state = "conflicted_newer_user_edit"
+            proposed_action = "manual_intervention_required"
+            is_safe = False
+            evidence = (
+                f"Current file digest ({target_sha[:12]}...) differs from both original backup "
+                f"({backup_sha[:12]}...) and candidate ({cand_sha[:12] if cand_sha else 'unknown'}...). "
+                f"External modifications or newer user edits detected. Automatic overwrite is forbidden."
+            )
+            has_conflicts = True
+            all_safe = False
+
+        artifacts_preview.append({
+            "recovery_id": rec_id,
+            "relative_path": rel_path,
+            "target_path": target_path,
+            "backup_path": bak_path,
+            "db_status": db_status,
+            "backup_exists": backup_exists,
+            "backup_sha256": backup_sha,
+            "target_exists": target_exists,
+            "target_sha256": target_sha,
+            "original_sha256": orig_sha,
+            "candidate_sha256": cand_sha,
+            "content_state": content_state,
+            "proposed_action": proposed_action,
+            "is_safe": is_safe,
+            "evidence": evidence
+        })
+
+    return {
+        "session_id": session_id,
+        "delivery_id": rec_list[0].get("delivery_id") if rec_list else None,
+        "total_records": len(artifacts_preview),
+        "can_auto_reconcile": all_safe and len(artifacts_preview) > 0,
+        "conflicts_detected": has_conflicts,
+        "artifacts": artifacts_preview,
+        "summary": "Reconciliation preview complete. Review proposed actions."
+    }
+
+
+def apply_rollback_reconciliation(
+    session_id: str,
+    recovery_ids: Optional[List[str]] = None,
+    operator_action: str = "restore_safe",
+    force: bool = False,
+    failpoint: Optional[str] = None,
+    db_path: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Executes authorized reconciliation for incomplete rollbacks under a durable state machine:
+    1. Acquire claim: status -> 'in_progress' with updated_at timestamp.
+       Prevents concurrent reconciliation on the same session/records.
+    2. Validate safety:
+       - If current file has newer user edits (differs from candidate and backup),
+         and force is False: transitions status -> 'conflicted', stops, returns conflict details.
+       - Re-verifies target path inside project root.
+    3. Execute restoration:
+       - Restores backup to target using atomic replacement.
+       - Immediately computes SHA-256 of restored file and verifies match against backup SHA.
+       - If mismatch: transitions to 'failed', retains backup.
+       - If match: status -> 'restored'.
+    4. Durable DB commit: status -> 'completed'.
+    5. Cleanup: Backup file is ONLY unlinked after verified restore and DB commit!
+    6. Updates session failure_analysis / permitted_recovery_actions if all recoveries complete.
+    7. Idempotent: repeated runs for completed recoveries return success without error.
+    """
+    now = time.time()
+    results = []
+    
+    with get_db_connection(db_path) as conn:
+        sess_row = conn.execute("SELECT * FROM workflow_sessions WHERE session_id = ?;", (session_id,)).fetchone()
+        if not sess_row:
+            return {"success": False, "error": "Session not found", "session_id": session_id}
+
+        # Select target recovery records
+        if recovery_ids:
+            placeholders = ",".join(["?"] * len(recovery_ids))
+            query = f"SELECT * FROM rollback_recovery_records WHERE session_id = ? AND recovery_id IN ({placeholders});"
+            records = conn.execute(query, [session_id] + list(recovery_ids)).fetchall()
+        else:
+            records = conn.execute(
+                "SELECT * FROM rollback_recovery_records WHERE session_id = ? AND status != 'completed';",
+                (session_id,)
+            ).fetchall()
+
+        rec_list = [dict(r) for r in records]
+        if not rec_list:
+            # Check if all records were already completed
+            completed_count = conn.execute(
+                "SELECT COUNT(*) as cnt FROM rollback_recovery_records WHERE session_id = ? AND status = 'completed';",
+                (session_id,)
+            ).fetchone()["cnt"]
+            if completed_count > 0:
+                return {
+                    "success": True,
+                    "session_id": session_id,
+                    "reconciled_count": 0,
+                    "already_completed": True,
+                    "message": "All rollback recoveries for this session have already been completed."
+                }
+            return {
+                "success": False,
+                "error": "No recovery records found to reconcile",
+                "session_id": session_id
+            }
+
+        # 1. Acquire claims atomically
+        for r in rec_list:
+            rec_id = r["recovery_id"]
+            if r["status"] == "in_progress":
+                # Check for stale lease (older than 60s)
+                if now - r["updated_at"] < 60.0:
+                    return {
+                        "success": False,
+                        "error": f"Concurrent reconciliation in progress for recovery record {rec_id}",
+                        "recovery_id": rec_id
+                    }
+            
+            conn.execute("""
+                UPDATE rollback_recovery_records
+                SET status = 'in_progress', updated_at = ?
+                WHERE recovery_id = ?;
+            """, (now, rec_id))
+        conn.commit()
+
+    if failpoint == "after_claim_before_intent":
+        raise IOError("Crash simulated after claim acquired before intent persisted")
+
+    # Process each record
+    all_succeeded = True
+    for r in rec_list:
+        rec_id = r["recovery_id"]
+        app_dir = r["app_dir"]
+        rel_path = r["relative_path"]
+        bak_path = r["backup_path"]
+        cand_sha = r["candidate_sha256"]
+
+        try:
+            target_path = validate_project_artifact_path(app_dir, rel_path)
+        except Exception as pe:
+            with get_db_connection(db_path) as conn:
+                conn.execute(
+                    "UPDATE rollback_recovery_records SET status = 'failed', error_message = ?, updated_at = ? WHERE recovery_id = ?;",
+                    (str(pe), time.time(), rec_id)
+                )
+                conn.commit()
+            results.append({"recovery_id": rec_id, "status": "failed", "error": str(pe)})
+            all_succeeded = False
+            continue
+
+        if not os.path.exists(bak_path):
+            err_msg = f"Recovery backup file missing on disk: {bak_path}"
+            with get_db_connection(db_path) as conn:
+                conn.execute(
+                    "UPDATE rollback_recovery_records SET status = 'failed', error_message = ?, updated_at = ? WHERE recovery_id = ?;",
+                    (err_msg, time.time(), rec_id)
+                )
+                conn.commit()
+            results.append({"recovery_id": rec_id, "status": "failed", "error": err_msg})
+            all_succeeded = False
+            continue
+
+        with open(bak_path, "rb") as bf:
+            backup_bytes = bf.read()
+        backup_sha = hashlib.sha256(backup_bytes).hexdigest()
+
+        target_exists = os.path.exists(target_path)
+        target_sha = None
+        if target_exists:
+            with open(target_path, "rb") as tf:
+                target_sha = hashlib.sha256(tf.read()).hexdigest()
+
+        # Check for conflict: current file differs from both original backup and candidate!
+        if target_exists and target_sha != backup_sha and target_sha != cand_sha:
+            if not force:
+                conflict_msg = (
+                    f"Conflict detected: target file '{rel_path}' has newer user edits "
+                    f"(SHA {target_sha[:12]}... matches neither backup nor candidate). "
+                    f"Automatic overwrite refused."
+                )
+                with get_db_connection(db_path) as conn:
+                    conn.execute(
+                        "UPDATE rollback_recovery_records SET status = 'conflicted', error_message = ?, updated_at = ? WHERE recovery_id = ?;",
+                        (conflict_msg, time.time(), rec_id)
+                    )
+                    conn.commit()
+                results.append({"recovery_id": rec_id, "status": "conflicted", "error": conflict_msg})
+                all_succeeded = False
+                continue
+
+        if failpoint == "before_filesystem_restore":
+            raise IOError("Crash simulated before filesystem restore")
+
+        # Restoration step:
+        if not target_exists or target_sha != backup_sha:
+            try:
+                temp_restore = target_path + f".restoring_{uuid.uuid4().hex[:6]}"
+                with open(temp_restore, "wb") as rf:
+                    rf.write(backup_bytes)
+                    rf.flush()
+                    os.fsync(rf.fileno())
+                os.replace(temp_restore, target_path)
+            except Exception as restore_err:
+                with get_db_connection(db_path) as conn:
+                    conn.execute(
+                        "UPDATE rollback_recovery_records SET status = 'failed', error_message = ?, updated_at = ? WHERE recovery_id = ?;",
+                        (f"Filesystem restoration failed: {restore_err}", time.time(), rec_id)
+                    )
+                    conn.commit()
+                results.append({"recovery_id": rec_id, "status": "failed", "error": str(restore_err)})
+                all_succeeded = False
+                continue
+
+        if failpoint == "after_restore_before_verification":
+            raise IOError("Crash simulated after restore before verification")
+
+        # Verification step:
+        with open(target_path, "rb") as tf:
+            restored_sha = hashlib.sha256(tf.read()).hexdigest()
+
+        if restored_sha != backup_sha:
+            err_msg = f"Post-restore verification failed: restored SHA ({restored_sha[:12]}...) does not match backup ({backup_sha[:12]}...)"
+            with get_db_connection(db_path) as conn:
+                conn.execute(
+                    "UPDATE rollback_recovery_records SET status = 'failed', error_message = ?, updated_at = ? WHERE recovery_id = ?;",
+                    (err_msg, time.time(), rec_id)
+                )
+                conn.commit()
+            results.append({"recovery_id": rec_id, "status": "failed", "error": err_msg})
+            all_succeeded = False
+            continue
+
+        with get_db_connection(db_path) as conn:
+            conn.execute(
+                "UPDATE rollback_recovery_records SET status = 'restored', updated_at = ? WHERE recovery_id = ?;",
+                (time.time(), rec_id)
+            )
+            conn.commit()
+
+        if failpoint == "after_verification_before_sqlite_commit":
+            raise IOError("Crash simulated after verification before SQLite commit")
+
+        # SQLite outcome persisted: status = 'completed'
+        with get_db_connection(db_path) as conn:
+            conn.execute(
+                "UPDATE rollback_recovery_records SET status = 'completed', error_message = NULL, updated_at = ? WHERE recovery_id = ?;",
+                (time.time(), rec_id)
+            )
+            conn.commit()
+
+        if failpoint == "after_sqlite_commit_before_cleanup":
+            raise IOError("Crash simulated after SQLite commit before backup cleanup")
+
+        # Backup cleanup: ONLY after verified restore and DB commit!
+        try:
+            if os.path.exists(bak_path):
+                os.remove(bak_path)
+        except Exception as clean_err:
+            logging.warning("Could not unlink backup %s after completed recovery: %s", bak_path, clean_err)
+
+        results.append({
+            "recovery_id": rec_id,
+            "relative_path": rel_path,
+            "status": "completed",
+            "restored_sha256": restored_sha
+        })
+
+    # If all records completed, check if session rollback_failed error can be cleared
+    with get_db_connection(db_path) as conn:
+        pending_recs = conn.execute(
+            "SELECT COUNT(*) as cnt FROM rollback_recovery_records WHERE session_id = ? AND status != 'completed';",
+            (session_id,)
+        ).fetchone()["cnt"]
+        if pending_recs == 0:
+            sess_err = conn.execute("SELECT error_message FROM workflow_sessions WHERE session_id = ?;", (session_id,)).fetchone()
+            if sess_err and sess_err["error_message"] and "rollback error" in sess_err["error_message"].lower():
+                cleared_msg = sess_err["error_message"] + " [Rollback successfully reconciled by operator]"
+                conn.execute(
+                    "UPDATE workflow_sessions SET error_message = ?, updated_at = ? WHERE session_id = ?;",
+                    (cleared_msg, time.time(), session_id)
+                )
+                conn.commit()
+
+    return {
+        "success": all_succeeded,
+        "session_id": session_id,
+        "results": results,
+        "reconciled_count": sum(1 for r in results if r["status"] == "completed"),
+        "conflicts_count": sum(1 for r in results if r["status"] == "conflicted"),
+        "failed_count": sum(1 for r in results if r["status"] == "failed")
+    }
+
+
+def reconcile_provider_run_usage(
+    run_id: str,
+    provider_lookup_fn: Optional[Any] = None,
+    db_path: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Reconciles usage and billing for an agent run using authoritative provider lookup data.
+    Guarantees:
+    - Never auto-replays generative model prompts.
+    - Idempotent: repeated calls do not double-count or alter already-confirmed runs.
+    - Preserves explicit provider-reported 0 tokens.
+    - Rejects negative or malformed usage.
+    - Reconciles tokens_used, token_source ('provider_confirmed'), reconciliation_status ('completed'/'unresolved'/'failed').
+    - Updates run and ledger under a durable transaction boundary.
+    """
+    with get_db_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(agent_runs);")
+        cols = {row[1] for row in cursor.fetchall()}
+        
+        row = cursor.execute("SELECT * FROM agent_runs WHERE run_id = ?;", (run_id,)).fetchone()
+        if not row:
+            return {"success": False, "error": "Run not found", "run_id": run_id}
+        
+        run_data = dict(row)
+        rec_status = run_data.get("reconciliation_status") or "none"
+
+        # Idempotency check: if already completed, return existing verified data without re-accounting
+        if rec_status == "completed":
+            return {
+                "success": True,
+                "already_reconciled": True,
+                "run_id": run_id,
+                "tokens_used": run_data.get("tokens_used", 0),
+                "token_source": run_data.get("token_source", "provider_confirmed"),
+                "reconciliation_status": "completed",
+                "message": "Run usage was previously reconciled with authoritative provider data."
+            }
+
+        provider_req_id = run_data.get("provider_request_id")
+
+        if provider_lookup_fn is None:
+            # No lookup provider provided - mark unresolved and return limitation
+            if "reconciliation_status" in cols:
+                conn.execute(
+                    "UPDATE agent_runs SET reconciliation_status = 'unresolved' WHERE run_id = ?;",
+                    (run_id,)
+                )
+                conn.commit()
+            return {
+                "success": False,
+                "run_id": run_id,
+                "reconciliation_status": "unresolved",
+                "error": "Authoritative provider lookup function not provided. Replay of generative prompts is forbidden."
+            }
+
+        # Perform authoritative lookup
+        try:
+            lookup_result = provider_lookup_fn(run_id, provider_req_id)
+        except Exception as lookup_err:
+            if "reconciliation_status" in cols:
+                conn.execute(
+                    "UPDATE agent_runs SET reconciliation_status = 'unresolved' WHERE run_id = ?;",
+                    (run_id,)
+                )
+                conn.commit()
+            return {
+                "success": False,
+                "run_id": run_id,
+                "reconciliation_status": "unresolved",
+                "error": f"Authoritative provider usage lookup failed: {lookup_err}"
+            }
+
+        if not isinstance(lookup_result, dict):
+            if "reconciliation_status" in cols:
+                conn.execute(
+                    "UPDATE agent_runs SET reconciliation_status = 'failed' WHERE run_id = ?;",
+                    (run_id,)
+                )
+                conn.commit()
+            return {
+                "success": False,
+                "run_id": run_id,
+                "reconciliation_status": "failed",
+                "error": "Malformed provider response: expected dictionary."
+            }
+
+        if not lookup_result.get("found", True):
+            if "reconciliation_status" in cols:
+                conn.execute(
+                    "UPDATE agent_runs SET reconciliation_status = 'unresolved' WHERE run_id = ?;",
+                    (run_id,)
+                )
+                conn.commit()
+            return {
+                "success": False,
+                "run_id": run_id,
+                "reconciliation_status": "unresolved",
+                "message": lookup_result.get("message", "Provider usage data unavailable or inconclusive.")
+            }
+
+        confirmed_tokens_raw = lookup_result.get("tokens")
+        if confirmed_tokens_raw is None:
+            confirmed_tokens_raw = lookup_result.get("confirmed_tokens")
+
+        if confirmed_tokens_raw is None:
+            if "reconciliation_status" in cols:
+                conn.execute(
+                    "UPDATE agent_runs SET reconciliation_status = 'unresolved' WHERE run_id = ?;",
+                    (run_id,)
+                )
+                conn.commit()
+            return {
+                "success": False,
+                "run_id": run_id,
+                "reconciliation_status": "unresolved",
+                "error": "Provider response did not contain verified token usage."
+            }
+
+        try:
+            confirmed_tokens = int(confirmed_tokens_raw)
+        except (ValueError, TypeError):
+            if "reconciliation_status" in cols:
+                conn.execute(
+                    "UPDATE agent_runs SET reconciliation_status = 'failed' WHERE run_id = ?;",
+                    (run_id,)
+                )
+                conn.commit()
+            return {
+                "success": False,
+                "run_id": run_id,
+                "reconciliation_status": "failed",
+                "error": f"Malformed provider token value: {confirmed_tokens_raw}"
+            }
+
+        # Guard against negative values
+        if confirmed_tokens < 0:
+            if "reconciliation_status" in cols:
+                conn.execute(
+                    "UPDATE agent_runs SET reconciliation_status = 'failed' WHERE run_id = ?;",
+                    (run_id,)
+                )
+                conn.commit()
+            return {
+                "success": False,
+                "run_id": run_id,
+                "reconciliation_status": "failed",
+                "error": f"Negative provider token value rejected: {confirmed_tokens}"
+            }
+
+        # Valid confirmed tokens (including explicit 0)!
+        resolved_req_id = lookup_result.get("provider_request_id") or provider_req_id
+        
+        # Atomically update agent_runs under durable transaction boundary
+        update_fields = [
+            "tokens_used = ?",
+            "token_source = 'provider_confirmed'",
+            "reconciliation_status = 'completed'"
+        ]
+        params = [confirmed_tokens]
+
+        if "provider_request_id" in cols and resolved_req_id:
+            update_fields.append("provider_request_id = ?")
+            params.append(resolved_req_id)
+
+        params.append(run_id)
+        sql = f"UPDATE agent_runs SET {', '.join(update_fields)} WHERE run_id = ?;"
+        conn.execute(sql, params)
+        conn.commit()
+
+        return {
+            "success": True,
+            "run_id": run_id,
+            "provider_request_id": resolved_req_id,
+            "tokens_used": confirmed_tokens,
+            "token_source": "provider_confirmed",
+            "reconciliation_status": "completed",
+            "cost": lookup_result.get("cost"),
+            "message": "Authoritative provider usage successfully reconciled."
+        }
 
 
