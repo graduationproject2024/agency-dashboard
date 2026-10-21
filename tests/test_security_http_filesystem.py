@@ -72,3 +72,11 @@ def test_error_handlers_do_not_leak_stack_traces(client):
     data = res.get_json()
     assert "error" in data
     assert "Traceback" not in str(res.data)
+
+def test_security_headers_present_on_responses(client):
+    """Verify standard security headers are present on outgoing responses."""
+    res = client.get('/')
+    assert res.headers.get('X-Content-Type-Options') == 'nosniff'
+    assert res.headers.get('X-Frame-Options') == 'SAMEORIGIN'
+    assert res.headers.get('X-XSS-Protection') == '1; mode=block'
+    assert res.headers.get('Referrer-Policy') == 'strict-origin-when-cross-origin'

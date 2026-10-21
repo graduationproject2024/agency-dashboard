@@ -3669,6 +3669,22 @@ def manage_settings():
         # GET returns safe sanitized settings (NEVER exposes plaintext secrets)
         return jsonify(get_safe_settings_view())
 
+# Inject standard HTTP security headers into all responses
+@app.after_request
+def add_security_headers(response):
+    """
+    Security Enhancement: Inject standard security headers into all outgoing HTTP responses.
+    - X-Content-Type-Options: Prevents MIME-type sniffing.
+    - X-Frame-Options: Protects against clickjacking.
+    - X-XSS-Protection: Enables browser XSS filtering.
+    - Referrer-Policy: Controls referrer information sent with requests.
+    """
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'SAMEORIGIN'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    return response
+
 # Standard error handlers
 @app.errorhandler(400)
 def bad_request(e):
