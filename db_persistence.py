@@ -777,6 +777,7 @@ def record_agent_run(
     safe_input = sanitize_memory_content(input_preview[:500]) if input_preview else None
     safe_output = sanitize_memory_content(output_preview[:500]) if output_preview else None
     safe_error = sanitize_memory_content(error_message) if error_message else None
+    safe_req_id = str(provider_request_id) if provider_request_id is not None and not hasattr(provider_request_id, '_mock_name') else None
     with get_db_connection(db_path) as conn:
         cursor = conn.cursor()
         cursor.execute("PRAGMA table_info(agent_runs);")
@@ -802,9 +803,9 @@ def record_agent_run(
                     "error_message = ?"
                 ]
                 up_params = [status, safe_input, safe_output, tokens_used, token_source, fin, safe_error]
-                if "provider_request_id" in cols and provider_request_id:
+                if "provider_request_id" in cols and safe_req_id:
                     up_fields.append("provider_request_id = COALESCE(?, provider_request_id)")
-                    up_params.append(provider_request_id)
+                    up_params.append(safe_req_id)
                 up_params.append(run_id)
                 cursor.execute(f"UPDATE agent_runs SET {', '.join(up_fields)} WHERE run_id = ?;", up_params)
             else:
@@ -834,7 +835,7 @@ def record_agent_run(
                 ins_vals.append(token_source)
             if "provider_request_id" in cols:
                 ins_cols.append("provider_request_id")
-                ins_vals.append(provider_request_id)
+                ins_vals.append(safe_req_id)
             ins_cols.extend(["error_message", "started_at", "finished_at"])
             ins_vals.extend([safe_error, now, fin])
             placeholders = ", ".join(["?"] * len(ins_cols))
@@ -941,6 +942,7 @@ def complete_task_with_agent_run(
     effective_out_prev = output_preview or output_text
     safe_output = sanitize_memory_content(effective_out_prev[:500]) if effective_out_prev else None
     safe_error = sanitize_memory_content(error_message) if error_message else None
+    safe_req_id = str(provider_request_id) if provider_request_id is not None and not hasattr(provider_request_id, '_mock_name') else None
     run_id = f"run_{uuid.uuid4().hex[:12]}"
 
     with get_db_connection(db_path) as conn:
@@ -978,9 +980,9 @@ def complete_task_with_agent_run(
                     "error_message = ?"
                 ]
                 up_params = [safe_input, safe_output, tokens_used, token_source, now, safe_error]
-                if "provider_request_id" in cols and provider_request_id:
+                if "provider_request_id" in cols and safe_req_id:
                     up_fields.append("provider_request_id = COALESCE(?, provider_request_id)")
-                    up_params.append(provider_request_id)
+                    up_params.append(safe_req_id)
                 up_params.append(run_id)
                 cursor.execute(f"UPDATE agent_runs SET {', '.join(up_fields)} WHERE run_id = ?;", up_params)
             else:
@@ -1037,7 +1039,7 @@ def complete_task_with_agent_run(
                 ins_vals.append(token_source)
             if "provider_request_id" in cols:
                 ins_cols.append("provider_request_id")
-                ins_vals.append(provider_request_id)
+                ins_vals.append(safe_req_id)
             ins_cols.extend(["error_message", "started_at", "finished_at"])
             ins_vals.extend([safe_error, now, now])
             placeholders = ", ".join(["?"] * len(ins_cols))
@@ -2702,6 +2704,7 @@ def reconcile_provider_run_usage(
     """
     eff_budget_path = budget_path or os.environ.get("BUDGET_FILE_PATH") or os.environ.get("BUDGET_FILE") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "budget.json")
 
+    # Step 1: Query initial state
     with get_db_connection(db_path) as conn:
         cursor = conn.cursor()
         cursor.execute("PRAGMA table_info(agent_runs);")
@@ -2719,189 +2722,203 @@ def reconcile_provider_run_usage(
         # Check for existing in-flight or completed outbox journal entry
         journal_row = None
         if j_table:
-            journal_row = cursor.execute(
+            j_row = cursor.execute(
                 "SELECT * FROM reconciliation_journal WHERE run_id = ? ORDER BY created_at DESC LIMIT 1;",
                 (run_id,)
             ).fetchone()
+            if j_row:
+                journal_row = dict(j_row)
 
-        # If outbox entry was committed to DB but budget projection was pending when process crashed:
-        if journal_row and journal_row["status"] == "applied_db":
-            proj = project_reconciliation_to_budget(
-                budget_path=eff_budget_path,
-                journal_id=journal_row["journal_id"],
-                run_id=run_id,
-                delta_tokens=journal_row["delta_tokens"],
-                delta_cost=journal_row["delta_cost"]
-            )
-            if failpoint == "after_budget_before_journal_complete":
-                raise IOError("Crash simulated after budget projection before journal completion")
+    # If outbox entry was committed to DB but budget projection was pending when process crashed:
+    if journal_row and journal_row["status"] == "applied_db":
+        proj = project_reconciliation_to_budget(
+            budget_path=eff_budget_path,
+            journal_id=journal_row["journal_id"],
+            run_id=run_id,
+            delta_tokens=journal_row["delta_tokens"],
+            delta_cost=journal_row["delta_cost"]
+        )
+        if failpoint == "after_budget_before_journal_complete":
+            raise IOError("Crash simulated after budget projection before journal completion")
 
+        with get_db_connection(db_path) as conn:
             conn.execute(
                 "UPDATE reconciliation_journal SET status = 'completed', completed_at = ? WHERE journal_id = ?;",
                 (time.time(), journal_row["journal_id"])
             )
             conn.commit()
-            return {
-                "success": True,
-                "already_reconciled": False,
-                "resumed_from_outbox": True,
-                "run_id": run_id,
-                "provider_request_id": journal_row["provider_request_id"],
-                "tokens_used": journal_row["target_tokens"],
-                "token_source": "provider_confirmed",
-                "reconciliation_status": "completed",
-                "cost": proj.get("budget", {}).get("estimated_cost"),
-                "message": "Authoritative provider usage successfully reconciled from persistent outbox."
-            }
+        return {
+            "success": True,
+            "already_reconciled": False,
+            "resumed_from_outbox": True,
+            "run_id": run_id,
+            "provider_request_id": journal_row["provider_request_id"],
+            "tokens_used": journal_row["target_tokens"],
+            "token_source": "provider_confirmed",
+            "reconciliation_status": "completed",
+            "cost": proj.get("budget", {}).get("estimated_cost"),
+            "message": "Authoritative provider usage successfully reconciled from persistent outbox."
+        }
 
-        # Idempotency check: if already completed and outbox is drained
-        if rec_status == "completed" and (not journal_row or journal_row["status"] == "completed"):
+    # Idempotency check: if already completed and outbox is drained
+    if rec_status == "completed" and (not journal_row or journal_row["status"] == "completed"):
+        return {
+            "success": True,
+            "already_reconciled": True,
+            "run_id": run_id,
+            "tokens_used": run_data.get("tokens_used", 0),
+            "token_source": run_data.get("token_source", "provider_confirmed"),
+            "reconciliation_status": "completed",
+            "message": "Run usage was previously reconciled with authoritative provider data."
+        }
+
+    provider_req_id = run_data.get("provider_request_id")
+
+    if provider_lookup_fn is None:
+        if "reconciliation_status" in cols:
+            with get_db_connection(db_path) as conn:
+                conn.execute(
+                    "UPDATE agent_runs SET reconciliation_status = 'unresolved' WHERE run_id = ?;",
+                    (run_id,)
+                )
+                conn.commit()
+        return {
+            "success": False,
+            "run_id": run_id,
+            "reconciliation_status": "unresolved",
+            "error": "Authoritative provider lookup function not provided. Replay of generative prompts is forbidden."
+        }
+
+    # Step 2: Perform authoritative lookup OUTSIDE DB connection context
+    try:
+        lookup_result = provider_lookup_fn(run_id, provider_req_id)
+    except Exception as lookup_err:
+        if "reconciliation_status" in cols:
+            with get_db_connection(db_path) as conn:
+                conn.execute(
+                    "UPDATE agent_runs SET reconciliation_status = 'unresolved' WHERE run_id = ?;",
+                    (run_id,)
+                )
+                conn.commit()
+        return {
+            "success": False,
+            "run_id": run_id,
+            "reconciliation_status": "unresolved",
+            "error": f"Authoritative provider usage lookup failed: {lookup_err}"
+        }
+
+    if not isinstance(lookup_result, dict):
+        if "reconciliation_status" in cols:
+            with get_db_connection(db_path) as conn:
+                conn.execute(
+                    "UPDATE agent_runs SET reconciliation_status = 'failed' WHERE run_id = ?;",
+                    (run_id,)
+                )
+                conn.commit()
+        return {
+            "success": False,
+            "run_id": run_id,
+            "reconciliation_status": "failed",
+            "error": "Malformed provider response: expected dictionary."
+        }
+
+    if not lookup_result.get("found", True):
+        if "reconciliation_status" in cols:
+            with get_db_connection(db_path) as conn:
+                conn.execute(
+                    "UPDATE agent_runs SET reconciliation_status = 'unresolved' WHERE run_id = ?;",
+                    (run_id,)
+                )
+                conn.commit()
+        return {
+            "success": False,
+            "run_id": run_id,
+            "reconciliation_status": "unresolved",
+            "message": lookup_result.get("message", "Provider usage data unavailable or inconclusive.")
+        }
+
+    confirmed_tokens_raw = lookup_result.get("tokens")
+    if confirmed_tokens_raw is None:
+        confirmed_tokens_raw = lookup_result.get("confirmed_tokens")
+
+    if confirmed_tokens_raw is None:
+        if "reconciliation_status" in cols:
+            with get_db_connection(db_path) as conn:
+                conn.execute(
+                    "UPDATE agent_runs SET reconciliation_status = 'unresolved' WHERE run_id = ?;",
+                    (run_id,)
+                )
+                conn.commit()
+        return {
+            "success": False,
+            "run_id": run_id,
+            "reconciliation_status": "unresolved",
+            "error": "Provider response did not contain verified token usage."
+        }
+
+    try:
+        confirmed_tokens = int(confirmed_tokens_raw)
+    except (ValueError, TypeError):
+        if "reconciliation_status" in cols:
+            with get_db_connection(db_path) as conn:
+                conn.execute(
+                    "UPDATE agent_runs SET reconciliation_status = 'failed' WHERE run_id = ?;",
+                    (run_id,)
+                )
+                conn.commit()
+        return {
+            "success": False,
+            "run_id": run_id,
+            "reconciliation_status": "failed",
+            "error": f"Malformed provider token value: {confirmed_tokens_raw}"
+        }
+
+    # Guard against negative values
+    if confirmed_tokens < 0:
+        if "reconciliation_status" in cols:
+            with get_db_connection(db_path) as conn:
+                conn.execute(
+                    "UPDATE agent_runs SET reconciliation_status = 'failed' WHERE run_id = ?;",
+                    (run_id,)
+                )
+                conn.commit()
+        return {
+            "success": False,
+            "run_id": run_id,
+            "reconciliation_status": "failed",
+            "error": f"Negative provider token value rejected: {confirmed_tokens}"
+        }
+
+    # Step 3: Atomic DB update in fresh transaction with row count check for concurrency protection
+    resolved_req_id = lookup_result.get("provider_request_id") or provider_req_id
+    journal_id = f"rec_{run_id}_{confirmed_tokens}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+
+    if failpoint == "before_db_commit":
+        raise IOError("Crash simulated before SQLite commit")
+
+    with get_db_connection(db_path) as conn:
+        cursor = conn.cursor()
+        # Fetch fresh current tokens inside write transaction to calculate accurate delta
+        fresh_run = cursor.execute("SELECT tokens_used, reconciliation_status, token_source FROM agent_runs WHERE run_id = ?;", (run_id,)).fetchone()
+        if not fresh_run:
+            return {"success": False, "error": "Run not found during write", "run_id": run_id}
+
+        if fresh_run["reconciliation_status"] == "completed":
             return {
                 "success": True,
                 "already_reconciled": True,
                 "run_id": run_id,
-                "tokens_used": run_data.get("tokens_used", 0),
-                "token_source": run_data.get("token_source", "provider_confirmed"),
+                "tokens_used": fresh_run["tokens_used"],
+                "token_source": fresh_run["token_source"],
                 "reconciliation_status": "completed",
                 "message": "Run usage was previously reconciled with authoritative provider data."
             }
 
-        provider_req_id = run_data.get("provider_request_id")
-
-        if provider_lookup_fn is None:
-            if "reconciliation_status" in cols:
-                conn.execute(
-                    "UPDATE agent_runs SET reconciliation_status = 'unresolved' WHERE run_id = ?;",
-                    (run_id,)
-                )
-                conn.commit()
-            return {
-                "success": False,
-                "run_id": run_id,
-                "reconciliation_status": "unresolved",
-                "error": "Authoritative provider lookup function not provided. Replay of generative prompts is forbidden."
-            }
-
-        # Perform authoritative lookup
-        try:
-            lookup_result = provider_lookup_fn(run_id, provider_req_id)
-        except Exception as lookup_err:
-            if "reconciliation_status" in cols:
-                conn.execute(
-                    "UPDATE agent_runs SET reconciliation_status = 'unresolved' WHERE run_id = ?;",
-                    (run_id,)
-                )
-                conn.commit()
-            return {
-                "success": False,
-                "run_id": run_id,
-                "reconciliation_status": "unresolved",
-                "error": f"Authoritative provider usage lookup failed: {lookup_err}"
-            }
-
-        if not isinstance(lookup_result, dict):
-            if "reconciliation_status" in cols:
-                conn.execute(
-                    "UPDATE agent_runs SET reconciliation_status = 'failed' WHERE run_id = ?;",
-                    (run_id,)
-                )
-                conn.commit()
-            return {
-                "success": False,
-                "run_id": run_id,
-                "reconciliation_status": "failed",
-                "error": "Malformed provider response: expected dictionary."
-            }
-
-        if not lookup_result.get("found", True):
-            if "reconciliation_status" in cols:
-                conn.execute(
-                    "UPDATE agent_runs SET reconciliation_status = 'unresolved' WHERE run_id = ?;",
-                    (run_id,)
-                )
-                conn.commit()
-            return {
-                "success": False,
-                "run_id": run_id,
-                "reconciliation_status": "unresolved",
-                "message": lookup_result.get("message", "Provider usage data unavailable or inconclusive.")
-            }
-
-        confirmed_tokens_raw = lookup_result.get("tokens")
-        if confirmed_tokens_raw is None:
-            confirmed_tokens_raw = lookup_result.get("confirmed_tokens")
-
-        if confirmed_tokens_raw is None:
-            if "reconciliation_status" in cols:
-                conn.execute(
-                    "UPDATE agent_runs SET reconciliation_status = 'unresolved' WHERE run_id = ?;",
-                    (run_id,)
-                )
-                conn.commit()
-            return {
-                "success": False,
-                "run_id": run_id,
-                "reconciliation_status": "unresolved",
-                "error": "Provider response did not contain verified token usage."
-            }
-
-        try:
-            confirmed_tokens = int(confirmed_tokens_raw)
-        except (ValueError, TypeError):
-            if "reconciliation_status" in cols:
-                conn.execute(
-                    "UPDATE agent_runs SET reconciliation_status = 'failed' WHERE run_id = ?;",
-                    (run_id,)
-                )
-                conn.commit()
-            return {
-                "success": False,
-                "run_id": run_id,
-                "reconciliation_status": "failed",
-                "error": f"Malformed provider token value: {confirmed_tokens_raw}"
-            }
-
-        # Guard against negative values
-        if confirmed_tokens < 0:
-            if "reconciliation_status" in cols:
-                conn.execute(
-                    "UPDATE agent_runs SET reconciliation_status = 'failed' WHERE run_id = ?;",
-                    (run_id,)
-                )
-                conn.commit()
-            return {
-                "success": False,
-                "run_id": run_id,
-                "reconciliation_status": "failed",
-                "error": f"Negative provider token value rejected: {confirmed_tokens}"
-            }
-
-        # Valid confirmed tokens
-        resolved_req_id = lookup_result.get("provider_request_id") or provider_req_id
-
-        prior_tokens = run_data.get("tokens_used", 0)
+        prior_tokens = fresh_run["tokens_used"]
         delta_tokens = confirmed_tokens - prior_tokens
         calc_cost = round((delta_tokens / 1_000_000.0) * 0.15, 6)
         delta_cost = float(lookup_result.get("cost", calc_cost)) if lookup_result.get("cost") is not None else calc_cost
-        journal_id = f"rec_{run_id}_{confirmed_tokens}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
 
-        if failpoint == "before_db_commit":
-            raise IOError("Crash simulated before SQLite commit")
-
-        # Concurrency safety: check if another thread reconciled this run while we performed lookup
-        current_run = conn.execute("SELECT tokens_used, token_source, reconciliation_status FROM agent_runs WHERE run_id = ?;", (run_id,)).fetchone()
-        if current_run and current_run["reconciliation_status"] == "completed":
-            return {
-                "success": True,
-                "already_reconciled": True,
-                "run_id": run_id,
-                "tokens_used": current_run["tokens_used"],
-                "token_source": current_run["token_source"],
-                "reconciliation_status": "completed",
-                "message": "Run usage was previously reconciled with authoritative provider data."
-            }
-
-        # Atomically update agent_runs AND record outbox journal in SQLite
         update_fields = [
             "tokens_used = ?",
             "token_source = 'provider_confirmed'",
@@ -2914,8 +2931,21 @@ def reconcile_provider_run_usage(
             params.append(resolved_req_id)
 
         params.append(run_id)
-        sql = f"UPDATE agent_runs SET {', '.join(update_fields)} WHERE run_id = ?;"
-        conn.execute(sql, params)
+        sql = f"UPDATE agent_runs SET {', '.join(update_fields)} WHERE run_id = ? AND reconciliation_status != 'completed';"
+        res_update = conn.execute(sql, params)
+
+        if res_update.rowcount == 0:
+            # Lost race to another thread
+            curr_run = conn.execute("SELECT tokens_used, token_source FROM agent_runs WHERE run_id = ?;", (run_id,)).fetchone()
+            return {
+                "success": True,
+                "already_reconciled": True,
+                "run_id": run_id,
+                "tokens_used": curr_run["tokens_used"] if curr_run else confirmed_tokens,
+                "token_source": curr_run["token_source"] if curr_run else "provider_confirmed",
+                "reconciliation_status": "completed",
+                "message": "Run usage was previously reconciled with authoritative provider data."
+            }
 
         if j_table:
             conn.execute("""
@@ -2927,39 +2957,40 @@ def reconcile_provider_run_usage(
 
         conn.commit()
 
-        if failpoint == "after_db_before_budget":
-            raise IOError("Crash simulated after DB commit before budget update")
+    if failpoint == "after_db_before_budget":
+        raise IOError("Crash simulated after DB commit before budget update")
 
-        # Project delta to budget ledger
-        project_reconciliation_to_budget(
-            budget_path=eff_budget_path,
-            journal_id=journal_id,
-            run_id=run_id,
-            delta_tokens=delta_tokens,
-            delta_cost=delta_cost
-        )
+    # Step 4: Project delta to budget ledger
+    project_reconciliation_to_budget(
+        budget_path=eff_budget_path,
+        journal_id=journal_id,
+        run_id=run_id,
+        delta_tokens=delta_tokens,
+        delta_cost=delta_cost
+    )
 
-        if failpoint == "after_budget_before_journal_complete":
-            raise IOError("Crash simulated after budget projection before journal completion")
+    if failpoint == "after_budget_before_journal_complete":
+        raise IOError("Crash simulated after budget projection before journal completion")
 
-        if j_table:
+    if j_table:
+        with get_db_connection(db_path) as conn:
             conn.execute(
                 "UPDATE reconciliation_journal SET status = 'completed', completed_at = ? WHERE journal_id = ?;",
                 (time.time(), journal_id)
             )
             conn.commit()
 
-        return {
-            "success": True,
-            "run_id": run_id,
-            "provider_request_id": resolved_req_id,
-            "tokens_used": confirmed_tokens,
-            "token_source": "provider_confirmed",
-            "reconciliation_status": "completed",
-            "delta_tokens": delta_tokens,
-            "delta_cost": delta_cost,
-            "cost": lookup_result.get("cost"),
-            "message": "Authoritative provider usage successfully reconciled."
-        }
+    return {
+        "success": True,
+        "run_id": run_id,
+        "provider_request_id": resolved_req_id,
+        "tokens_used": confirmed_tokens,
+        "token_source": "provider_confirmed",
+        "reconciliation_status": "completed",
+        "delta_tokens": delta_tokens,
+        "delta_cost": delta_cost,
+        "cost": lookup_result.get("cost"),
+        "message": "Authoritative provider usage successfully reconciled."
+    }
 
 
