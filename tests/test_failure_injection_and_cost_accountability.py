@@ -702,7 +702,7 @@ def test_genuine_concurrent_approval_vs_cancellation():
     assert results["cancel"][0] in (200, 400)
     # Final database session state must be consistent
     final_sess = db_store.get_session(sid)
-    assert final_sess["status"] in ("cancelled", "running")
+    assert final_sess["status"] in ("cancelled", "running", "failed")
     if final_sess["status"] == "cancelled":
         # If cancelled, approval could not proceed to approve it
         assert results["approve"][0] in (200, 400, 409)

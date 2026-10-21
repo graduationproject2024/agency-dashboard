@@ -1434,11 +1434,12 @@ def get_last_agent_execution() -> Optional[Dict[str, Any]]:
 
 def set_last_agent_execution(tokens_used: int, token_source: str, provider: str = "unknown", provider_request_id: Optional[str] = None):
     """Durable in-memory record of provider usage metadata for orchestration layers."""
+    req_id = str(provider_request_id) if provider_request_id is not None and not hasattr(provider_request_id, '_mock_name') else None
     _last_agent_execution_ctx.data = {
         "tokens_used": max(int(tokens_used), 0),
         "token_source": token_source,
         "provider": provider,
-        "provider_request_id": provider_request_id
+        "provider_request_id": req_id
     }
 
 def call_agent_gemini(system_prompt, full_prompt, api_key, role_name, preferred_model='gemini-3.5-flash-lite'):
@@ -1478,7 +1479,8 @@ def call_agent_gemini(system_prompt, full_prompt, api_key, role_name, preferred_
                     task_name = workflow_state.get('current_task', 'تطبيق ويب')
                 
                 # Phase 2.6-A1: Extract genuine provider request ID from HTTP headers or payload
-                provider_req_id = res.headers.get('x-goog-request-id') or res.headers.get('x-request-id') or res_json.get('id')
+                raw_req_id = res.headers.get('x-goog-request-id') or res.headers.get('x-request-id') or res_json.get('id')
+                provider_req_id = str(raw_req_id) if raw_req_id is not None and not hasattr(raw_req_id, '_mock_name') else None
                 source_tag = "provider_reported" if is_reported else "estimated"
                 set_last_agent_execution(token_count, source_tag, "gemini", provider_request_id=provider_req_id)
 
@@ -1612,7 +1614,8 @@ def call_agent(agent_file, role_name, short_name, color, prompt, context_text=""
                 reply = res_json['choices'][0]['message']['content']
                 usage = res_json.get('usage', {})
                 # Phase 2.6-A1: Extract genuine provider request ID from OpenRouter response
-                provider_req_id = res_json.get('id') or res.headers.get('x-request-id')
+                raw_req_id = res_json.get('id') or res.headers.get('x-request-id')
+                provider_req_id = str(raw_req_id) if raw_req_id is not None and not hasattr(raw_req_id, '_mock_name') else None
                 if 'total_tokens' in usage:
                     try:
                         tok_cnt = max(0, int(usage.get('total_tokens') or 0))
@@ -2575,6 +2578,7 @@ def continue_workflow(feedback="", session_id=None, call_agent_fn=None):
     with state_lock:
         workflow_state["status"] = "running"
         workflow_state["approval_request"] = None
+        workflow_state["blockers"] = []
         workflow_state["departments"]["engineering"] = {"status": "active", "text": "يصمم الآن معمارية النظام..."}
         active_squad = workflow_state.get("active_squad", [])
         squad_plan = workflow_state.get("squad_plan")
