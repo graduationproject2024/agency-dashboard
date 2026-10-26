@@ -1237,18 +1237,22 @@ def get_safe_settings_view():
 
 # --- Budget & Token Accounting ---
 
+def get_budget_file():
+    return os.environ.get("BUDGET_FILE_PATH") or os.environ.get("BUDGET_FILE") or BUDGET_FILE
+
 def load_budget():
+    b_file = get_budget_file()
     with budget_lock:
-        if os.path.exists(BUDGET_FILE):
+        if os.path.exists(b_file):
             try:
-                with open(BUDGET_FILE, 'r', encoding='utf-8') as f:
+                with open(b_file, 'r', encoding='utf-8') as f:
                     content = f.read().strip()
                     if content:
                         return json.loads(content)
             except Exception as e:
                 print(f"[ERROR] Corrupt budget file detected: {e}")
                 # Attempt recovery from backup
-                bak_path = BUDGET_FILE + ".bak"
+                bak_path = b_file + ".bak"
                 if os.path.exists(bak_path):
                     try:
                         with open(bak_path, 'r', encoding='utf-8') as bf:
@@ -1258,9 +1262,9 @@ def load_budget():
                     except Exception:
                         pass
                 # Preserve corrupt file for audit rather than silently erasing
-                corrupt_copy = f"{BUDGET_FILE}.corrupt.{int(time.time())}"
+                corrupt_copy = f"{b_file}.corrupt.{int(time.time())}"
                 try:
-                    os.replace(BUDGET_FILE, corrupt_copy)
+                    os.replace(b_file, corrupt_copy)
                     print(f"[WARN] Preserved corrupted budget as {corrupt_copy}")
                 except Exception:
                     pass
@@ -1272,16 +1276,17 @@ def load_budget():
         }
 
 def save_budget(data):
+    b_file = get_budget_file()
     with budget_lock:
         try:
             # Create backup before atomic write
-            if os.path.exists(BUDGET_FILE):
+            if os.path.exists(b_file):
                 try:
-                    with open(BUDGET_FILE, 'r', encoding='utf-8') as sf, open(BUDGET_FILE + ".bak", 'w', encoding='utf-8') as df:
+                    with open(b_file, 'r', encoding='utf-8') as sf, open(b_file + ".bak", 'w', encoding='utf-8') as df:
                         df.write(sf.read())
                 except Exception:
                     pass
-            atomic_write_json(BUDGET_FILE, data)
+            atomic_write_json(b_file, data)
         except Exception as e:
             print(f"[ERROR] Error saving budget: {e}")
 
@@ -3526,7 +3531,7 @@ def manual_run_adjustment_endpoint(run_id):
             principal=principal,
             idempotency_key=idempotency_key,
             is_incremental=is_incremental,
-            budget_path=BUDGET_FILE
+            budget_path=get_budget_file()
         )
         response = jsonify(res)
         if res.get("resumed_from_idempotency"):

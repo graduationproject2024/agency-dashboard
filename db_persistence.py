@@ -202,6 +202,7 @@ def init_db(db_path: Optional[str] = None):
             tokens_used INTEGER NOT NULL DEFAULT 0,
             cost_booked REAL NOT NULL DEFAULT 0.0,
             token_source TEXT NOT NULL DEFAULT 'estimated',
+            cost_source TEXT NOT NULL DEFAULT 'estimated',
             provider TEXT,
             model TEXT,
             provider_request_id TEXT,
@@ -345,22 +346,55 @@ def init_db(db_path: Optional[str] = None):
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_rec_audit_target ON recovery_audit_log(target_id);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_rec_audit_time ON recovery_audit_log(timestamp);")
 
-        # 11. Idempotency Keys table (Phase 2.7.1 Financial & Administrative Idempotency)
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS idempotency_keys (
-            key TEXT PRIMARY KEY,
-            scope TEXT NOT NULL,
-            target_id TEXT NOT NULL,
-            request_hash TEXT NOT NULL,
-            response_json TEXT NOT NULL,
-            status TEXT NOT NULL CHECK(status IN ('in_progress', 'completed', 'failed')),
-            created_at REAL NOT NULL,
-            completed_at REAL
-        );
-        """)
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_idemp_scope_target ON idempotency_keys(scope, target_id);")
+        # 11. Idempotency Keys table (Phase 2.7.2 Financial & Administrative Idempotency)
+        cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='idempotency_keys';")
+        idemp_sql_row = cursor.fetchone()
+        if idemp_sql_row is None:
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS idempotency_keys (
+                key TEXT PRIMARY KEY,
+                scope TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                response_json TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL CHECK(status IN ('in_progress', 'committed_pending_projection', 'completed', 'failed_retryable', 'failed_terminal')),
+                journal_id TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                completed_at REAL
+            );
+            """)
+        elif "committed_pending_projection" not in idemp_sql_row[0]:
+            cursor.execute("PRAGMA foreign_keys=OFF;")
+            cursor.execute("ALTER TABLE idempotency_keys RENAME TO idempotency_keys_old;")
+            cursor.execute("""
+            CREATE TABLE idempotency_keys (
+                key TEXT PRIMARY KEY,
+                scope TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                response_json TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL CHECK(status IN ('in_progress', 'committed_pending_projection', 'completed', 'failed_retryable', 'failed_terminal')),
+                journal_id TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                completed_at REAL
+            );
+            """)
+            cursor.execute("""
+            INSERT INTO idempotency_keys (key, scope, target_id, request_hash, response_json, status, created_at, updated_at, completed_at)
+            SELECT key, scope, target_id, request_hash, response_json,
+                   CASE WHEN status = 'failed' THEN 'failed_terminal' ELSE status END,
+                   created_at, created_at, completed_at
+            FROM idempotency_keys_old;
+            """)
+            cursor.execute("DROP TABLE idempotency_keys_old;")
+            cursor.execute("PRAGMA foreign_keys=ON;")
 
-        # Ensure token_source, provider_request_id, reconciliation_status, provider, model, and cost_booked columns exist in agent_runs table
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_idemp_scope_target ON idempotency_keys(scope, target_id);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_idemp_status ON idempotency_keys(status);")
+
+        # Ensure token_source, provider_request_id, reconciliation_status, provider, model, cost_booked, and cost_source columns exist in agent_runs table
         cursor.execute("PRAGMA table_info(agent_runs);")
         run_cols = {row[1] for row in cursor.fetchall()}
         if "token_source" not in run_cols:
@@ -375,6 +409,17 @@ def init_db(db_path: Optional[str] = None):
             cursor.execute("ALTER TABLE agent_runs ADD COLUMN model TEXT;")
         if "cost_booked" not in run_cols:
             cursor.execute("ALTER TABLE agent_runs ADD COLUMN cost_booked REAL DEFAULT 0.0;")
+        if "cost_source" not in run_cols:
+            cursor.execute("ALTER TABLE agent_runs ADD COLUMN cost_source TEXT DEFAULT 'estimated';")
+            cursor.execute("""
+                UPDATE agent_runs
+                SET cost_source = CASE
+                    WHEN token_source IN ('provider_confirmed', 'provider_reported') THEN 'provider_confirmed'
+                    WHEN token_source = 'manual_operator_adjustment' THEN 'manual_operator_adjustment'
+                    ELSE 'estimated'
+                END
+                WHERE cost_source IS NULL OR cost_source = 'estimated';
+            """)
 
         cursor.execute("PRAGMA table_info(reconciliation_journal);")
         j_cols = {row[1] for row in cursor.fetchall()}
@@ -382,6 +427,7 @@ def init_db(db_path: Optional[str] = None):
             cursor.execute("ALTER TABLE reconciliation_journal ADD COLUMN target_cost REAL DEFAULT 0.0;")
 
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_runs_provider ON agent_runs(provider);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_runs_cost_source ON agent_runs(cost_source);")
 
         # Ensure workflow_sessions check constraint includes 'interrupted'
         cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='workflow_sessions';")
@@ -862,6 +908,7 @@ def record_agent_run(
     provider: Optional[str] = None,
     model: Optional[str] = None,
     cost_booked: Optional[float] = None,
+    cost_source: Optional[str] = None,
     db_path: Optional[str] = None
 ) -> str:
     run_id = f"run_{uuid.uuid4().hex[:12]}"
@@ -871,6 +918,7 @@ def record_agent_run(
     safe_output = sanitize_memory_content(output_preview[:500]) if output_preview else None
     safe_error = sanitize_memory_content(error_message) if error_message else None
     initial_cost = round_cost(cost_booked if cost_booked is not None else (tokens_used / 1_000_000.0) * 0.15, 6)
+    effective_cost_source = cost_source or ("provider_confirmed" if token_source in ("provider_confirmed", "provider_reported") else ("manual_operator_adjustment" if token_source == "manual_operator_adjustment" else "estimated"))
     with get_db_connection(db_path) as conn:
         cursor = conn.cursor()
         cursor.execute("PRAGMA table_info(agent_runs);")
@@ -899,6 +947,9 @@ def record_agent_run(
                 if "cost_booked" in cols:
                     up_fields.append("cost_booked = ?")
                     up_params.append(initial_cost)
+                if "cost_source" in cols:
+                    up_fields.append("cost_source = ?")
+                    up_params.append(effective_cost_source)
                 if "provider_request_id" in cols and provider_request_id:
                     up_fields.append("provider_request_id = COALESCE(?, provider_request_id)")
                     up_params.append(provider_request_id)
@@ -935,6 +986,9 @@ def record_agent_run(
             if "cost_booked" in cols:
                 ins_cols.append("cost_booked")
                 ins_vals.append(initial_cost)
+            if "cost_source" in cols:
+                ins_cols.append("cost_source")
+                ins_vals.append(effective_cost_source)
             if "token_source" in cols:
                 ins_cols.append("token_source")
                 ins_vals.append(token_source)
@@ -1010,6 +1064,9 @@ def record_agent_run_start(
         if "token_source" in cols:
             ins_cols.append("token_source")
             ins_vals.append("estimated")
+        if "cost_source" in cols:
+            ins_cols.append("cost_source")
+            ins_vals.append("estimated")
         if "provider" in cols:
             ins_cols.append("provider")
             ins_vals.append(provider)
@@ -1043,6 +1100,7 @@ def complete_task_with_agent_run(
     provider: Optional[str] = None,
     model: Optional[str] = None,
     cost_booked: Optional[float] = None,
+    cost_source: Optional[str] = None,
     db_path: Optional[str] = None
 ) -> Tuple[bool, str]:
     """
@@ -1066,6 +1124,7 @@ def complete_task_with_agent_run(
     safe_output = sanitize_memory_content(effective_out_prev[:500]) if effective_out_prev else None
     safe_error = sanitize_memory_content(error_message) if error_message else None
     initial_cost = round_cost(cost_booked if cost_booked is not None else (tokens_used / 1_000_000.0) * 0.15, 6)
+    effective_cost_source = cost_source or ("provider_confirmed" if token_source in ("provider_confirmed", "provider_reported") else ("manual_operator_adjustment" if token_source == "manual_operator_adjustment" else "estimated"))
     run_id = f"run_{uuid.uuid4().hex[:12]}"
 
     with get_db_connection(db_path) as conn:
@@ -1106,6 +1165,9 @@ def complete_task_with_agent_run(
                 if "cost_booked" in cols:
                     up_fields.append("cost_booked = ?")
                     up_params.append(initial_cost)
+                if "cost_source" in cols:
+                    up_fields.append("cost_source = ?")
+                    up_params.append(effective_cost_source)
                 if "provider_request_id" in cols and provider_request_id:
                     up_fields.append("provider_request_id = COALESCE(?, provider_request_id)")
                     up_params.append(provider_request_id)
@@ -1143,6 +1205,9 @@ def complete_task_with_agent_run(
                 if "cost_booked" in cols:
                     up_fields.append("cost_booked = ?")
                     up_params.append(initial_cost)
+                if "cost_source" in cols:
+                    up_fields.append("cost_source = ?")
+                    up_params.append(effective_cost_source)
                 if "provider_request_id" in cols and provider_request_id:
                     up_fields.append("provider_request_id = COALESCE(?, provider_request_id)")
                     up_params.append(provider_request_id)
@@ -1178,6 +1243,9 @@ def complete_task_with_agent_run(
             if "cost_booked" in cols:
                 ins_cols.append("cost_booked")
                 ins_vals.append(initial_cost)
+            if "cost_source" in cols:
+                ins_cols.append("cost_source")
+                ins_vals.append(effective_cost_source)
             if "token_source" in cols:
                 ins_cols.append("token_source")
                 ins_vals.append(token_source)
@@ -3001,10 +3069,11 @@ def apply_manual_run_adjustment(
                         return cached_resp
                     except Exception:
                         pass
+            now_ts = time.time()
             cursor.execute("""
-                INSERT OR REPLACE INTO idempotency_keys (key, scope, target_id, request_hash, response_json, status, created_at)
-                VALUES (?, 'manual_adjustment', ?, ?, '', 'in_progress', ?);
-            """, (idempotency_key, run_id, req_hash, time.time()))
+                INSERT OR REPLACE INTO idempotency_keys (key, scope, target_id, request_hash, response_json, status, created_at, updated_at)
+                VALUES (?, 'manual_adjustment', ?, ?, '', 'in_progress', ?, ?);
+            """, (idempotency_key, run_id, req_hash, now_ts, now_ts))
             conn.commit()
 
         row = cursor.execute("SELECT * FROM agent_runs WHERE run_id = ?;", (run_id,)).fetchone()
@@ -3119,8 +3188,8 @@ def apply_manual_run_adjustment(
 
         if idempotency_key and idemp_table:
             conn.execute(
-                "UPDATE idempotency_keys SET status = 'completed', response_json = ?, completed_at = ? WHERE key = ?;",
-                (json.dumps(resp_data), time.time(), idempotency_key)
+                "UPDATE idempotency_keys SET status = 'completed', response_json = ?, updated_at = ?, completed_at = ? WHERE key = ?;",
+                (json.dumps(resp_data), time.time(), time.time(), idempotency_key)
             )
 
         conn.commit()

@@ -41,9 +41,9 @@ Previously, `/api/runs/<run_id>/reconcile_usage` accepted `provider_tokens` and 
 
 #### Remediation Implementation
 1. **Schema Migration (`db_persistence.py`):**
-   - Added `provider TEXT` and `model TEXT` columns to `agent_runs` in `init_db`.
-   - Added database index `idx_agent_runs_provider` on `agent_runs(provider)`.
-   - Updated `record_agent_run`, `record_agent_run_start`, and `complete_task_with_agent_run` to accept and persist `provider` and `model`.
+   - Added `provider TEXT`, `model TEXT`, and `cost_source TEXT` columns to `agent_runs` in `init_db`.
+   - Added database indexes `idx_agent_runs_provider` and `idx_agent_runs_cost_source`.
+   - Updated `record_agent_run`, `record_agent_run_start`, and `complete_task_with_agent_run` to accept and persist `provider`, `model`, and `cost_source`.
    - Added `get_agent_run(run_id, db_path)` helper to retrieve trusted run metadata.
 2. **Adapter & Orchestrator Upgrades (`app.py`, `task_orchestrator.py`):**
    - Updated `set_last_agent_execution` to store `model`.
