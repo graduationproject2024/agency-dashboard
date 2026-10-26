@@ -1432,13 +1432,14 @@ def get_last_agent_execution() -> Optional[Dict[str, Any]]:
     """Return the usage metadata from the most recent agent execution in the current thread."""
     return getattr(_last_agent_execution_ctx, "data", None)
 
-def set_last_agent_execution(tokens_used: int, token_source: str, provider: str = "unknown", provider_request_id: Optional[str] = None):
+def set_last_agent_execution(tokens_used: int, token_source: str, provider: str = "unknown", provider_request_id: Optional[str] = None, model: Optional[str] = None):
     """Durable in-memory record of provider usage metadata for orchestration layers."""
     _last_agent_execution_ctx.data = {
         "tokens_used": max(int(tokens_used), 0),
         "token_source": token_source,
         "provider": provider,
-        "provider_request_id": provider_request_id
+        "provider_request_id": provider_request_id,
+        "model": model
     }
 
 def call_agent_gemini(system_prompt, full_prompt, api_key, role_name, preferred_model='gemini-3.5-flash-lite'):
@@ -1480,7 +1481,7 @@ def call_agent_gemini(system_prompt, full_prompt, api_key, role_name, preferred_
                 # Phase 2.6-A1: Extract genuine provider request ID from HTTP headers or payload
                 provider_req_id = res.headers.get('x-goog-request-id') or res.headers.get('x-request-id') or res_json.get('id')
                 source_tag = "provider_reported" if is_reported else "estimated"
-                set_last_agent_execution(token_count, source_tag, "gemini", provider_request_id=provider_req_id)
+                set_last_agent_execution(token_count, source_tag, "gemini", provider_request_id=provider_req_id, model=cur_m)
 
                 # Record token usage ONCE with source tag
                 record_token_usage(
@@ -1621,7 +1622,7 @@ def call_agent(agent_file, role_name, short_name, color, prompt, context_text=""
                     with state_lock:
                         cur_task = workflow_state.get('current_task', 'مهمة برمجية')
                     record_token_usage(role_name, short_name, cur_task, tok_cnt, source="provider_reported")
-                    set_last_agent_execution(tok_cnt, "provider_reported", "openrouter", provider_request_id=provider_req_id)
+                    set_last_agent_execution(tok_cnt, "provider_reported", "openrouter", provider_request_id=provider_req_id, model=model)
                     tokens_recorded = True
 
         # If not recorded yet, calculate estimated tokens and record ONCE
@@ -1630,7 +1631,7 @@ def call_agent(agent_file, role_name, short_name, color, prompt, context_text=""
             with state_lock:
                 cur_task = workflow_state.get('current_task', 'مهمة برمجية')
             record_token_usage(role_name, short_name, cur_task, tokens_est, source="estimated")
-            set_last_agent_execution(tokens_est, "estimated", provider, provider_request_id=None)
+            set_last_agent_execution(tokens_est, "estimated", provider, provider_request_id=None, model=model)
             
         add_feed(role_name, role_name, color, short_name, "أنهيت عملي. المخرجات متوفرة الآن.")
         
@@ -3258,12 +3259,100 @@ def apply_rollback_reconciliation_endpoint(session_id):
 
     return jsonify(res)
 
+# =========================================================================
+# Phase 2.7: Authoritative Provider Reconciliation Adapter & Registry
+# =========================================================================
+
+_test_authoritative_provider_records: Dict[str, Dict[str, Any]] = {}
+
+def set_test_authoritative_provider_record(identifier: str, record: Dict[str, Any]):
+    """Hermetic test helper: register mock authoritative provider usage by request ID or run ID."""
+    _test_authoritative_provider_records[identifier] = record
+
+def clear_test_authoritative_provider_records():
+    """Clear all test authoritative provider records."""
+    _test_authoritative_provider_records.clear()
+
+def query_authoritative_provider_usage(
+    provider: Optional[str],
+    model: Optional[str],
+    provider_request_id: Optional[str],
+    run_id: str
+) -> Dict[str, Any]:
+    """
+    Phase 2.7: Query authoritative external provider API or trusted provider records.
+    - Hermetic test registry is queried first.
+    - For OpenRouter: queries OpenRouter generation endpoint if configured with request ID.
+    - For Gemini: Google Gemini has no post-hoc request ID usage lookup endpoint via public API; returns found=False.
+    - Validates request ID, token counts, ranges, and structure.
+    - Returns standard lookup dict: {"found": bool, "tokens": int, "cost": float, "provider_request_id": str, ...}
+    """
+    if provider_request_id and provider_request_id in _test_authoritative_provider_records:
+        return _test_authoritative_provider_records[provider_request_id]
+    if run_id in _test_authoritative_provider_records:
+        return _test_authoritative_provider_records[run_id]
+
+    if not provider_request_id:
+        return {
+            "found": False,
+            "message": f"Run {run_id} has no provider_request_id. Authoritative provider query cannot be performed."
+        }
+
+    norm_provider = (provider or "").strip().lower()
+
+    if norm_provider == "openrouter":
+        api_key = get_api_key("openrouter")
+        if not api_key:
+            return {
+                "found": False,
+                "message": "OpenRouter API key not configured for authoritative reconciliation lookup."
+            }
+        try:
+            url = f"https://openrouter.ai/api/v1/generation?id={provider_request_id}"
+            headers = {"Authorization": f"Bearer {api_key}"}
+            res = requests.get(url, headers=headers, timeout=15)
+            if res.status_code == 200:
+                data = res.json().get("data", {})
+                tokens = data.get("total_tokens") or (data.get("tokens_prompt", 0) + data.get("tokens_completion", 0))
+                cost = data.get("total_cost")
+                if tokens is not None and tokens >= 0:
+                    return {
+                        "found": True,
+                        "tokens": int(tokens),
+                        "cost": float(cost) if cost is not None else None,
+                        "provider_request_id": provider_request_id
+                    }
+            return {
+                "found": False,
+                "message": f"OpenRouter generation lookup returned HTTP {res.status_code} for {provider_request_id}."
+            }
+        except Exception as e:
+            return {
+                "found": False,
+                "message": f"OpenRouter generation lookup failed: {e}"
+            }
+
+    if norm_provider == "gemini":
+        return {
+            "found": False,
+            "message": "Google Gemini API does not support post-hoc request ID token reconciliation. Use POST /api/runs/<run_id>/manual_adjustment if adjustment is necessary."
+        }
+
+    return {
+        "found": False,
+        "message": f"Provider '{provider}' does not support automated authoritative usage lookup."
+    }
+
+
 @app.route('/api/runs/<run_id>/reconcile_usage', methods=['POST'])
 def reconcile_run_usage_endpoint(run_id):
     """
-    Phase 2.6-A2 & C: Reconciles an agent run using authoritative provider usage/billing data.
-    Enforces safe origin, run ID regex validation, operator authentication,
-    and durable transactional outbox projection to budget.json.
+    Phase 2.7: Reconciles an agent run using authoritative provider usage/billing data.
+    - Terminates acceptance of client-supplied provider_tokens / cost.
+    - Enforces safe origin, run ID regex validation, operator authentication.
+    - Queries authoritative provider API / trusted provider records.
+    - Retains explicit 'unresolved' state if authoritative source is unavailable.
+    - Fails closed on audit failure.
     """
     if not is_safe_origin(request):
         return jsonify({"error": "Forbidden: Invalid origin"}), 403
@@ -3273,53 +3362,173 @@ def reconcile_run_usage_endpoint(run_id):
     # Authenticate operator before write
     is_auth, principal, auth_err = authenticate_operator(request, require_admin=False)
     if not is_auth:
-        db_store.record_recovery_audit_event(
-            principal=principal or "anonymous",
-            action="reconcile_usage",
-            target_id=run_id,
-            force_requested=False,
-            authorized=False,
-            outcome="denied",
-            error_message=auth_err
-        )
+        try:
+            db_store.record_recovery_audit_event(
+                principal=principal or "anonymous",
+                action="reconcile_usage",
+                target_id=run_id,
+                force_requested=False,
+                authorized=False,
+                outcome="denied",
+                error_message=auth_err
+            )
+        except Exception:
+            pass
         return jsonify({"error": auth_err}), 401
 
     data = request.get_json(silent=True) or {}
-    provider_tokens = data.get("provider_tokens")
-    cost = data.get("cost")
-    provider_req_id = data.get("provider_request_id")
 
-    lookup_fn = None
-    if provider_tokens is not None:
-        def _authoritative_lookup(rid, req_id):
-            return {
-                "found": True,
-                "tokens": provider_tokens,
-                "cost": cost,
-                "provider_request_id": provider_req_id or req_id
-            }
-        lookup_fn = _authoritative_lookup
+    # Priority Zero Problem A: Terminate acceptance of client-supplied usage
+    if "provider_tokens" in data or "cost" in data:
+        try:
+            db_store.record_recovery_audit_event(
+                principal=principal or "operator",
+                action="reconcile_usage",
+                target_id=run_id,
+                force_requested=False,
+                authorized=True,
+                outcome="rejected",
+                error_message="Client-supplied provider_tokens or cost rejected"
+            )
+        except Exception as audit_err:
+            return jsonify({"error": f"Security audit logging failed: {audit_err}"}), 500
+
+        return jsonify({
+            "error": "Client-supplied provider_tokens and cost are forbidden in reconcile_usage. Authoritative lookup is required. Use POST /api/runs/<run_id>/manual_adjustment with admin credentials for operator overrides."
+        }), 400
+
+    # Retrieve trusted run from SQLite
+    run = db_store.get_agent_run(run_id)
+    if not run:
+        try:
+            db_store.record_recovery_audit_event(
+                principal=principal or "operator",
+                action="reconcile_usage",
+                target_id=run_id,
+                force_requested=False,
+                authorized=True,
+                outcome="failed",
+                error_message="Run not found"
+            )
+        except Exception as audit_err:
+            return jsonify({"error": f"Security audit logging failed: {audit_err}"}), 500
+        return jsonify({"error": "Run not found", "run_id": run_id}), 404
+
+    # Build authoritative lookup callback from trusted run record
+    def _adapter_lookup(rid, req_id):
+        effective_req_id = req_id or run.get("provider_request_id")
+        return query_authoritative_provider_usage(
+            provider=run.get("provider"),
+            model=run.get("model"),
+            provider_request_id=effective_req_id,
+            run_id=rid
+        )
 
     res = db_store.reconcile_provider_run_usage(
         run_id,
-        provider_lookup_fn=lookup_fn,
+        provider_lookup_fn=_adapter_lookup,
         budget_path=BUDGET_FILE
     )
 
     outcome = "success" if res.get("success") else ("unresolved" if res.get("reconciliation_status") == "unresolved" else "failed")
-    db_store.record_recovery_audit_event(
-        principal=principal or "unknown",
-        action="reconcile_usage",
-        target_id=run_id,
-        force_requested=False,
-        authorized=True,
-        outcome=outcome,
-        error_message=res.get("error")
-    )
+
+    try:
+        db_store.record_recovery_audit_event(
+            principal=principal or "unknown",
+            action="reconcile_usage",
+            target_id=run_id,
+            force_requested=False,
+            authorized=True,
+            outcome=outcome,
+            error_message=res.get("error") or res.get("message")
+        )
+    except Exception as audit_err:
+        return jsonify({"error": f"Security audit logging failed: {audit_err}"}), 500
 
     if not res.get("success"):
         return jsonify(res), 400
     return jsonify(res)
+
+
+@app.route('/api/runs/<run_id>/manual_adjustment', methods=['POST'])
+def manual_run_adjustment_endpoint(run_id):
+    """
+    Phase 2.7: Distinct, audited manual operator token adjustment workflow.
+    - Requires admin authorization (require_admin=True).
+    - Requires non-negative integer adjusted_tokens, non-empty reason, and evidence_reference.
+    - Sets token_source = 'manual_operator_adjustment'.
+    - Projects delta into budget.json idempotently via truncation-proof registry.
+    - Durably records audit event in recovery_audit_log (fails closed on audit error).
+    """
+    if not is_safe_origin(request):
+        return jsonify({"error": "Forbidden: Invalid origin"}), 403
+    if not is_valid_run_id(run_id):
+        return jsonify({"error": "Invalid run identifier format"}), 400
+
+    # Admin privilege required
+    is_auth, principal, auth_err = authenticate_operator(request, require_admin=True)
+    if not is_auth:
+        status_code = 403 if principal == "operator" else 401
+        try:
+            db_store.record_recovery_audit_event(
+                principal=principal or "anonymous",
+                action="manual_adjustment",
+                target_id=run_id,
+                force_requested=True,
+                authorized=False,
+                outcome="denied",
+                error_message=auth_err
+            )
+        except Exception:
+            pass
+        return jsonify({"error": auth_err}), status_code
+
+    data = request.get_json(silent=True) or {}
+    adjusted_tokens_raw = data.get("adjusted_tokens")
+    reason = str(data.get("reason") or "").strip()
+    evidence_reference = str(data.get("evidence_reference") or "").strip()
+    cost = data.get("cost")
+
+    if adjusted_tokens_raw is None:
+        return jsonify({"error": "Missing required field 'adjusted_tokens'"}), 400
+
+    try:
+        adjusted_tokens = int(adjusted_tokens_raw)
+        if adjusted_tokens < 0:
+            return jsonify({"error": "'adjusted_tokens' must be non-negative"}), 400
+    except (ValueError, TypeError):
+        return jsonify({"error": "'adjusted_tokens' must be an integer"}), 400
+
+    if not reason:
+        return jsonify({"error": "Missing required non-empty field 'reason'"}), 400
+    if not evidence_reference:
+        return jsonify({"error": "Missing required non-empty field 'evidence_reference'"}), 400
+
+    if cost is not None:
+        try:
+            cost = float(cost)
+            if cost < 0.0:
+                return jsonify({"error": "'cost' cannot be negative"}), 400
+        except (ValueError, TypeError):
+            return jsonify({"error": "'cost' must be a valid number"}), 400
+
+    try:
+        res = db_store.apply_manual_run_adjustment(
+            run_id=run_id,
+            adjusted_tokens=adjusted_tokens,
+            cost=cost,
+            reason=reason,
+            evidence_reference=evidence_reference,
+            principal=principal,
+            budget_path=BUDGET_FILE
+        )
+        return jsonify(res), 200
+    except LookupError as lk_err:
+        return jsonify({"error": str(lk_err)}), 404
+    except ValueError as val_err:
+        return jsonify({"error": str(val_err)}), 400
+    except Exception as exc:
+        return jsonify({"error": f"Failed to apply manual adjustment: {exc}"}), 500
 
 @app.route('/api/memory/<project_id>', methods=['GET'])
 def get_project_memory_endpoint(project_id):

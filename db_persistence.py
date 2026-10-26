@@ -6,6 +6,9 @@ import uuid
 import re
 import hashlib
 import logging
+import threading
+import functools
+from contextlib import contextmanager
 from typing import Dict, List, Optional, Tuple, Any
 
 DEFAULT_DB_FILENAME = "agency_persistence.db"
@@ -145,6 +148,10 @@ def init_db(db_path: Optional[str] = None):
             output_preview TEXT,
             tokens_used INTEGER NOT NULL DEFAULT 0,
             token_source TEXT NOT NULL DEFAULT 'estimated',
+            provider TEXT,
+            model TEXT,
+            provider_request_id TEXT,
+            reconciliation_status TEXT NOT NULL DEFAULT 'none',
             error_message TEXT,
             started_at REAL NOT NULL,
             finished_at REAL,
@@ -283,7 +290,7 @@ def init_db(db_path: Optional[str] = None):
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_rec_audit_target ON recovery_audit_log(target_id);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_rec_audit_time ON recovery_audit_log(timestamp);")
 
-        # Ensure token_source, provider_request_id, and reconciliation_status columns exist in agent_runs table
+        # Ensure token_source, provider_request_id, reconciliation_status, provider, and model columns exist in agent_runs table
         cursor.execute("PRAGMA table_info(agent_runs);")
         run_cols = {row[1] for row in cursor.fetchall()}
         if "token_source" not in run_cols:
@@ -292,6 +299,12 @@ def init_db(db_path: Optional[str] = None):
             cursor.execute("ALTER TABLE agent_runs ADD COLUMN provider_request_id TEXT;")
         if "reconciliation_status" not in run_cols:
             cursor.execute("ALTER TABLE agent_runs ADD COLUMN reconciliation_status TEXT DEFAULT 'none';")
+        if "provider" not in run_cols:
+            cursor.execute("ALTER TABLE agent_runs ADD COLUMN provider TEXT;")
+        if "model" not in run_cols:
+            cursor.execute("ALTER TABLE agent_runs ADD COLUMN model TEXT;")
+
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_runs_provider ON agent_runs(provider);")
 
         # Ensure workflow_sessions check constraint includes 'interrupted'
         cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='workflow_sessions';")
@@ -769,6 +782,8 @@ def record_agent_run(
     output_preview: Optional[str] = None,
     error_message: Optional[str] = None,
     provider_request_id: Optional[str] = None,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
     db_path: Optional[str] = None
 ) -> str:
     run_id = f"run_{uuid.uuid4().hex[:12]}"
@@ -805,6 +820,12 @@ def record_agent_run(
                 if "provider_request_id" in cols and provider_request_id:
                     up_fields.append("provider_request_id = COALESCE(?, provider_request_id)")
                     up_params.append(provider_request_id)
+                if "provider" in cols and provider:
+                    up_fields.append("provider = COALESCE(?, provider)")
+                    up_params.append(provider)
+                if "model" in cols and model:
+                    up_fields.append("model = COALESCE(?, model)")
+                    up_params.append(model)
                 up_params.append(run_id)
                 cursor.execute(f"UPDATE agent_runs SET {', '.join(up_fields)} WHERE run_id = ?;", up_params)
             else:
@@ -835,6 +856,12 @@ def record_agent_run(
             if "provider_request_id" in cols:
                 ins_cols.append("provider_request_id")
                 ins_vals.append(provider_request_id)
+            if "provider" in cols:
+                ins_cols.append("provider")
+                ins_vals.append(provider)
+            if "model" in cols:
+                ins_cols.append("model")
+                ins_vals.append(model)
             ins_cols.extend(["error_message", "started_at", "finished_at"])
             ins_vals.extend([safe_error, now, fin])
             placeholders = ", ".join(["?"] * len(ins_cols))
@@ -853,6 +880,12 @@ def list_agent_runs(session_id: str, task_id: Optional[str] = None, db_path: Opt
             rows = conn.execute("SELECT * FROM agent_runs WHERE session_id = ? ORDER BY started_at ASC;", (session_id,)).fetchall()
         return [dict(r) for r in rows]
 
+def get_agent_run(run_id: str, db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Retrieve an individual agent run by run_id."""
+    with get_db_connection(db_path) as conn:
+        row = conn.execute("SELECT * FROM agent_runs WHERE run_id = ?;", (run_id,)).fetchone()
+        return dict(row) if row else None
+
 
 def record_agent_run_start(
     task_id: str,
@@ -862,6 +895,8 @@ def record_agent_run_start(
     division_id: str,
     prompt_file: str,
     input_preview: Optional[str] = None,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
     db_path: Optional[str] = None
 ) -> str:
     """
@@ -877,30 +912,31 @@ def record_agent_run_start(
         cursor = conn.cursor()
         cursor.execute("PRAGMA table_info(agent_runs);")
         cols = {row[1] for row in cursor.fetchall()}
+        ins_cols = [
+            "run_id", "task_id", "session_id", "agent_id", "agent_name",
+            "division_id", "prompt_file", "status", "input_preview",
+            "tokens_used", "started_at"
+        ]
+        ins_vals = [
+            run_id, task_id, session_id, agent_id, agent_name,
+            division_id, prompt_file, 'running', safe_input,
+            0, now
+        ]
         if "token_source" in cols:
-            conn.execute("""
-                INSERT INTO agent_runs (
-                    run_id, task_id, session_id, agent_id, agent_name,
-                    division_id, prompt_file, status, input_preview,
-                    tokens_used, token_source, started_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-            """, (
-                run_id, task_id, session_id, agent_id, agent_name,
-                division_id, prompt_file, 'running', safe_input,
-                0, 'estimated', now
-            ))
-        else:
-            conn.execute("""
-                INSERT INTO agent_runs (
-                    run_id, task_id, session_id, agent_id, agent_name,
-                    division_id, prompt_file, status, input_preview,
-                    tokens_used, started_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-            """, (
-                run_id, task_id, session_id, agent_id, agent_name,
-                division_id, prompt_file, 'running', safe_input,
-                0, now
-            ))
+            ins_cols.append("token_source")
+            ins_vals.append("estimated")
+        if "provider" in cols:
+            ins_cols.append("provider")
+            ins_vals.append(provider)
+        if "model" in cols:
+            ins_cols.append("model")
+            ins_vals.append(model)
+
+        placeholders = ", ".join(["?"] * len(ins_cols))
+        conn.execute(
+            f"INSERT INTO agent_runs ({', '.join(ins_cols)}) VALUES ({placeholders});",
+            ins_vals
+        )
         conn.commit()
     return run_id
 
@@ -919,6 +955,8 @@ def complete_task_with_agent_run(
     output_preview: Optional[str] = None,
     error_message: Optional[str] = None,
     provider_request_id: Optional[str] = None,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
     db_path: Optional[str] = None
 ) -> Tuple[bool, str]:
     """
@@ -981,6 +1019,12 @@ def complete_task_with_agent_run(
                 if "provider_request_id" in cols and provider_request_id:
                     up_fields.append("provider_request_id = COALESCE(?, provider_request_id)")
                     up_params.append(provider_request_id)
+                if "provider" in cols and provider:
+                    up_fields.append("provider = COALESCE(?, provider)")
+                    up_params.append(provider)
+                if "model" in cols and model:
+                    up_fields.append("model = COALESCE(?, model)")
+                    up_params.append(model)
                 up_params.append(run_id)
                 cursor.execute(f"UPDATE agent_runs SET {', '.join(up_fields)} WHERE run_id = ?;", up_params)
             else:
@@ -1009,6 +1053,12 @@ def complete_task_with_agent_run(
                 if "provider_request_id" in cols and provider_request_id:
                     up_fields.append("provider_request_id = COALESCE(?, provider_request_id)")
                     up_params.append(provider_request_id)
+                if "provider" in cols and provider:
+                    up_fields.append("provider = COALESCE(?, provider)")
+                    up_params.append(provider)
+                if "model" in cols and model:
+                    up_fields.append("model = COALESCE(?, model)")
+                    up_params.append(model)
                 up_params.append(run_id)
                 cursor.execute(f"UPDATE agent_runs SET {', '.join(up_fields)} WHERE run_id = ?;", up_params)
             else:
@@ -1038,6 +1088,12 @@ def complete_task_with_agent_run(
             if "provider_request_id" in cols:
                 ins_cols.append("provider_request_id")
                 ins_vals.append(provider_request_id)
+            if "provider" in cols:
+                ins_cols.append("provider")
+                ins_vals.append(provider)
+            if "model" in cols:
+                ins_cols.append("model")
+                ins_vals.append(model)
             ins_cols.extend(["error_message", "started_at", "finished_at"])
             ins_vals.extend([safe_error, now, now])
             placeholders = ", ".join(["?"] * len(ins_cols))
@@ -2575,6 +2631,67 @@ def cleanup_abandoned_restore_staging(app_dir: str, max_age_seconds: float = 60.
     return cleaned_count
 
 
+_BUDGET_THREAD_LOCK = threading.Lock()
+
+@contextmanager
+def _budget_file_lock(budget_path: str, timeout: float = 15.0):
+    """
+    Phase 2.7: Cross-process and cross-thread file lock on budget_path.lock to prevent concurrent
+    read-modify-write lost updates across multi-process or multi-threaded runners.
+    Includes automatic stale-lock detection and break (>60s).
+    """
+    lock_path = f"{budget_path}.lock"
+    start_time = time.time()
+    acquired = False
+    fd = None
+
+    _BUDGET_THREAD_LOCK.acquire()
+    try:
+        while time.time() - start_time < timeout:
+            try:
+                # O_CREAT | O_EXCL ensures atomic creation across processes
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                acquired = True
+                try:
+                    payload = f"{os.getpid()}:{time.time()}".encode("utf-8")
+                    os.write(fd, payload)
+                except Exception:
+                    pass
+                break
+            except (FileExistsError, OSError):
+                # Check for stale lock
+                try:
+                    mtime = os.path.getmtime(lock_path)
+                    if time.time() - mtime > 60.0:
+                        try:
+                            os.remove(lock_path)
+                            continue
+                        except OSError:
+                            pass
+                except OSError:
+                    pass
+                time.sleep(0.02)
+
+        if not acquired:
+            raise TimeoutError(f"Could not acquire budget file lock on {lock_path} within {timeout}s")
+
+        try:
+            yield
+        finally:
+            if acquired and fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                try:
+                    if os.path.exists(lock_path):
+                        os.remove(lock_path)
+                except OSError:
+                    pass
+    finally:
+        _BUDGET_THREAD_LOCK.release()
+
+
 def _atomic_write_json_direct(filepath: str, data: Any):
     """Atomically write JSON data with fsync durability before replace."""
     tmp_path = f"{filepath}.tmp_{uuid.uuid4().hex[:6]}"
@@ -2590,61 +2707,217 @@ def project_reconciliation_to_budget(
     journal_id: str,
     run_id: str,
     delta_tokens: int,
-    delta_cost: float
+    delta_cost: float,
+    source: str = "provider_confirmed",
+    department: str = "إدارة الميزانية والتدقيق",
+    task_desc: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Phase 2.6-A2: Projects reconciliation delta into budget ledger idempotently.
-    Checks budget['transactions'] for ref_journal_id to prevent duplicate accounting.
-    Uses atomic persistence with fsync.
+    Phase 2.7: Projects reconciliation delta into budget ledger idempotently and safely.
+    - Uses cross-process/cross-thread file lock (_budget_file_lock) during read-modify-write.
+    - Uses permanent 'applied_reconciliations' registry in budget.json that is NEVER truncated.
+    - Checks legacy rolling transactions for backwards compatibility.
+    - Handles corrupted or partially written JSON budget files safely.
+    - Uses atomic replacement with fsync.
     """
-    if not os.path.exists(budget_path):
-        default_data = {
-            "tokens_used": 0,
-            "estimated_cost": 0.0,
-            "budget_limit": 50.0,
-            "transactions": []
-        }
-        _atomic_write_json_direct(budget_path, default_data)
+    task_label = task_desc or f"تسوية استهلاك {run_id}"
 
-    try:
-        with open(budget_path, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-            budget = json.loads(content) if content else {}
-    except Exception as e:
-        raise IOError(f"Failed to read budget file at {budget_path}: {e}")
+    with _budget_file_lock(budget_path):
+        budget = None
+        if os.path.exists(budget_path):
+            try:
+                with open(budget_path, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                    if content:
+                        budget = json.loads(content)
+            except Exception:
+                # Corrupted or unparseable JSON: check for .bak file
+                bak_path = f"{budget_path}.bak"
+                if os.path.exists(bak_path):
+                    try:
+                        with open(bak_path, "r", encoding="utf-8") as bf:
+                            b_content = bf.read().strip()
+                            if b_content:
+                                budget = json.loads(b_content)
+                    except Exception:
+                        budget = None
 
-    txs = budget.get("transactions", [])
-    # Idempotency check: if already applied to budget ledger, do not duplicate
-    for tx in txs:
-        if tx.get("ref_journal_id") == journal_id:
+        if not isinstance(budget, dict):
+            budget = {
+                "tokens_used": 0,
+                "estimated_cost": 0.0,
+                "budget_limit": 50.0,
+                "transactions": [],
+                "applied_reconciliations": {}
+            }
+
+        applied_registry = budget.setdefault("applied_reconciliations", {})
+
+        # 1. Truncation-proof permanent registry check
+        if journal_id in applied_registry:
             return {"projected": True, "already_applied": True, "budget": budget}
 
-    curr_tokens = budget.get("tokens_used", 0)
-    curr_cost = budget.get("estimated_cost", 0.0)
+        # 2. Check legacy transactions list for backwards compatibility
+        txs = budget.get("transactions", [])
+        for tx in txs:
+            if tx.get("ref_journal_id") == journal_id:
+                # Backfill into truncation-proof registry
+                applied_registry[journal_id] = {
+                    "applied_at": time.time(),
+                    "run_id": run_id,
+                    "delta_tokens": delta_tokens,
+                    "delta_cost": delta_cost,
+                    "source": source
+                }
+                _atomic_write_json_direct(budget_path, budget)
+                return {"projected": True, "already_applied": True, "budget": budget}
 
-    new_tokens = max(0, curr_tokens + delta_tokens)
-    new_cost = max(0.0, round(curr_cost + delta_cost, 4))
+        curr_tokens = budget.get("tokens_used", 0)
+        curr_cost = budget.get("estimated_cost", 0.0)
 
-    budget["tokens_used"] = new_tokens
-    budget["estimated_cost"] = new_cost
+        new_tokens = max(0, curr_tokens + delta_tokens)
+        new_cost = max(0.0, round(curr_cost + delta_cost, 4))
 
-    new_tx = {
-        "id": int(time.time() * 1000) + len(txs),
-        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "agent": "Financial Reconciler",
-        "department": "إدارة الميزانية والتدقيق",
-        "task": f"تسوية استهلاك {run_id}",
-        "tokens": delta_tokens,
-        "cost": round(delta_cost, 4),
-        "source": "provider_confirmed",
-        "ref_journal_id": journal_id,
-        "ref_run_id": run_id
+        budget["tokens_used"] = new_tokens
+        budget["estimated_cost"] = new_cost
+
+        new_tx = {
+            "id": int(time.time() * 1000) + len(txs),
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "agent": "Financial Reconciler",
+            "department": department,
+            "task": task_label,
+            "tokens": delta_tokens,
+            "cost": round(delta_cost, 4),
+            "source": source,
+            "ref_journal_id": journal_id,
+            "ref_run_id": run_id
+        }
+        txs.insert(0, new_tx)
+        budget["transactions"] = txs[:60]
+        applied_registry[journal_id] = {
+            "applied_at": time.time(),
+            "run_id": run_id,
+            "delta_tokens": delta_tokens,
+            "delta_cost": delta_cost,
+            "source": source
+        }
+
+        _atomic_write_json_direct(budget_path, budget)
+        return {"projected": True, "already_applied": False, "budget": budget}
+
+
+def apply_manual_run_adjustment(
+    run_id: str,
+    adjusted_tokens: int,
+    cost: Optional[float] = None,
+    reason: str = "",
+    evidence_reference: str = "",
+    principal: str = "admin",
+    db_path: Optional[str] = None,
+    budget_path: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Phase 2.7: Applies a distinct, operator-audited manual token adjustment to an agent run.
+    - Requires non-empty reason and evidence reference.
+    - Sets token_source = 'manual_operator_adjustment' and reconciliation_status = 'completed'.
+    - Atomically updates agent_runs and inserts a reconciliation_journal outbox record.
+    - Projects delta into budget.json idempotently via truncation-proof registry.
+    - Durably records an audit event in recovery_audit_log.
+    """
+    if adjusted_tokens < 0:
+        raise ValueError("adjusted_tokens cannot be negative.")
+    if not reason or not reason.strip():
+        raise ValueError("Manual adjustment requires a non-empty reason.")
+    if not evidence_reference or not evidence_reference.strip():
+        raise ValueError("Manual adjustment requires a non-empty evidence_reference.")
+
+    eff_budget_path = budget_path or os.environ.get("BUDGET_FILE_PATH") or os.environ.get("BUDGET_FILE") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "budget.json")
+
+    with get_db_connection(db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(agent_runs);")
+        cols = {row[1] for row in cursor.fetchall()}
+
+        j_table = cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reconciliation_journal';").fetchone()
+
+        row = cursor.execute("SELECT * FROM agent_runs WHERE run_id = ?;", (run_id,)).fetchone()
+        if not row:
+            raise LookupError(f"Run {run_id} not found.")
+
+        run_data = dict(row)
+        prior_tokens = run_data.get("tokens_used", 0)
+        delta_tokens = adjusted_tokens - prior_tokens
+        calc_cost = round((delta_tokens / 1_000_000.0) * 0.15, 6)
+        delta_cost = float(cost) if cost is not None else calc_cost
+
+        journal_id = f"adj_{run_id}_{adjusted_tokens}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+
+        update_fields = [
+            "tokens_used = ?",
+            "token_source = 'manual_operator_adjustment'",
+            "reconciliation_status = 'completed'"
+        ]
+        params = [adjusted_tokens, run_id]
+
+        conn.execute(f"UPDATE agent_runs SET {', '.join(update_fields)} WHERE run_id = ?;", params)
+
+        if j_table:
+            conn.execute("""
+                INSERT INTO reconciliation_journal (
+                    journal_id, run_id, target_tokens, delta_tokens, delta_cost,
+                    status, provider_request_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, 'applied_db', ?, ?);
+            """, (journal_id, run_id, adjusted_tokens, delta_tokens, delta_cost, f"manual:{evidence_reference[:50]}", time.time()))
+
+        conn.commit()
+
+        # Project to budget
+        proj = project_reconciliation_to_budget(
+            budget_path=eff_budget_path,
+            journal_id=journal_id,
+            run_id=run_id,
+            delta_tokens=delta_tokens,
+            delta_cost=delta_cost,
+            source="manual_operator_adjustment",
+            department="إدارة التدقيق المالي اليدوي",
+            task_desc=f"تعديل إداري لاستهلاك {run_id}: {reason[:40]}"
+        )
+
+        if j_table:
+            conn.execute(
+                "UPDATE reconciliation_journal SET status = 'completed', completed_at = ? WHERE journal_id = ?;",
+                (time.time(), journal_id)
+            )
+            conn.commit()
+
+    # Durably record audit event
+    record_recovery_audit_event(
+        principal=principal or "admin",
+        action="manual_adjustment",
+        target_id=run_id,
+        force_requested=True,
+        authorized=True,
+        outcome="success",
+        error_message=f"Adjusted to {adjusted_tokens} tokens. Reason: {reason}. Ref: {evidence_reference}",
+        db_path=db_path
+    )
+
+    return {
+        "success": True,
+        "run_id": run_id,
+        "prior_tokens": prior_tokens,
+        "adjusted_tokens": adjusted_tokens,
+        "delta_tokens": delta_tokens,
+        "delta_cost": delta_cost,
+        "token_source": "manual_operator_adjustment",
+        "reconciliation_status": "completed",
+        "reason": reason,
+        "evidence_reference": evidence_reference,
+        "journal_id": journal_id,
+        "cost": proj.get("budget", {}).get("estimated_cost"),
+        "message": "Manual run adjustment successfully applied and projected."
     }
-    txs.insert(0, new_tx)
-    budget["transactions"] = txs[:60]
-
-    _atomic_write_json_direct(budget_path, budget)
-    return {"projected": True, "already_applied": False, "budget": budget}
 
 
 def record_recovery_audit_event(
@@ -2681,6 +2954,16 @@ def record_recovery_audit_event(
     return audit_id
 
 
+_RUN_RECON_THREAD_LOCK = threading.Lock()
+
+def _with_recon_lock(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _RUN_RECON_THREAD_LOCK:
+            return fn(*args, **kwargs)
+    return wrapper
+
+@_with_recon_lock
 def reconcile_provider_run_usage(
     run_id: str,
     provider_lookup_fn: Optional[Any] = None,

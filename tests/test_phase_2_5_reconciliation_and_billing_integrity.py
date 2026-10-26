@@ -984,15 +984,25 @@ def test_workstream_d_reconcile_usage_http_flow(monkeypatch, tmp_path):
         status="completed",
         tokens_used=100,
         token_source="estimated",
+        provider_request_id="req_http_1750",
         db_path=test_db
     )
+
+    from app import set_test_authoritative_provider_record, clear_test_authoritative_provider_records
+    clear_test_authoritative_provider_records()
+    set_test_authoritative_provider_record("req_http_1750", {
+        "found": True,
+        "tokens": 1750,
+        "cost": 0.035,
+        "provider_request_id": "req_http_1750"
+    })
 
     client = app.test_client()
 
     res = client.post(
         f"/api/runs/{run_id}/reconcile_usage",
         headers={"Origin": "http://127.0.0.1:8080", "Content-Type": "application/json", "X-Operator-Token": "op_test_token_123"},
-        json={"provider_tokens": 1750, "cost": 0.035, "provider_request_id": "req_http_1750"}
+        json={}
     )
     assert res.status_code == 200
     data = res.get_json()

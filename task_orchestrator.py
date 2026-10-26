@@ -498,10 +498,14 @@ def execute_single_task(
             tokens_used = output_res.get("tokens_used")
             token_source = output_res.get("token_source")
             provider_request_id = output_res.get("provider_request_id")
+            provider = output_res.get("provider")
+            model = output_res.get("model")
             if token_source is None:
                 token_source = "provider_reported" if tokens_used is not None else "estimated"
         else:
             output = output_res
+            provider = None
+            model = None
             try:
                 from app import get_last_agent_execution
                 meta = get_last_agent_execution()
@@ -509,6 +513,8 @@ def execute_single_task(
                     tokens_used = meta["tokens_used"]
                     token_source = meta.get("token_source", "provider_reported")
                     provider_request_id = meta.get("provider_request_id")
+                    provider = meta.get("provider")
+                    model = meta.get("model")
             except Exception:
                 pass
         
@@ -531,6 +537,8 @@ def execute_single_task(
             tokens_used=tokens_used,
             token_source=token_source,
             provider_request_id=provider_request_id,
+            provider=provider,
+            model=model,
             input_preview=full_context[:400],
             output_preview=output[:400],
             db_path=db_path
