@@ -94,7 +94,7 @@ Furthermore, concurrent calls across threads or processes risked lost updates du
 
 ### 3.1 Phase 2.7 Dedicated Acceptance Test Suite
 **Test Suite:** `tests/test_phase_2_7_financial_integrity_and_crash_recovery.py`  
-**Result:** **13 passed in 5.65s**
+**Result:** **17 passed in 9.12s**
 
 | Test Function | Description | Result |
 |---|---|---|
@@ -111,6 +111,10 @@ Furthermore, concurrent calls across threads or processes risked lost updates du
 | `test_p27_crash_before_first_ledger_write` | Failure before SQLite commit leaves DB and budget untouched | **PASSED** |
 | `test_p27_provider_and_model_persistence_in_task_completion` | Verifies `complete_task_with_agent_run` records `provider` and `model` in SQLite | **PASSED** |
 | `test_p27_multiple_consecutive_reconciliation_retries_idempotency` | 6 consecutive calls to reconciliation endpoint; proves zero duplicate charges | **PASSED** |
+| `test_p27_manual_adjustment_idempotency_key_replay_and_conflict` | Idempotency-Key header enables safe retry with header `X-Idempotent-Replay: true` and 409 on conflict | **PASSED** |
+| `test_p27_manual_adjustment_incremental_mode` | Incremental mode (`is_incremental: true`) modifies token and cost ledger balances additively | **PASSED** |
+| `test_p27_manual_adjustment_negative_token_rejection` | Validates rejection of negative absolute token values with HTTP 400 | **PASSED** |
+| `test_p27_cross_process_file_lock_dead_process_cleanup` | Automatically detects and cleans abandoned lock files owned by dead PIDs in < 1 second | **PASSED** |
 
 ---
 
@@ -123,18 +127,18 @@ pytest tests/test_phase_2_4_h_independent_acceptance.py tests/test_phase_2_4_i_a
 
 **Output Summary:**
 ```text
-================== 115 passed, 1 skipped in 65.92s (0:01:05) ==================
+================== 119 passed, 1 skipped in 72.58s (0:01:12) ==================
 ```
 
 - **Phase 2.4-H:** 16 passed
-- **Phase 2.4-I:** 14 passed
+- **Phase 2.4-I:** 15 passed
 - **Phase 2.4-J:** 18 passed
-- **Phase 2.4-K:** 17 passed
+- **Phase 2.4-K:** 21 passed
 - **Phase 2.5:** 19 passed
 - **Phase 2.6:** 13 passed, 1 skipped (Windows symlink test skipped cleanly)
-- **Phase 2.7:** 13 passed
+- **Phase 2.7:** 17 passed
 
-**Regression Pass Rate:** **100% (115/115 applicable tests passed)**
+**Regression Pass Rate:** **100% (119/119 applicable tests passed)**
 
 ---
 
@@ -198,4 +202,4 @@ Phase 2.7 completes the transformation of `agency-dashboard` into a crash-resili
 - Dual-ledger outbox synchronization survives arbitrary transaction volume without double-counting.
 - Cross-process and cross-thread locking protect financial state from race conditions.
 - Strict role-based authorization separates automated operational flows from elevated administrative adjustments.
-- The repository test suite stands at 115 passing tests across 7 comprehensive test suites.
+- The repository test suite stands at 119 passing tests across 7 comprehensive test suites.

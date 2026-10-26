@@ -795,3 +795,204 @@ def test_p27_multiple_consecutive_reconciliation_retries_idempotency(tmp_path):
         b_final = json.load(f)
     assert b_final["tokens_used"] == 1400
 
+
+def test_p27_manual_adjustment_idempotency_key_replay_and_conflict(tmp_path, monkeypatch):
+    """Idempotency-Key header provides replay protection (200 OK) and conflict detection (409)."""
+    test_db = str(tmp_path / "p27_idemp_key.db")
+    db_store.init_db(test_db)
+    monkeypatch.setattr("db_persistence.DEFAULT_DB_FILENAME", os.path.basename(test_db))
+    monkeypatch.setenv("DATABASE_PATH", test_db)
+    monkeypatch.setenv("ADMIN_AUTH_TOKEN", "admin_secret_token")
+
+    test_budget = str(tmp_path / "test_budget_idemp.json")
+    with open(test_budget, "w", encoding="utf-8") as f:
+        json.dump({"tokens_used": 1000, "estimated_cost": 0.01, "transactions": [], "applied_reconciliations": {}}, f)
+    monkeypatch.setenv("BUDGET_FILE", test_budget)
+    monkeypatch.setenv("BUDGET_FILE_PATH", test_budget)
+    monkeypatch.setattr("app.BUDGET_FILE", test_budget, raising=False)
+
+    sid = "sess_p27_idemp"
+    db_store.create_session(session_id=sid, project_name="Idemp Test", task_description="Desc", db_path=test_db)
+    tid = db_store.create_task(session_id=sid, title="Task Idemp", division_id="engineering", assigned_agent_id="dev", stage="dev", status="completed", db_path=test_db)
+    run_id = db_store.record_agent_run(
+        task_id=tid,
+        session_id=sid,
+        agent_id="dev",
+        agent_name="Developer",
+        division_id="engineering",
+        prompt_file="dev.md",
+        status="completed",
+        tokens_used=100,
+        token_source="estimated",
+        db_path=test_db
+    )
+
+    client = app.test_client()
+    idemp_key = f"idemp_{uuid.uuid4().hex}"
+
+    # Request 1: First application with Idempotency-Key
+    res1 = client.post(
+        f"/api/runs/{run_id}/manual_adjustment",
+        headers={
+            "Origin": "http://127.0.0.1:8080",
+            "Content-Type": "application/json",
+            "X-Admin-Token": "admin_secret_token",
+            "Idempotency-Key": idemp_key
+        },
+        json={"adjusted_tokens": 800, "reason": "First manual adjustment", "evidence_reference": "REF-001"}
+    )
+    assert res1.status_code == 200
+    data1 = res1.get_json()
+    assert data1["adjusted_tokens"] == 800
+    assert data1["delta_tokens"] == 700
+
+    # Request 2: Replay with identical payload and same Idempotency-Key -> 200 OK with X-Idempotent-Replay header
+    res2 = client.post(
+        f"/api/runs/{run_id}/manual_adjustment",
+        headers={
+            "Origin": "http://127.0.0.1:8080",
+            "Content-Type": "application/json",
+            "X-Admin-Token": "admin_secret_token",
+            "Idempotency-Key": idemp_key
+        },
+        json={"adjusted_tokens": 800, "reason": "First manual adjustment", "evidence_reference": "REF-001"}
+    )
+    assert res2.status_code == 200
+    assert res2.headers.get("X-Idempotent-Replay") == "true"
+    data2 = res2.get_json()
+    assert data2["adjusted_tokens"] == 800
+    assert data2["resumed_from_idempotency"] is True
+
+    # Request 3: Replay with DIFFERENT payload using same Idempotency-Key -> 409 Conflict
+    res3 = client.post(
+        f"/api/runs/{run_id}/manual_adjustment",
+        headers={
+            "Origin": "http://127.0.0.1:8080",
+            "Content-Type": "application/json",
+            "X-Admin-Token": "admin_secret_token",
+            "Idempotency-Key": idemp_key
+        },
+        json={"adjusted_tokens": 1500, "reason": "Conflicting different payload", "evidence_reference": "REF-CONFLICT"}
+    )
+    assert res3.status_code == 409
+    assert "Idempotency key" in res3.get_json()["error"]
+    assert "previously used with different request parameters" in res3.get_json()["error"]
+
+
+def test_p27_manual_adjustment_incremental_mode(tmp_path, monkeypatch):
+    """Incremental manual adjustment modifies tokens additively."""
+    test_db = str(tmp_path / "p27_incr.db")
+    db_store.init_db(test_db)
+    monkeypatch.setattr("db_persistence.DEFAULT_DB_FILENAME", os.path.basename(test_db))
+    monkeypatch.setenv("DATABASE_PATH", test_db)
+    monkeypatch.setenv("ADMIN_AUTH_TOKEN", "admin_secret_token")
+
+    test_budget = str(tmp_path / "test_budget_incr.json")
+    with open(test_budget, "w", encoding="utf-8") as f:
+        json.dump({"tokens_used": 1000, "estimated_cost": 0.01, "transactions": [], "applied_reconciliations": {}}, f)
+    monkeypatch.setenv("BUDGET_FILE", test_budget)
+    monkeypatch.setenv("BUDGET_FILE_PATH", test_budget)
+    monkeypatch.setattr("app.BUDGET_FILE", test_budget, raising=False)
+
+    sid = "sess_p27_incr"
+    db_store.create_session(session_id=sid, project_name="Incr Test", task_description="Desc", db_path=test_db)
+    tid = db_store.create_task(session_id=sid, title="Task Incr", division_id="engineering", assigned_agent_id="dev", stage="dev", status="completed", db_path=test_db)
+    run_id = db_store.record_agent_run(
+        task_id=tid,
+        session_id=sid,
+        agent_id="dev",
+        agent_name="Developer",
+        division_id="engineering",
+        prompt_file="dev.md",
+        status="completed",
+        tokens_used=500,
+        token_source="estimated",
+        db_path=test_db
+    )
+
+    client = app.test_client()
+
+    # Apply incremental +250 tokens
+    res = client.post(
+        f"/api/runs/{run_id}/manual_adjustment",
+        headers={"Origin": "http://127.0.0.1:8080", "Content-Type": "application/json", "X-Admin-Token": "admin_secret_token"},
+        json={
+            "adjusted_tokens": 250,
+            "is_incremental": True,
+            "reason": "Additive late billing credit",
+            "evidence_reference": "INCR-001"
+        }
+    )
+    assert res.status_code == 200
+    data = res.get_json()
+    assert data["prior_tokens"] == 500
+    assert data["adjusted_tokens"] == 750
+    assert data["delta_tokens"] == 250
+
+    # Verify budget ledger updated by delta (+250)
+    with open(test_budget, "r", encoding="utf-8") as f:
+        b = json.load(f)
+    assert b["tokens_used"] == 1250  # 1000 + 250
+
+
+def test_p27_manual_adjustment_negative_token_rejection(tmp_path, monkeypatch):
+    """Negative absolute token values are rejected with HTTP 400."""
+    test_db = str(tmp_path / "p27_neg.db")
+    db_store.init_db(test_db)
+    monkeypatch.setattr("db_persistence.DEFAULT_DB_FILENAME", os.path.basename(test_db))
+    monkeypatch.setenv("DATABASE_PATH", test_db)
+    monkeypatch.setenv("ADMIN_AUTH_TOKEN", "admin_secret_token")
+
+    sid = "sess_p27_neg"
+    db_store.create_session(session_id=sid, project_name="Neg Test", task_description="Desc", db_path=test_db)
+    tid = db_store.create_task(session_id=sid, title="Task Neg", division_id="engineering", assigned_agent_id="dev", stage="dev", status="completed", db_path=test_db)
+    run_id = db_store.record_agent_run(
+        task_id=tid,
+        session_id=sid,
+        agent_id="dev",
+        agent_name="Developer",
+        division_id="engineering",
+        prompt_file="dev.md",
+        status="completed",
+        tokens_used=500,
+        token_source="estimated",
+        db_path=test_db
+    )
+
+    client = app.test_client()
+
+    # Negative absolute token adjustment -> 400
+    res = client.post(
+        f"/api/runs/{run_id}/manual_adjustment",
+        headers={"Origin": "http://127.0.0.1:8080", "Content-Type": "application/json", "X-Admin-Token": "admin_secret_token"},
+        json={"adjusted_tokens": -50, "reason": "Invalid negative", "evidence_reference": "NEG-001"}
+    )
+    assert res.status_code == 400
+    assert "'adjusted_tokens' must be non-negative" in res.get_json()["error"]
+
+
+def test_p27_cross_process_file_lock_dead_process_cleanup(tmp_path):
+    """_budget_file_lock automatically detects and breaks dead process abandoned locks."""
+    budget_file = str(tmp_path / "dead_lock_budget.json")
+    with open(budget_file, "w", encoding="utf-8") as f:
+        json.dump({"tokens_used": 0, "transactions": []}, f)
+
+    lock_file = f"{budget_file}.lock"
+    # Create an abandoned lock file owned by a PID that definitely does not exist (PID 999999)
+    with open(lock_file, "w", encoding="utf-8") as lf:
+        lf.write(f"999999:{time.time() - 100.0}\n")
+
+    # Acquiring the lock should detect that PID 999999 is dead and break it without timing out
+    t0 = time.time()
+    with db_store._budget_file_lock(budget_file, timeout=5.0):
+        # We successfully acquired the lock
+        assert os.path.exists(lock_file)
+        with open(lock_file, "r", encoding="utf-8") as lf:
+            content = lf.read()
+        assert content.startswith(f"{os.getpid()}:")
+
+    # Lock should take < 1 second to break dead PID
+    assert time.time() - t0 < 2.0
+    # On exit, lock should be cleanly removed
+    assert not os.path.exists(lock_file)
+

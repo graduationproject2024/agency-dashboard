@@ -3488,13 +3488,17 @@ def manual_run_adjustment_endpoint(run_id):
     reason = str(data.get("reason") or "").strip()
     evidence_reference = str(data.get("evidence_reference") or "").strip()
     cost = data.get("cost")
+    is_incremental = bool(data.get("is_incremental", False))
+    idempotency_key = request.headers.get("Idempotency-Key") or request.headers.get("X-Idempotency-Key")
+    if idempotency_key:
+        idempotency_key = idempotency_key.strip()
 
     if adjusted_tokens_raw is None:
         return jsonify({"error": "Missing required field 'adjusted_tokens'"}), 400
 
     try:
         adjusted_tokens = int(adjusted_tokens_raw)
-        if adjusted_tokens < 0:
+        if not is_incremental and adjusted_tokens < 0:
             return jsonify({"error": "'adjusted_tokens' must be non-negative"}), 400
     except (ValueError, TypeError):
         return jsonify({"error": "'adjusted_tokens' must be an integer"}), 400
@@ -3507,7 +3511,7 @@ def manual_run_adjustment_endpoint(run_id):
     if cost is not None:
         try:
             cost = float(cost)
-            if cost < 0.0:
+            if not is_incremental and cost < 0.0:
                 return jsonify({"error": "'cost' cannot be negative"}), 400
         except (ValueError, TypeError):
             return jsonify({"error": "'cost' must be a valid number"}), 400
@@ -3520,9 +3524,18 @@ def manual_run_adjustment_endpoint(run_id):
             reason=reason,
             evidence_reference=evidence_reference,
             principal=principal,
+            idempotency_key=idempotency_key,
+            is_incremental=is_incremental,
             budget_path=BUDGET_FILE
         )
-        return jsonify(res), 200
+        response = jsonify(res)
+        if res.get("resumed_from_idempotency"):
+            response.headers["X-Idempotent-Replay"] = "true"
+        return response, 200
+    except db_store.IdempotencyConflictError as idemp_err:
+        return jsonify({"error": str(idemp_err)}), 409
+    except db_store.IdempotencyInProgressError as in_prog_err:
+        return jsonify({"error": str(in_prog_err)}), 409
     except LookupError as lk_err:
         return jsonify({"error": str(lk_err)}), 404
     except ValueError as val_err:

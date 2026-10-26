@@ -1,4 +1,6 @@
 import os
+import sys
+import math
 import sqlite3
 import json
 import time
@@ -8,10 +10,63 @@ import hashlib
 import logging
 import threading
 import functools
+from decimal import Decimal, ROUND_HALF_UP
 from contextlib import contextmanager
 from typing import Dict, List, Optional, Tuple, Any
 
 DEFAULT_DB_FILENAME = "agency_persistence.db"
+
+class IdempotencyConflictError(ValueError):
+    """Raised when an idempotency key is reused with a different request payload."""
+    pass
+
+class IdempotencyInProgressError(RuntimeError):
+    """Raised when a request with the same idempotency key is currently executing."""
+    pass
+
+def round_cost(val: Any, places: int = 6) -> float:
+    """Rounds financial cost to specified decimal precision using Decimal quantization to avoid drift."""
+    try:
+        if val is None:
+            return 0.0
+        d = Decimal(str(val)).quantize(Decimal(10) ** -places, rounding=ROUND_HALF_UP)
+        return float(d)
+    except Exception:
+        return round(float(val or 0.0), places)
+
+def is_process_alive(pid: int) -> bool:
+    """
+    Check if a process with given PID is actively running.
+    Works reliably on Windows and POSIX systems.
+    """
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            SYNCHRONIZE = 0x00100000
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, pid)
+            if not handle:
+                return False
+            exit_code = ctypes.c_ulong()
+            still_active = 259  # STILL_ACTIVE
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                is_active = (exit_code.value == still_active)
+            else:
+                is_active = False
+            kernel32.CloseHandle(handle)
+            return is_active
+        except Exception:
+            return False
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError as err:
+            import errno
+            return err.errno == errno.EPERM
 
 def get_db_path(custom_path: Optional[str] = None) -> str:
     """
@@ -27,8 +82,6 @@ def get_db_path(custom_path: Optional[str] = None) -> str:
     if env_path:
         return os.path.abspath(env_path)
     return os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), DEFAULT_DB_FILENAME))
-
-from contextlib import contextmanager
 
 def _retry_on_db_lock(func, max_retries=5, initial_delay=0.05):
     delay = initial_delay
@@ -147,6 +200,7 @@ def init_db(db_path: Optional[str] = None):
             input_preview TEXT,
             output_preview TEXT,
             tokens_used INTEGER NOT NULL DEFAULT 0,
+            cost_booked REAL NOT NULL DEFAULT 0.0,
             token_source TEXT NOT NULL DEFAULT 'estimated',
             provider TEXT,
             model TEXT,
@@ -267,7 +321,8 @@ def init_db(db_path: Optional[str] = None):
             status TEXT NOT NULL CHECK(status IN ('applied_db', 'completed', 'failed')),
             provider_request_id TEXT,
             created_at REAL NOT NULL,
-            completed_at REAL
+            completed_at REAL,
+            target_cost REAL NOT NULL DEFAULT 0.0
         );
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_rec_journal_run ON reconciliation_journal(run_id);")
@@ -290,7 +345,22 @@ def init_db(db_path: Optional[str] = None):
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_rec_audit_target ON recovery_audit_log(target_id);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_rec_audit_time ON recovery_audit_log(timestamp);")
 
-        # Ensure token_source, provider_request_id, reconciliation_status, provider, and model columns exist in agent_runs table
+        # 11. Idempotency Keys table (Phase 2.7.1 Financial & Administrative Idempotency)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS idempotency_keys (
+            key TEXT PRIMARY KEY,
+            scope TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            request_hash TEXT NOT NULL,
+            response_json TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('in_progress', 'completed', 'failed')),
+            created_at REAL NOT NULL,
+            completed_at REAL
+        );
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_idemp_scope_target ON idempotency_keys(scope, target_id);")
+
+        # Ensure token_source, provider_request_id, reconciliation_status, provider, model, and cost_booked columns exist in agent_runs table
         cursor.execute("PRAGMA table_info(agent_runs);")
         run_cols = {row[1] for row in cursor.fetchall()}
         if "token_source" not in run_cols:
@@ -303,6 +373,13 @@ def init_db(db_path: Optional[str] = None):
             cursor.execute("ALTER TABLE agent_runs ADD COLUMN provider TEXT;")
         if "model" not in run_cols:
             cursor.execute("ALTER TABLE agent_runs ADD COLUMN model TEXT;")
+        if "cost_booked" not in run_cols:
+            cursor.execute("ALTER TABLE agent_runs ADD COLUMN cost_booked REAL DEFAULT 0.0;")
+
+        cursor.execute("PRAGMA table_info(reconciliation_journal);")
+        j_cols = {row[1] for row in cursor.fetchall()}
+        if "target_cost" not in j_cols:
+            cursor.execute("ALTER TABLE reconciliation_journal ADD COLUMN target_cost REAL DEFAULT 0.0;")
 
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_runs_provider ON agent_runs(provider);")
 
@@ -784,6 +861,7 @@ def record_agent_run(
     provider_request_id: Optional[str] = None,
     provider: Optional[str] = None,
     model: Optional[str] = None,
+    cost_booked: Optional[float] = None,
     db_path: Optional[str] = None
 ) -> str:
     run_id = f"run_{uuid.uuid4().hex[:12]}"
@@ -792,6 +870,7 @@ def record_agent_run(
     safe_input = sanitize_memory_content(input_preview[:500]) if input_preview else None
     safe_output = sanitize_memory_content(output_preview[:500]) if output_preview else None
     safe_error = sanitize_memory_content(error_message) if error_message else None
+    initial_cost = round_cost(cost_booked if cost_booked is not None else (tokens_used / 1_000_000.0) * 0.15, 6)
     with get_db_connection(db_path) as conn:
         cursor = conn.cursor()
         cursor.execute("PRAGMA table_info(agent_runs);")
@@ -817,6 +896,9 @@ def record_agent_run(
                     "error_message = ?"
                 ]
                 up_params = [status, safe_input, safe_output, tokens_used, token_source, fin, safe_error]
+                if "cost_booked" in cols:
+                    up_fields.append("cost_booked = ?")
+                    up_params.append(initial_cost)
                 if "provider_request_id" in cols and provider_request_id:
                     up_fields.append("provider_request_id = COALESCE(?, provider_request_id)")
                     up_params.append(provider_request_id)
@@ -850,6 +932,9 @@ def record_agent_run(
                 division_id, prompt_file, status,
                 safe_input, safe_output, tokens_used
             ]
+            if "cost_booked" in cols:
+                ins_cols.append("cost_booked")
+                ins_vals.append(initial_cost)
             if "token_source" in cols:
                 ins_cols.append("token_source")
                 ins_vals.append(token_source)
@@ -957,6 +1042,7 @@ def complete_task_with_agent_run(
     provider_request_id: Optional[str] = None,
     provider: Optional[str] = None,
     model: Optional[str] = None,
+    cost_booked: Optional[float] = None,
     db_path: Optional[str] = None
 ) -> Tuple[bool, str]:
     """
@@ -979,6 +1065,7 @@ def complete_task_with_agent_run(
     effective_out_prev = output_preview or output_text
     safe_output = sanitize_memory_content(effective_out_prev[:500]) if effective_out_prev else None
     safe_error = sanitize_memory_content(error_message) if error_message else None
+    initial_cost = round_cost(cost_booked if cost_booked is not None else (tokens_used / 1_000_000.0) * 0.15, 6)
     run_id = f"run_{uuid.uuid4().hex[:12]}"
 
     with get_db_connection(db_path) as conn:
@@ -1016,6 +1103,9 @@ def complete_task_with_agent_run(
                     "error_message = ?"
                 ]
                 up_params = [safe_input, safe_output, tokens_used, token_source, now, safe_error]
+                if "cost_booked" in cols:
+                    up_fields.append("cost_booked = ?")
+                    up_params.append(initial_cost)
                 if "provider_request_id" in cols and provider_request_id:
                     up_fields.append("provider_request_id = COALESCE(?, provider_request_id)")
                     up_params.append(provider_request_id)
@@ -1050,6 +1140,9 @@ def complete_task_with_agent_run(
                     "error_message = ?"
                 ]
                 up_params = [safe_input, safe_output, tokens_used, token_source, now, safe_error]
+                if "cost_booked" in cols:
+                    up_fields.append("cost_booked = ?")
+                    up_params.append(initial_cost)
                 if "provider_request_id" in cols and provider_request_id:
                     up_fields.append("provider_request_id = COALESCE(?, provider_request_id)")
                     up_params.append(provider_request_id)
@@ -1082,6 +1175,9 @@ def complete_task_with_agent_run(
                 division_id, prompt_file, 'completed',
                 safe_input, safe_output, tokens_used
             ]
+            if "cost_booked" in cols:
+                ins_cols.append("cost_booked")
+                ins_vals.append(initial_cost)
             if "token_source" in cols:
                 ins_cols.append("token_source")
                 ins_vals.append(token_source)
@@ -1757,6 +1853,14 @@ def reconcile_interrupted_sessions(db_path: Optional[str] = None, budget_path: O
                         conn.execute(
                             "UPDATE reconciliation_journal SET status = 'completed', completed_at = ? WHERE journal_id = ?;",
                             (time.time(), pj["journal_id"])
+                        )
+                        conn.execute(
+                            "UPDATE recovery_audit_log SET outcome = 'success' WHERE target_id = ? AND outcome = 'applied_db';",
+                            (pj["run_id"],)
+                        )
+                        conn.execute(
+                            "UPDATE idempotency_keys SET status = 'completed', completed_at = ? WHERE target_id = ? AND status = 'in_progress';",
+                            (time.time(), pj["run_id"])
                         )
                     except Exception as drain_err:
                         logging.warning("Error draining reconciliation journal %s: %s", pj["journal_id"], drain_err)
@@ -2636,9 +2740,12 @@ _BUDGET_THREAD_LOCK = threading.Lock()
 @contextmanager
 def _budget_file_lock(budget_path: str, timeout: float = 15.0):
     """
-    Phase 2.7: Cross-process and cross-thread file lock on budget_path.lock to prevent concurrent
-    read-modify-write lost updates across multi-process or multi-threaded runners.
-    Includes automatic stale-lock detection and break (>60s).
+    Phase 2.7.1: Hardened cross-process and cross-thread file lock on budget_path.lock.
+    Uses O_CREAT | O_EXCL for atomic mutual exclusion across processes.
+    Writes owner PID and timestamp into lock file with fsync.
+    Does NOT remove locks based on fixed age if the owner process is still actively running.
+    Detects crashed/abandoned lock owners via reliable OS-level process liveness check.
+    Releases only lock files owned by this process.
     """
     lock_path = f"{budget_path}.lock"
     start_time = time.time()
@@ -2655,25 +2762,45 @@ def _budget_file_lock(budget_path: str, timeout: float = 15.0):
                 try:
                     payload = f"{os.getpid()}:{time.time()}".encode("utf-8")
                     os.write(fd, payload)
+                    os.fsync(fd)
                 except Exception:
                     pass
                 break
             except (FileExistsError, OSError):
-                # Check for stale lock
+                # Inspect existing lock owner
+                owner_pid = None
                 try:
-                    mtime = os.path.getmtime(lock_path)
-                    if time.time() - mtime > 60.0:
+                    if os.path.exists(lock_path):
+                        with open(lock_path, "r", encoding="utf-8") as lf:
+                            lock_text = lf.read().strip()
+                        if ":" in lock_text:
+                            pid_str = lock_text.split(":", 1)[0].strip()
+                            if pid_str.isdigit():
+                                owner_pid = int(pid_str)
+
+                    # If lock has an owner PID and that process is dead, break the abandoned lock
+                    if owner_pid is not None and not is_process_alive(owner_pid):
                         try:
                             os.remove(lock_path)
                             continue
                         except OSError:
                             pass
+                    # If file has been empty or unreadable without valid PID for > 5s, break it
+                    elif owner_pid is None and os.path.exists(lock_path):
+                        mtime = os.path.getmtime(lock_path)
+                        if time.time() - mtime > 5.0:
+                            try:
+                                os.remove(lock_path)
+                                continue
+                            except OSError:
+                                pass
                 except OSError:
                     pass
+
                 time.sleep(0.02)
 
         if not acquired:
-            raise TimeoutError(f"Could not acquire budget file lock on {lock_path} within {timeout}s")
+            raise TimeoutError(f"Could not acquire budget file lock on {lock_path} within {timeout}s: held by active process PID {owner_pid}")
 
         try:
             yield
@@ -2685,7 +2812,10 @@ def _budget_file_lock(budget_path: str, timeout: float = 15.0):
                     pass
                 try:
                     if os.path.exists(lock_path):
-                        os.remove(lock_path)
+                        with open(lock_path, "r", encoding="utf-8") as lf:
+                            content = lf.read().strip()
+                        if content.startswith(f"{os.getpid()}:"):
+                            os.remove(lock_path)
                 except OSError:
                     pass
     finally:
@@ -2814,19 +2944,23 @@ def apply_manual_run_adjustment(
     reason: str = "",
     evidence_reference: str = "",
     principal: str = "admin",
+    idempotency_key: Optional[str] = None,
+    is_incremental: bool = False,
+    failpoint: Optional[str] = None,
     db_path: Optional[str] = None,
     budget_path: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Phase 2.7: Applies a distinct, operator-audited manual token adjustment to an agent run.
+    Phase 2.7.1: Applies a distinct, operator-audited manual token adjustment to an agent run.
     - Requires non-empty reason and evidence reference.
+    - Supports Idempotency-Key handling with in-progress locks and response replay.
+    - Supports absolute or incremental token/cost adjustments.
     - Sets token_source = 'manual_operator_adjustment' and reconciliation_status = 'completed'.
-    - Atomically updates agent_runs and inserts a reconciliation_journal outbox record.
+    - Atomically updates agent_runs, reconciliation_journal outbox record, and recovery_audit_log.
     - Projects delta into budget.json idempotently via truncation-proof registry.
-    - Durably records an audit event in recovery_audit_log.
     """
-    if adjusted_tokens < 0:
-        raise ValueError("adjusted_tokens cannot be negative.")
+    if adjusted_tokens < 0 and not is_incremental:
+        raise ValueError("adjusted_tokens cannot be negative for absolute adjustment.")
     if not reason or not reason.strip():
         raise ValueError("Manual adjustment requires a non-empty reason.")
     if not evidence_reference or not evidence_reference.strip():
@@ -2834,31 +2968,88 @@ def apply_manual_run_adjustment(
 
     eff_budget_path = budget_path or os.environ.get("BUDGET_FILE_PATH") or os.environ.get("BUDGET_FILE") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "budget.json")
 
+    request_payload = {
+        "run_id": run_id,
+        "adjusted_tokens": adjusted_tokens,
+        "cost": cost,
+        "reason": reason.strip(),
+        "evidence_reference": evidence_reference.strip(),
+        "is_incremental": is_incremental
+    }
+    req_hash = hashlib.sha256(json.dumps(request_payload, sort_keys=True).encode("utf-8")).hexdigest()
+
     with get_db_connection(db_path) as conn:
         cursor = conn.cursor()
         cursor.execute("PRAGMA table_info(agent_runs);")
         cols = {row[1] for row in cursor.fetchall()}
 
         j_table = cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reconciliation_journal';").fetchone()
+        idemp_table = cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='idempotency_keys';").fetchone()
+
+        if idempotency_key and idemp_table:
+            row_idemp = cursor.execute("SELECT * FROM idempotency_keys WHERE key = ?;", (idempotency_key,)).fetchone()
+            if row_idemp:
+                if row_idemp["request_hash"] != req_hash:
+                    raise IdempotencyConflictError(f"Idempotency key '{idempotency_key}' was previously used with different request parameters.")
+                if row_idemp["status"] == "in_progress":
+                    if time.time() - row_idemp["created_at"] < 60.0:
+                        raise IdempotencyInProgressError(f"Request with idempotency key '{idempotency_key}' is currently in progress.")
+                elif row_idemp["status"] == "completed":
+                    try:
+                        cached_resp = json.loads(row_idemp["response_json"])
+                        cached_resp["resumed_from_idempotency"] = True
+                        return cached_resp
+                    except Exception:
+                        pass
+            cursor.execute("""
+                INSERT OR REPLACE INTO idempotency_keys (key, scope, target_id, request_hash, response_json, status, created_at)
+                VALUES (?, 'manual_adjustment', ?, ?, '', 'in_progress', ?);
+            """, (idempotency_key, run_id, req_hash, time.time()))
+            conn.commit()
 
         row = cursor.execute("SELECT * FROM agent_runs WHERE run_id = ?;", (run_id,)).fetchone()
         if not row:
             raise LookupError(f"Run {run_id} not found.")
 
         run_data = dict(row)
-        prior_tokens = run_data.get("tokens_used", 0)
-        delta_tokens = adjusted_tokens - prior_tokens
-        calc_cost = round((delta_tokens / 1_000_000.0) * 0.15, 6)
-        delta_cost = float(cost) if cost is not None else calc_cost
+        prior_tokens = int(run_data.get("tokens_used", 0) or 0)
+        prior_cost = float(run_data.get("cost_booked") if "cost_booked" in run_data and run_data["cost_booked"] is not None else round_cost((prior_tokens / 1_000_000.0) * 0.15, 6))
 
-        journal_id = f"adj_{run_id}_{adjusted_tokens}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+        if is_incremental:
+            final_tokens = max(0, prior_tokens + adjusted_tokens)
+            delta_tokens = adjusted_tokens
+            if cost is not None:
+                delta_cost = round_cost(float(cost), 6)
+                final_cost = max(0.0, round_cost(prior_cost + delta_cost, 6))
+            else:
+                delta_cost = round_cost((delta_tokens / 1_000_000.0) * 0.15, 6)
+                final_cost = max(0.0, round_cost(prior_cost + delta_cost, 6))
+        else:
+            final_tokens = max(0, adjusted_tokens)
+            delta_tokens = final_tokens - prior_tokens
+            if cost is not None:
+                final_cost = max(0.0, round_cost(float(cost), 6))
+                delta_cost = round_cost(final_cost - prior_cost, 6)
+            else:
+                final_cost = max(0.0, round_cost((final_tokens / 1_000_000.0) * 0.15, 6))
+                delta_cost = round_cost(final_cost - prior_cost, 6)
+
+        if failpoint == "before_db_commit":
+            raise IOError("Crash simulated before SQLite commit")
+
+        journal_id = f"adj_{run_id}_{final_tokens}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+        audit_id = f"aud_{uuid.uuid4().hex[:12]}"
 
         update_fields = [
             "tokens_used = ?",
             "token_source = 'manual_operator_adjustment'",
             "reconciliation_status = 'completed'"
         ]
-        params = [adjusted_tokens, run_id]
+        params = [final_tokens]
+        if "cost_booked" in cols:
+            update_fields.append("cost_booked = ?")
+            params.append(final_cost)
+        params.append(run_id)
 
         conn.execute(f"UPDATE agent_runs SET {', '.join(update_fields)} WHERE run_id = ?;", params)
 
@@ -2866,11 +3057,21 @@ def apply_manual_run_adjustment(
             conn.execute("""
                 INSERT INTO reconciliation_journal (
                     journal_id, run_id, target_tokens, delta_tokens, delta_cost,
-                    status, provider_request_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, 'applied_db', ?, ?);
-            """, (journal_id, run_id, adjusted_tokens, delta_tokens, delta_cost, f"manual:{evidence_reference[:50]}", time.time()))
+                    status, provider_request_id, created_at, target_cost
+                ) VALUES (?, ?, ?, ?, ?, 'applied_db', ?, ?, ?);
+            """, (journal_id, run_id, final_tokens, delta_tokens, delta_cost, f"manual:{evidence_reference[:50]}", time.time(), final_cost))
+
+        conn.execute("""
+            INSERT INTO recovery_audit_log (
+                audit_id, timestamp, principal, action, target_id,
+                force_requested, authorized, outcome, error_message
+            ) VALUES (?, ?, ?, 'manual_adjustment', ?, 1, 1, 'applied_db', ?);
+        """, (audit_id, time.time(), principal or "admin", run_id, f"Adjusted to {final_tokens} tokens (delta: {delta_tokens}, cost: {final_cost}). Reason: {reason}. Ref: {evidence_reference}"))
 
         conn.commit()
+
+        if failpoint == "after_db_before_budget":
+            raise IOError("Crash simulated after DB commit before budget update")
 
         # Project to budget
         proj = project_reconciliation_to_budget(
@@ -2884,14 +3085,47 @@ def apply_manual_run_adjustment(
             task_desc=f"تعديل إداري لاستهلاك {run_id}: {reason[:40]}"
         )
 
+        if failpoint == "after_budget_before_journal_complete":
+            raise IOError("Crash simulated after budget projection before journal completion")
+
         if j_table:
             conn.execute(
                 "UPDATE reconciliation_journal SET status = 'completed', completed_at = ? WHERE journal_id = ?;",
                 (time.time(), journal_id)
             )
-            conn.commit()
 
-    # Durably record audit event
+        conn.execute(
+            "UPDATE recovery_audit_log SET outcome = 'success' WHERE audit_id = ?;",
+            (audit_id,)
+        )
+
+        resp_data = {
+            "success": True,
+            "run_id": run_id,
+            "prior_tokens": prior_tokens,
+            "prior_cost": prior_cost,
+            "adjusted_tokens": final_tokens,
+            "delta_tokens": delta_tokens,
+            "delta_cost": delta_cost,
+            "cost": final_cost,
+            "token_source": "manual_operator_adjustment",
+            "reconciliation_status": "completed",
+            "reason": reason,
+            "evidence_reference": evidence_reference,
+            "journal_id": journal_id,
+            "budget": proj.get("budget", {}),
+            "message": "Manual run adjustment successfully applied and projected."
+        }
+
+        if idempotency_key and idemp_table:
+            conn.execute(
+                "UPDATE idempotency_keys SET status = 'completed', response_json = ?, completed_at = ? WHERE key = ?;",
+                (json.dumps(resp_data), time.time(), idempotency_key)
+            )
+
+        conn.commit()
+
+    # Durably record audit event via function outside connection context (fails closed if audit fails)
     record_recovery_audit_event(
         principal=principal or "admin",
         action="manual_adjustment",
@@ -2899,25 +3133,11 @@ def apply_manual_run_adjustment(
         force_requested=True,
         authorized=True,
         outcome="success",
-        error_message=f"Adjusted to {adjusted_tokens} tokens. Reason: {reason}. Ref: {evidence_reference}",
+        error_message=f"Adjusted to {final_tokens} tokens (delta: {delta_tokens}, cost: {final_cost}). Reason: {reason}. Ref: {evidence_reference}",
         db_path=db_path
     )
 
-    return {
-        "success": True,
-        "run_id": run_id,
-        "prior_tokens": prior_tokens,
-        "adjusted_tokens": adjusted_tokens,
-        "delta_tokens": delta_tokens,
-        "delta_cost": delta_cost,
-        "token_source": "manual_operator_adjustment",
-        "reconciliation_status": "completed",
-        "reason": reason,
-        "evidence_reference": evidence_reference,
-        "journal_id": journal_id,
-        "cost": proj.get("budget", {}).get("estimated_cost"),
-        "message": "Manual run adjustment successfully applied and projected."
-    }
+    return resp_data
 
 
 def record_recovery_audit_event(
@@ -2972,9 +3192,10 @@ def reconcile_provider_run_usage(
     failpoint: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Phase 2.6-A2: Reconciles usage and billing for an agent run using authoritative provider lookup data
+    Phase 2.7: Reconciles usage and billing for an agent run using authoritative provider lookup data
     and synchronizes the financial ledger via transactional outbox journal.
     Guarantees:
+    - Never accepts client-supplied token/cost claims.
     - Never auto-replays generative model prompts.
     - Idempotent: repeated calls do not double-count or alter already-confirmed runs.
     - Preserves explicit provider-reported 0 tokens.
@@ -3046,6 +3267,7 @@ def reconcile_provider_run_usage(
                 "tokens_used": run_data.get("tokens_used", 0),
                 "token_source": run_data.get("token_source", "provider_confirmed"),
                 "reconciliation_status": "completed",
+                "cost": run_data.get("cost_booked"),
                 "message": "Run usage was previously reconciled with authoritative provider data."
             }
 
@@ -3163,9 +3385,22 @@ def reconcile_provider_run_usage(
         resolved_req_id = lookup_result.get("provider_request_id") or provider_req_id
 
         prior_tokens = run_data.get("tokens_used", 0)
+        prior_cost = float(run_data.get("cost_booked") if "cost_booked" in run_data and run_data["cost_booked"] is not None else round_cost((prior_tokens / 1_000_000.0) * 0.15, 6))
         delta_tokens = confirmed_tokens - prior_tokens
-        calc_cost = round((delta_tokens / 1_000_000.0) * 0.15, 6)
-        delta_cost = float(lookup_result.get("cost", calc_cost)) if lookup_result.get("cost") is not None else calc_cost
+        calc_cost = round_cost((delta_tokens / 1_000_000.0) * 0.15, 6)
+
+        if lookup_result.get("cost") is not None:
+            reported_cost = float(lookup_result["cost"])
+            if lookup_result.get("is_total_cost", True):
+                final_cost = max(0.0, round_cost(reported_cost, 6))
+                delta_cost = round_cost(final_cost - prior_cost, 6)
+            else:
+                delta_cost = round_cost(reported_cost, 6)
+                final_cost = max(0.0, round_cost(prior_cost + delta_cost, 6))
+        else:
+            delta_cost = calc_cost
+            final_cost = max(0.0, round_cost(prior_cost + delta_cost, 6))
+
         journal_id = f"rec_{run_id}_{confirmed_tokens}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
 
         if failpoint == "before_db_commit":
@@ -3181,6 +3416,7 @@ def reconcile_provider_run_usage(
                 "tokens_used": current_run["tokens_used"],
                 "token_source": current_run["token_source"],
                 "reconciliation_status": "completed",
+                "cost": current_run.get("cost_booked"),
                 "message": "Run usage was previously reconciled with authoritative provider data."
             }
 
@@ -3191,6 +3427,10 @@ def reconcile_provider_run_usage(
             "reconciliation_status = 'completed'"
         ]
         params = [confirmed_tokens]
+
+        if "cost_booked" in cols:
+            update_fields.append("cost_booked = ?")
+            params.append(final_cost)
 
         if "provider_request_id" in cols and resolved_req_id:
             update_fields.append("provider_request_id = ?")
@@ -3204,9 +3444,9 @@ def reconcile_provider_run_usage(
             conn.execute("""
                 INSERT INTO reconciliation_journal (
                     journal_id, run_id, target_tokens, delta_tokens, delta_cost,
-                    status, provider_request_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, 'applied_db', ?, ?);
-            """, (journal_id, run_id, confirmed_tokens, delta_tokens, delta_cost, resolved_req_id, time.time()))
+                    status, provider_request_id, created_at, target_cost
+                ) VALUES (?, ?, ?, ?, ?, 'applied_db', ?, ?, ?);
+            """, (journal_id, run_id, confirmed_tokens, delta_tokens, delta_cost, resolved_req_id, time.time(), final_cost))
 
         conn.commit()
 
@@ -3241,7 +3481,7 @@ def reconcile_provider_run_usage(
             "reconciliation_status": "completed",
             "delta_tokens": delta_tokens,
             "delta_cost": delta_cost,
-            "cost": lookup_result.get("cost"),
+            "cost": final_cost,
             "message": "Authoritative provider usage successfully reconciled."
         }
 
