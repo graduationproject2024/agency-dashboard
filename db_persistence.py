@@ -24,6 +24,10 @@ class IdempotencyInProgressError(RuntimeError):
     """Raised when a request with the same idempotency key is currently executing."""
     pass
 
+class ConcurrencyConflictError(RuntimeError):
+    """Raised when concurrent operations attempt conflicting updates on the same run ledger."""
+    pass
+
 def round_cost(val: Any, places: int = 6) -> float:
     """Rounds financial cost to specified decimal precision using Decimal quantization to avoid drift."""
     try:
@@ -33,6 +37,47 @@ def round_cost(val: Any, places: int = 6) -> float:
         return float(d)
     except Exception:
         return round(float(val or 0.0), places)
+
+def validate_financial_numeric(
+    val: Any,
+    field_name: str = "cost",
+    allow_none: bool = False,
+    allow_negative: bool = False,
+    max_value: float = 1_000_000.0
+) -> Optional[float]:
+    """
+    Phase 2.7.2: Strict financial numeric validation.
+    Enforces:
+    - Rejects booleans (isinstance(True, int) == True)
+    - Rejects NaN, +Infinity, -Infinity
+    - Rejects negative values unless allow_negative=True
+    - Rejects out-of-range values exceeding max_value
+    - Normalizes precision consistently using round_cost
+    """
+    if val is None:
+        if allow_none:
+            return None
+        raise ValueError(f"{field_name} cannot be None.")
+
+    if isinstance(val, bool):
+        raise ValueError(f"{field_name} cannot be a boolean (got {val}).")
+
+    try:
+        num = float(val)
+    except (ValueError, TypeError):
+        raise ValueError(f"{field_name} must be a valid numeric value, got: {val!r}")
+
+    import math
+    if not math.isfinite(num):
+        raise ValueError(f"{field_name} must be a finite number (got {val}).")
+
+    if not allow_negative and num < 0.0:
+        raise ValueError(f"{field_name} cannot be negative (got {num}).")
+
+    if abs(num) > max_value:
+        raise ValueError(f"{field_name} exceeds maximum allowable threshold ({max_value}).")
+
+    return round_cost(num, 6)
 
 def is_process_alive(pid: int) -> bool:
     """
@@ -358,6 +403,8 @@ def init_db(db_path: Optional[str] = None):
                 request_hash TEXT NOT NULL,
                 response_json TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL CHECK(status IN ('in_progress', 'committed_pending_projection', 'completed', 'failed_retryable', 'failed_terminal')),
+                owner_token TEXT NOT NULL DEFAULT '',
+                lease_expires_at REAL NOT NULL DEFAULT 0.0,
                 journal_id TEXT,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
@@ -375,6 +422,8 @@ def init_db(db_path: Optional[str] = None):
                 request_hash TEXT NOT NULL,
                 response_json TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL CHECK(status IN ('in_progress', 'committed_pending_projection', 'completed', 'failed_retryable', 'failed_terminal')),
+                owner_token TEXT NOT NULL DEFAULT '',
+                lease_expires_at REAL NOT NULL DEFAULT 0.0,
                 journal_id TEXT,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
@@ -390,6 +439,15 @@ def init_db(db_path: Optional[str] = None):
             """)
             cursor.execute("DROP TABLE idempotency_keys_old;")
             cursor.execute("PRAGMA foreign_keys=ON;")
+
+        cursor.execute("PRAGMA table_info(idempotency_keys);")
+        idemp_cols = {row[1] for row in cursor.fetchall()}
+        if "owner_token" not in idemp_cols:
+            cursor.execute("ALTER TABLE idempotency_keys ADD COLUMN owner_token TEXT NOT NULL DEFAULT '';")
+        if "lease_expires_at" not in idemp_cols:
+            cursor.execute("ALTER TABLE idempotency_keys ADD COLUMN lease_expires_at REAL NOT NULL DEFAULT 0.0;")
+        if "journal_id" not in idemp_cols:
+            cursor.execute("ALTER TABLE idempotency_keys ADD COLUMN journal_id TEXT;")
 
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_idemp_scope_target ON idempotency_keys(scope, target_id);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_idemp_status ON idempotency_keys(status);")
@@ -2803,7 +2861,7 @@ def cleanup_abandoned_restore_staging(app_dir: str, max_age_seconds: float = 60.
     return cleaned_count
 
 
-_BUDGET_THREAD_LOCK = threading.Lock()
+_BUDGET_THREAD_LOCK = threading.RLock()
 
 @contextmanager
 def _budget_file_lock(budget_path: str, timeout: float = 15.0):
