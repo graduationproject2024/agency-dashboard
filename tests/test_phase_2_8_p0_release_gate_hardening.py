@@ -49,6 +49,13 @@ def temp_db(tmp_path, monkeypatch):
     return db_file
 
 
+@pytest.fixture
+def test_client():
+    app.config["TESTING"] = True
+    with app.test_client() as client:
+        yield client
+
+
 VALID_HTML = "<!DOCTYPE html><html><head><title>App</title><link rel='stylesheet' href='style.css'></head><body><h1>App</h1><script src='script.js'></script></body></html>"
 VALID_CSS = "body { margin: 0; padding: 0; }"
 VALID_JS = "console.log('clean app');"
@@ -546,3 +553,349 @@ def test_req20_valid_trusted_qa_run_for_exact_candidate_revision_passes(temp_db)
     assert res["status"] == "passed"
     assert res["reasons"] == []
     assert res["blocking_findings_count"] == 0
+
+
+# =========================================================================
+# Phase 2.8 Final P0 Closure: Fail-Closed QA Revision Binding Tests
+# =========================================================================
+
+def test_finding_with_none_revision_cannot_be_resolved(temp_db):
+    """A finding with artifact_revision=None must fail closed and cannot be resolved."""
+    sess_id = db_store.create_session("None Rev Session", "Task", db_path=temp_db)
+    cand = _make_candidate_files()
+
+    fid = db_store.record_qa_finding(
+        session_id=sess_id,
+        task_id=None,
+        qa_run_id="run_1",
+        severity="high",
+        category="syntax",
+        artifact_name="index.html",
+        evidence="Missing doctype",
+        status="open",
+        artifact_revision=None,
+        db_path=temp_db
+    )
+
+    # 1. run_qa_checks on candidate must NOT resolve finding
+    rep = run_qa_checks(cand["index.html"], cand["style.css"], cand["script.js"], session_id=sess_id, verified_finding_ids=[fid], db_path=temp_db)
+    assert fid in rep["unresolved_findings"]
+    assert fid not in rep["resolved_findings"]
+    f = db_store.get_qa_finding(fid, db_path=temp_db)
+    assert f["status"] == "open"
+
+    # 2. Direct status update must reject resolution
+    ok, err = db_store.update_qa_finding_status(
+        finding_id=fid,
+        status="verified_resolved",
+        verified_by_agent="engineering-qa-engineer",
+        artifact_revision=compute_artifact_revision(cand),
+        db_path=temp_db
+    )
+    assert ok is False
+    assert "missing, empty, or malformed artifact_revision" in err
+
+
+def test_finding_with_empty_revision_cannot_be_resolved(temp_db):
+    """A finding with empty string artifact_revision must fail closed and cannot be resolved."""
+    sess_id = db_store.create_session("Empty Rev Session", "Task", db_path=temp_db)
+    cand = _make_candidate_files()
+
+    fid = db_store.record_qa_finding(
+        session_id=sess_id,
+        task_id=None,
+        qa_run_id="run_1",
+        severity="high",
+        category="syntax",
+        artifact_name="index.html",
+        evidence="Missing tag",
+        status="open",
+        artifact_revision="",
+        db_path=temp_db
+    )
+
+    rep = run_qa_checks(cand["index.html"], cand["style.css"], cand["script.js"], session_id=sess_id, verified_finding_ids=[fid], db_path=temp_db)
+    assert fid in rep["unresolved_findings"]
+    assert fid not in rep["resolved_findings"]
+    f = db_store.get_qa_finding(fid, db_path=temp_db)
+    assert f["status"] == "open"
+
+    ok, err = db_store.update_qa_finding_status(
+        finding_id=fid,
+        status="verified_resolved",
+        verified_by_agent="engineering-qa-engineer",
+        artifact_revision=compute_artifact_revision(cand),
+        db_path=temp_db
+    )
+    assert ok is False
+    assert "missing, empty, or malformed artifact_revision" in err
+
+
+def test_finding_with_malformed_revision_cannot_be_resolved(temp_db):
+    """A finding with a malformed artifact_revision (not 64-char hex) must fail closed."""
+    sess_id = db_store.create_session("Malformed Rev Session", "Task", db_path=temp_db)
+    cand = _make_candidate_files()
+
+    fid = db_store.record_qa_finding(
+        session_id=sess_id,
+        task_id=None,
+        qa_run_id="run_1",
+        severity="high",
+        category="syntax",
+        artifact_name="index.html",
+        evidence="Syntax issue",
+        status="open",
+        artifact_revision="not-a-valid-sha256-hash",
+        db_path=temp_db
+    )
+
+    rep = run_qa_checks(cand["index.html"], cand["style.css"], cand["script.js"], session_id=sess_id, verified_finding_ids=[fid], db_path=temp_db)
+    assert fid in rep["unresolved_findings"]
+    assert fid not in rep["resolved_findings"]
+    f = db_store.get_qa_finding(fid, db_path=temp_db)
+    assert f["status"] == "open"
+
+    ok, err = db_store.update_qa_finding_status(
+        finding_id=fid,
+        status="verified_resolved",
+        verified_by_agent="engineering-qa-engineer",
+        artifact_revision=compute_artifact_revision(cand),
+        db_path=temp_db
+    )
+    assert ok is False
+    assert "missing, empty, or malformed artifact_revision" in err
+
+
+def test_finding_from_older_revision_cannot_be_resolved_against_current_candidate(temp_db):
+    """A finding from an older revision cannot be resolved against the current candidate."""
+    sess_id = db_store.create_session("Older Rev Session", "Task", db_path=temp_db)
+    cand_old = {"index.html": "<!DOCTYPE html><html><body>Old</body></html>", "style.css": "body { color: blue; }", "script.js": "console.log('old');"}
+    rev_old = compute_artifact_revision(cand_old)
+    cand_new = _make_candidate_files()
+    rev_new = compute_artifact_revision(cand_new)
+    assert rev_old != rev_new
+
+    fid = db_store.record_qa_finding(
+        session_id=sess_id,
+        task_id=None,
+        qa_run_id="run_old",
+        severity="high",
+        category="syntax",
+        artifact_name="index.html",
+        evidence="Old finding",
+        status="open",
+        artifact_revision=rev_old,
+        db_path=temp_db
+    )
+
+    rep = run_qa_checks(cand_new["index.html"], cand_new["style.css"], cand_new["script.js"], session_id=sess_id, verified_finding_ids=[fid], db_path=temp_db)
+    assert fid in rep["unresolved_findings"]
+    assert fid not in rep["resolved_findings"]
+    assert db_store.get_qa_finding(fid, db_path=temp_db)["status"] == "open"
+
+
+def test_resolution_record_tied_to_different_revision_is_rejected(temp_db):
+    """A resolution record tied to a different revision is rejected both at update and gate evaluation."""
+    sess_id = db_store.create_session("Diff Rev Res Session", "Task", db_path=temp_db)
+    cand = _make_candidate_files()
+    rev_actual = compute_artifact_revision(cand)
+    rev_forged = "e" * 64
+
+    fid = db_store.record_qa_finding(
+        session_id=sess_id,
+        task_id=None,
+        qa_run_id="run_1",
+        severity="critical",
+        category="security",
+        artifact_name="index.html",
+        evidence="Path traversal",
+        status="open",
+        artifact_revision=rev_actual,
+        db_path=temp_db
+    )
+
+    # Attempt resolution with different revision -> rejected
+    ok, err = db_store.update_qa_finding_status(
+        finding_id=fid,
+        status="verified_resolved",
+        verified_by_agent="engineering-qa-engineer",
+        artifact_revision=rev_forged,
+        db_path=temp_db
+    )
+    assert ok is False
+    assert "does not match finding artifact_revision" in err
+
+    # Resolve with correct revision
+    ok_res, _ = db_store.update_qa_finding_status(
+        finding_id=fid,
+        status="verified_resolved",
+        verified_by_agent="engineering-qa-engineer",
+        artifact_revision=rev_actual,
+        db_path=temp_db
+    )
+    assert ok_res is True
+
+    # Tamper resolution history to simulate stale resolution from older revision
+    with db_store.get_db_connection(temp_db) as conn:
+        stale_history = json.dumps([{"status": "verified_resolved", "artifact_revision": rev_forged, "timestamp": 123456}])
+        conn.execute("UPDATE qa_findings SET verification_history_json = ? WHERE finding_id = ?", (stale_history, fid))
+        conn.commit()
+
+    # Valid QA run and manifest for candidate
+    rep = run_qa_checks(cand["index.html"], cand["style.css"], cand["script.js"], session_id=sess_id, db_path=temp_db)
+    res = evaluate_release_gate(sess_id, candidate_files=cand, artifact_manifest=rep["manifest"], db_path=temp_db)
+    assert res["allowed"] is False
+    assert any("tied to a different artifact revision" in r for r in res["reasons"])
+
+
+def test_finding_with_correct_revision_wrong_target_id_rejected(temp_db):
+    """When verified_finding_ids restricts targeted resolution, other findings with same revision remain open."""
+    sess_id = db_store.create_session("Target ID Session", "Task", db_path=temp_db)
+    cand = _make_candidate_files()
+    rev = compute_artifact_revision(cand)
+
+    fid1 = db_store.record_qa_finding(
+        session_id=sess_id, task_id=None, qa_run_id="r1", severity="medium",
+        category="syntax", artifact_name="index.html", evidence="Issue 1",
+        status="open", artifact_revision=rev, db_path=temp_db
+    )
+    fid2 = db_store.record_qa_finding(
+        session_id=sess_id, task_id=None, qa_run_id="r1", severity="medium",
+        category="syntax", artifact_name="index.html", evidence="Issue 2",
+        status="open", artifact_revision=rev, db_path=temp_db
+    )
+
+    rep = run_qa_checks(cand["index.html"], cand["style.css"], cand["script.js"], session_id=sess_id, verified_finding_ids=[fid1], db_path=temp_db)
+    assert fid1 in rep["resolved_findings"]
+    assert fid2 in rep["unresolved_findings"]
+    assert db_store.get_qa_finding(fid2, db_path=temp_db)["status"] == "open"
+
+
+def test_finding_with_correct_revision_wrong_session_or_task_rejected(temp_db):
+    """Findings from another session or mismatching task scope cannot be resolved even with matching revision."""
+    sess1 = db_store.create_session("Sess 1", "Task", db_path=temp_db)
+    sess2 = db_store.create_session("Sess 2", "Task", db_path=temp_db)
+    cand = _make_candidate_files()
+    rev = compute_artifact_revision(cand)
+
+    fid_cross_sess = db_store.record_qa_finding(
+        session_id=sess2, task_id=None, qa_run_id="r1", severity="high",
+        category="syntax", artifact_name="index.html", evidence="Cross session",
+        status="open", artifact_revision=rev, db_path=temp_db
+    )
+    fid_task_mismatch = db_store.record_qa_finding(
+        session_id=sess1, task_id="task_backend", qa_run_id="r1", severity="high",
+        category="syntax", artifact_name="index.html", evidence="Task mismatch",
+        status="open", artifact_revision=rev, db_path=temp_db
+    )
+
+    rep = run_qa_checks(
+        cand["index.html"], cand["style.css"], cand["script.js"],
+        session_id=sess1, task_id="task_frontend",
+        verified_finding_ids=[fid_cross_sess, fid_task_mismatch],
+        db_path=temp_db
+    )
+    assert fid_cross_sess in rep["unresolved_findings"]
+    assert fid_task_mismatch in rep["unresolved_findings"]
+    assert db_store.get_qa_finding(fid_cross_sess, db_path=temp_db)["status"] == "open"
+    assert db_store.get_qa_finding(fid_task_mismatch, db_path=temp_db)["status"] == "open"
+
+
+def test_missing_revision_identity_cannot_be_bypassed_via_alternate_resolution_paths(test_client, temp_db):
+    """API endpoint /api/qa_findings/<id>/status rejects verified_resolved without matching revision."""
+    sess_id = db_store.create_session("API Bypass Session", "Task", db_path=temp_db)
+    fid_none_rev = db_store.record_qa_finding(
+        session_id=sess_id, task_id=None, qa_run_id="r1", severity="high",
+        category="syntax", artifact_name="index.html", evidence="No rev",
+        status="open", artifact_revision=None, db_path=temp_db
+    )
+
+    # Attempt 1: Call endpoint without artifact_revision in payload
+    resp1 = test_client.post(
+        f"/api/qa_findings/{fid_none_rev}/status",
+        headers={"Origin": "http://127.0.0.1:8080"},
+        json={"status": "verified_resolved", "agent_id": "engineering-qa-engineer"}
+    )
+    assert resp1.status_code == 400
+    assert "missing, empty, or malformed artifact_revision" in resp1.get_json()["error"]
+    assert db_store.get_qa_finding(fid_none_rev, db_path=temp_db)["status"] == "open"
+
+    # Attempt 2: Call endpoint supplying forged revision on finding that has None revision
+    resp2 = test_client.post(
+        f"/api/qa_findings/{fid_none_rev}/status",
+        headers={"Origin": "http://127.0.0.1:8080"},
+        json={"status": "verified_resolved", "agent_id": "engineering-qa-engineer", "artifact_revision": "f" * 64}
+    )
+    assert resp2.status_code == 400
+    assert db_store.get_qa_finding(fid_none_rev, db_path=temp_db)["status"] == "open"
+
+
+def test_previously_unresolved_finding_cannot_be_resolved_by_later_qa_on_different_artifacts(temp_db):
+    """A previously unresolved finding cannot be marked resolved solely because a later QA run passes on different artifacts."""
+    sess_id = db_store.create_session("Later QA Session", "Task", db_path=temp_db)
+    cand_v1 = {"index.html": "<!DOCTYPE html><html><body>Version 1</body></html>", "style.css": "body { color: red; }", "script.js": "console.log(1);"}
+    rev_v1 = compute_artifact_revision(cand_v1)
+    cand_v2 = _make_candidate_files()
+    rev_v2 = compute_artifact_revision(cand_v2)
+    assert rev_v1 != rev_v2
+
+    fid = db_store.record_qa_finding(
+        session_id=sess_id, task_id=None, qa_run_id="r1", severity="critical",
+        category="security", artifact_name="index.html", evidence="V1 flaw",
+        status="open", artifact_revision=rev_v1, db_path=temp_db
+    )
+
+    # Run QA on v2 deliverables (which pass)
+    rep = run_qa_checks(cand_v2["index.html"], cand_v2["style.css"], cand_v2["script.js"], session_id=sess_id, db_path=temp_db)
+    assert rep["passed"] is True
+    # The v1 finding must NOT be in resolved_findings
+    assert fid not in rep["resolved_findings"]
+    assert db_store.get_qa_finding(fid, db_path=temp_db)["status"] == "open"
+
+
+def test_release_gate_resolved_finding_without_revision_fails_closed(temp_db):
+    """A finding marked 'verified_resolved' in persistence that lacks a valid revision fails closed in release gate."""
+    sess_id = db_store.create_session("No Rev Resolved Session", "Task", db_path=temp_db)
+    cand = _make_candidate_files()
+
+    # Record passing QA run
+    rep = run_qa_checks(cand["index.html"], cand["style.css"], cand["script.js"], session_id=sess_id, db_path=temp_db)
+    assert rep["passed"] is True
+
+    # Insert a finding marked verified_resolved but with artifact_revision = None directly into DB
+    with db_store.get_db_connection(temp_db) as conn:
+        conn.execute("""
+            INSERT INTO qa_findings (
+                finding_id, session_id, task_id, qa_run_id, severity, category,
+                artifact_name, evidence, responsible_agent_id, status,
+                verification_history_json, artifact_revision, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """, (
+            "fnd_tampered_no_rev", sess_id, None, rep["qa_run_id"], "high", "syntax",
+            "index.html", "Old untrusted finding", "dev", "verified_resolved",
+            json.dumps([{"status": "verified_resolved"}]), None, 1000, 1000
+        ))
+        conn.commit()
+
+    res = evaluate_release_gate(sess_id, candidate_files=cand, artifact_manifest=rep["manifest"], db_path=temp_db)
+    assert res["allowed"] is False
+    assert any("missing, empty, or malformed artifact_revision" in r for r in res["reasons"])
+    assert res["blocking_findings_count"] == 1
+
+
+def test_candidate_content_changed_after_qa_certification_fails_closed(temp_db):
+    """Candidate content changed after QA certification fails closed."""
+    sess_id = db_store.create_session("Post QA Tamper Session", "Task", db_path=temp_db)
+    cand_cert = _make_candidate_files()
+
+    rep = run_qa_checks(cand_cert["index.html"], cand_cert["style.css"], cand_cert["script.js"], session_id=sess_id, db_path=temp_db)
+    assert rep["passed"] is True
+
+    # Candidate file is tampered after QA certification
+    cand_tampered = copy.deepcopy(cand_cert)
+    cand_tampered["index.html"] += "\n<!-- backdoor injection -->"
+
+    res = evaluate_release_gate(sess_id, candidate_files=cand_tampered, artifact_manifest=rep["manifest"], db_path=temp_db)
+    assert res["allowed"] is False
+    assert any("Artifact revision mismatch" in r or "digest mismatch" in r for r in res["reasons"])
+

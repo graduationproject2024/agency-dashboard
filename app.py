@@ -2410,18 +2410,22 @@ def run_qa_checks(
                 if f_status == "verified_resolved":
                     continue
 
-                # If this QA run failed, no open findings may be resolved
-                if not passed:
+                # If this QA run failed or effective revision is invalid, no open findings may be resolved
+                if not passed or not db_store.is_valid_artifact_revision(effective_revision):
                     unresolved_finding_ids.append(fid)
                     continue
 
                 # Scope check 0: Session binding - findings from another session cannot be resolved
-                if f_sess and f_sess != session_id:
+                if not f_sess or f_sess != session_id:
                     unresolved_finding_ids.append(fid)
                     continue
 
-                # Scope check 1: Revision binding - finding from revision A cannot be resolved by a run for revision B
-                if f_rev and f_rev != effective_revision:
+                # Scope check 1: Revision binding - finding must have valid non-empty revision matching effective_revision exactly
+                if not f_rev or not db_store.is_valid_artifact_revision(f_rev):
+                    unresolved_finding_ids.append(fid)
+                    continue
+
+                if f_rev.strip().lower() != effective_revision.strip().lower():
                     unresolved_finding_ids.append(fid)
                     continue
 
@@ -2431,7 +2435,7 @@ def run_qa_checks(
                     continue
 
                 # Scope check 2: The specific artifact must have been verified in this QA run
-                if art_name not in verified_artifacts:
+                if not art_name or art_name not in verified_artifacts:
                     unresolved_finding_ids.append(fid)
                     continue
 
@@ -2440,12 +2444,14 @@ def run_qa_checks(
                     unresolved_finding_ids.append(fid)
                     continue
 
-                # Perform independent QA verification transition
+                # Perform independent QA verification transition with explicit revision binding
                 try:
                     ok, err = db_store.update_qa_finding_status(
                         finding_id=fid,
                         status="verified_resolved",
                         verified_by_agent="engineering-qa-engineer",
+                        artifact_revision=effective_revision,
+                        qa_run_id=qa_run_id,
                         note=f"Verified resolved by passed QA test run {qa_run_id} for artifact {art_name}",
                         db_path=db_path
                     )
@@ -2787,17 +2793,66 @@ def evaluate_release_gate(
                                     f"does not match certified QA manifest {expected_sha[:10]}... (stale or tampered evidence)"
                                 )
 
-        # 5. Open QA findings check (blocking vs non-blocking)
+        # 5. Open QA findings check (blocking vs non-blocking) & resolution audit
         findings = db_store.list_qa_findings(session_id=session_id, db_path=db_path)
         for f in findings:
             sev = f.get("severity")
             st = f.get("status")
             f_rev = f.get("artifact_revision")
-            # Precision finding scoping: findings bound to a different/obsolete artifact revision
-            # do not apply to this candidate revision.
-            if candidate_rev_hash and f_rev and f_rev != candidate_rev_hash:
+            fid = f.get("finding_id")
+
+            # Check 5.1: Missing, empty, or malformed artifact_revision on finding fails closed
+            if not f_rev or not db_store.is_valid_artifact_revision(f_rev):
+                if st == "verified_resolved":
+                    reasons.append(
+                        f"Finding '{fid}' marked 'verified_resolved' has missing, empty, or malformed artifact_revision "
+                        f"and fails closed (untrusted resolution evidence)"
+                    )
+                    if sev in ("critical", "high"):
+                        unresolved_blocking.append(f)
+                else:
+                    reasons.append(
+                        f"Finding '{fid}' has missing, empty, or malformed artifact_revision and cannot be verified"
+                    )
+                    if sev in ("critical", "high"):
+                        unresolved_blocking.append(f)
+                    else:
+                        non_blocking_findings.append(f)
                 continue
-            if st not in ("verified_resolved", "accepted"):
+
+            # Check 5.2: Precision finding scoping: findings bound to a different/obsolete artifact revision
+            # do not apply to this candidate revision.
+            if candidate_rev_hash and f_rev.strip().lower() != candidate_rev_hash.strip().lower():
+                continue
+
+            # Check 5.3: Finding belongs to current candidate revision
+            if st == "verified_resolved":
+                # Verify resolution audit trail
+                history = f.get("verification_history") or []
+                resolved_entries = [h for h in history if isinstance(h, dict) and h.get("status") == "verified_resolved"]
+                if not resolved_entries:
+                    reasons.append(f"Finding '{fid}' marked 'verified_resolved' is missing verification history record")
+                    if sev in ("critical", "high"):
+                        unresolved_blocking.append(f)
+                else:
+                    latest_res = resolved_entries[-1]
+                    res_rev = latest_res.get("artifact_revision")
+                    if not res_rev or not db_store.is_valid_artifact_revision(res_rev):
+                        reasons.append(
+                            f"Resolution record for finding '{fid}' has missing, empty, or malformed artifact_revision and fails closed"
+                        )
+                        if sev in ("critical", "high"):
+                            unresolved_blocking.append(f)
+                    elif res_rev.strip().lower() != candidate_rev_hash.strip().lower():
+                        reasons.append(
+                            f"Resolution record for finding '{fid}' is tied to a different artifact revision "
+                            f"('{res_rev[:10]}...' vs current '{candidate_rev_hash[:10]}...')"
+                        )
+                        if sev in ("critical", "high"):
+                            unresolved_blocking.append(f)
+            elif st == "accepted":
+                pass
+            else:
                 if sev in ("critical", "high"):
                     unresolved_blocking.append(f)
                 else:
@@ -4724,11 +4779,15 @@ def update_qa_finding_status_endpoint(finding_id):
         return jsonify({"error": "status is required"}), 400
     agent_id = data.get("agent_id", "operator")
     note = data.get("note", "")
+    artifact_revision = data.get("artifact_revision")
+    qa_run_id = data.get("qa_run_id")
     ok, err = db_store.update_qa_finding_status(
         finding_id=finding_id,
         status=new_status,
         verified_by_agent=agent_id,
-        note=note
+        note=note,
+        artifact_revision=artifact_revision,
+        qa_run_id=qa_run_id
     )
     if not ok:
         return jsonify({"error": err, "finding_id": finding_id}), 400

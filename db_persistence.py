@@ -1808,6 +1808,18 @@ VALID_QA_SEVERITIES = {'critical', 'high', 'medium', 'low', 'warning'}
 VALID_QA_CATEGORIES = {'security', 'syntax', 'contract', 'accessibility', 'integrity', 'performance'}
 VALID_QA_STATUSES = {'open', 'remediated', 'accepted', 'verified_resolved'}
 
+REVISION_HEX_REGEX = re.compile(r'^[0-9a-fA-F]{64}$')
+
+def is_valid_artifact_revision(revision: Any) -> bool:
+    """
+    Validate whether an artifact revision is a valid canonical 64-character hex SHA-256 digest.
+    Explicitly rejects None, empty strings, non-string types, and malformed strings.
+    """
+    if not revision or not isinstance(revision, str):
+        return False
+    return bool(REVISION_HEX_REGEX.match(revision.strip()))
+
+
 def record_qa_finding(
     session_id: str,
     qa_run_id: str,
@@ -1936,13 +1948,16 @@ def update_qa_finding_status(
     note: str = "",
     new_status: Optional[str] = None,
     verification_note: Optional[str] = None,
+    artifact_revision: Optional[str] = None,
+    qa_run_id: Optional[str] = None,
     db_path: Optional[str] = None
 ) -> Tuple[bool, str]:
     """
     Update QA finding status with mandatory verification audit trail.
-    CRITICAL QUALITY INVARIANT:
-    An implementation agent cannot unilaterally mark its own failed QA finding as 'verified_resolved'.
-    Independent verification is strictly enforced.
+    CRITICAL QUALITY INVARIANTS:
+    1. An implementation agent cannot unilaterally mark its own failed QA finding as 'verified_resolved'.
+    2. A finding must never be resolved without valid, non-empty artifact revision binding matching
+       the candidate artifact revision being verified.
     Returns (success, error_or_empty_str).
     """
     if isinstance(finding_id, dict):
@@ -1961,25 +1976,54 @@ def update_qa_finding_status(
             return (False, f"QA finding {finding_id} not found")
 
         finding = dict(row)
-        # Idempotent state transition guard: preserve audit integrity on repeat runs
-        if finding.get("status") == eff_status:
-            return (True, "")
 
-        # Prevent self-certification
+        # Fail-closed validation for resolution to 'verified_resolved'
         if eff_status == "verified_resolved":
+            # 1. Prevent self-certification
             if verified_by_agent and verified_by_agent == finding.get("responsible_agent_id"):
                 return (
                     False,
                     f"Self-certification rejected: responsible agent '{verified_by_agent}' cannot verify and resolve their own finding {finding_id}"
                 )
 
+            # 2. Finding's own revision must be valid and non-empty
+            f_rev = finding.get("artifact_revision")
+            if not f_rev or not is_valid_artifact_revision(f_rev):
+                return (
+                    False,
+                    f"Resolution rejected: finding {finding_id} has missing, empty, or malformed artifact_revision ('{f_rev}')"
+                )
+
+            # 3. Resolution requires an explicit valid artifact revision
+            if not artifact_revision or not is_valid_artifact_revision(artifact_revision):
+                return (
+                    False,
+                    f"Resolution rejected: resolution requires a valid, non-empty artifact_revision, got '{artifact_revision}'"
+                )
+
+            # 4. Exact equality between finding revision and resolution revision
+            if f_rev.strip().lower() != artifact_revision.strip().lower():
+                return (
+                    False,
+                    f"Resolution rejected: resolution revision '{artifact_revision}' does not match finding artifact_revision '{f_rev}'"
+                )
+
+        # Idempotent state transition guard: preserve audit integrity on repeat runs
+        if finding.get("status") == eff_status:
+            return (True, "")
+
         history = json.loads(finding.get("verification_history_json") or "[]")
-        history.append({
+        history_entry = {
             "timestamp": now,
             "status": eff_status,
             "verified_by": verified_by_agent,
             "note": sanitize_memory_content(eff_note)
-        })
+        }
+        if eff_status == "verified_resolved":
+            history_entry["artifact_revision"] = artifact_revision.strip().lower()
+            if qa_run_id:
+                history_entry["qa_run_id"] = str(qa_run_id).strip()
+        history.append(history_entry)
         history_json = json.dumps(history, ensure_ascii=False)
 
         conn.execute("""
@@ -2018,6 +2062,8 @@ def record_qa_run(
         raise ValueError("session_id is required and cannot be empty")
     if not artifact_revision or not str(artifact_revision).strip():
         raise ValueError("artifact_revision is required and cannot be empty")
+    if not is_valid_artifact_revision(artifact_revision):
+        raise ValueError(f"artifact_revision '{artifact_revision}' is invalid or malformed; must be 64-character hexadecimal SHA-256 hash")
     if validation_status not in ("passed", "failed"):
         raise ValueError(f"Invalid validation_status '{validation_status}', must be 'passed' or 'failed'")
 

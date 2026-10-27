@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 import db_persistence as db_store
 import task_orchestrator as orch
-from app import app, evaluate_release_gate, run_qa_checks
+from app import app, evaluate_release_gate, run_qa_checks, compute_artifact_revision
 
 
 @pytest.fixture
@@ -253,6 +253,10 @@ def test_qa_run_resolves_only_targeted_finding_id(temp_db):
     """When verified_finding_ids is passed, ONLY those findings may be marked verified_resolved."""
     sess_id = db_store.create_session("Targeted Finding Session", "Task", db_path=temp_db)
     
+    clean_html = "<!DOCTYPE html><html><head><title>App</title></head><body><h1>Clean</h1></body></html>"
+    cand = {"index.html": clean_html, "style.css": "body { margin: 0; }", "script.js": "console.log('clean');"}
+    rev = compute_artifact_revision(cand)
+
     fid1 = db_store.record_qa_finding(
         session_id=sess_id,
         task_id=None,
@@ -263,6 +267,7 @@ def test_qa_run_resolves_only_targeted_finding_id(temp_db):
         evidence="Missing doctype",
         responsible_agent_id="developer_1",
         status="open",
+        artifact_revision=rev,
         db_path=temp_db
     )
     fid2 = db_store.record_qa_finding(
@@ -275,10 +280,10 @@ def test_qa_run_resolves_only_targeted_finding_id(temp_db):
         evidence="Unclosed element",
         responsible_agent_id="developer_1",
         status="open",
+        artifact_revision=rev,
         db_path=temp_db
     )
 
-    clean_html = "<!DOCTYPE html><html><head><title>App</title></head><body><h1>Clean</h1></body></html>"
     report = run_qa_checks(
         app_html=clean_html,
         app_css="body { margin: 0; }",
@@ -403,6 +408,10 @@ def test_already_resolved_finding_history_idempotency(temp_db):
     """Repeated QA runs do not duplicate verification history on already resolved findings."""
     sess_id = db_store.create_session("History Idempotency Session", "Task", db_path=temp_db)
     
+    clean_html = "<!DOCTYPE html><html><head><title>App</title></head><body><h1>Clean</h1></body></html>"
+    cand = {"index.html": clean_html, "style.css": "body {}", "script.js": "console.log(1);"}
+    rev = compute_artifact_revision(cand)
+
     fid = db_store.record_qa_finding(
         session_id=sess_id,
         task_id=None,
@@ -413,10 +422,9 @@ def test_already_resolved_finding_history_idempotency(temp_db):
         evidence="Fix me",
         responsible_agent_id="dev",
         status="open",
+        artifact_revision=rev,
         db_path=temp_db
     )
-
-    clean_html = "<!DOCTYPE html><html><head><title>App</title></head><body><h1>Clean</h1></body></html>"
     
     # Run 1 resolves finding
     rep1 = run_qa_checks(clean_html, app_css="body {}", app_js="console.log(1);", session_id=sess_id, db_path=temp_db)

@@ -477,6 +477,7 @@ def test_group_e_run_qa_checks_records_structured_findings(temp_db):
 def test_group_e_prevention_of_self_certification(temp_db):
     """Verify implementation agent cannot unilaterally mark its own findings verified_resolved."""
     sess_id = db_store.create_session("Test Self Cert", "Desc", db_path=temp_db)
+    valid_rev = "a" * 64
     fid = db_store.record_qa_finding(
         session_id=sess_id,
         task_id=None,
@@ -488,6 +489,7 @@ def test_group_e_prevention_of_self_certification(temp_db):
         remediation_recommendation="Fix bracket",
         responsible_agent_id="engineering-senior-developer",
         status="open",
+        artifact_revision=valid_rev,
         db_path=temp_db
     )
 
@@ -496,6 +498,7 @@ def test_group_e_prevention_of_self_certification(temp_db):
         finding_id=fid,
         status="verified_resolved",
         verified_by_agent="engineering-senior-developer",
+        artifact_revision=valid_rev,
         db_path=temp_db
     )
     assert ok is False
@@ -506,6 +509,7 @@ def test_group_e_prevention_of_self_certification(temp_db):
         finding_id=fid,
         status="verified_resolved",
         verified_by_agent="engineering-qa-engineer",
+        artifact_revision=valid_rev,
         db_path=temp_db
     )
     assert ok2 is True
