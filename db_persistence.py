@@ -3764,6 +3764,34 @@ def _budget_file_lock(budget_path: str, timeout: float = 15.0):
                     msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
                 elif HAS_FCNTL:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    # Verify file has not been unlinked or replaced before/during flock
+                    try:
+                        fstat_info = os.fstat(fd)
+                        stat_info = os.stat(lock_path)
+                        if fstat_info.st_nlink == 0 or fstat_info.st_ino != stat_info.st_ino:
+                            try:
+                                fcntl.flock(fd, fcntl.LOCK_UN)
+                            except Exception:
+                                pass
+                            try:
+                                os.close(fd)
+                            except OSError:
+                                pass
+                            fd = None
+                            time.sleep(0.01)
+                            continue
+                    except (OSError, FileNotFoundError):
+                        try:
+                            fcntl.flock(fd, fcntl.LOCK_UN)
+                        except Exception:
+                            pass
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
+                        fd = None
+                        time.sleep(0.01)
+                        continue
                 acquired = True
                 break
             except (OSError, BlockingIOError, PermissionError):
@@ -3814,19 +3842,30 @@ def _budget_file_lock(budget_path: str, timeout: float = 15.0):
                         msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
                     except Exception:
                         pass
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    try:
+                        os.remove(lock_path)
+                    except OSError:
+                        pass
                 elif HAS_FCNTL:
+                    try:
+                        st = os.fstat(fd)
+                        curr_st = os.stat(lock_path)
+                        if st.st_ino == curr_st.st_ino:
+                            os.remove(lock_path)
+                    except Exception:
+                        pass
                     try:
                         fcntl.flock(fd, fcntl.LOCK_UN)
                     except Exception:
                         pass
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-                try:
-                    os.remove(lock_path)
-                except OSError:
-                    pass
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
     finally:
         _BUDGET_THREAD_LOCK.release()
 
