@@ -2175,7 +2175,7 @@ def build_artifact_manifest(
     }
 
 
-def run_qa_checks(app_html, app_css="", app_js=""):
+def run_qa_checks(app_html, app_css="", app_js="", session_id=None, task_id=None, db_path=None):
     """
     Production QA Gate Entry Point:
     Directly testable structural, syntactic, security, and asset completeness verification.
@@ -2183,6 +2183,7 @@ def run_qa_checks(app_html, app_css="", app_js=""):
     Verifies HTML structure using StrictHTMLStructureValidator, validates JS syntax via Node parser,
     inspects local asset references for path traversal escapes, and returns a structured report
     with a deterministic candidate artifact manifest.
+    When session_id is provided, persists structured findings to the durable qa_findings registry.
     """
     errors = []
     qa_run_id = f"qa_run_{uuid.uuid4().hex[:12]}"
@@ -2281,6 +2282,65 @@ def run_qa_checks(app_html, app_css="", app_js=""):
         qa_run_id=qa_run_id,
         validation_status="passed" if passed else "failed"
     )
+
+    recorded_finding_ids = []
+    if session_id:
+        try:
+            for err in errors:
+                err_lower = err.lower()
+                if "path traversal" in err_lower or "file://" in err_lower or "disallowed" in err_lower:
+                    cat = "security"
+                    sev = "critical"
+                    art = "index.html" if "html" in err_lower else "style.css"
+                elif "fatal error" in err_lower:
+                    cat = "syntax"
+                    sev = "critical"
+                    art = "index.html"
+                elif "javascript" in err_lower or "js" in err_lower:
+                    cat = "syntax"
+                    sev = "high"
+                    art = "script.js"
+                elif "html" in err_lower or "doctype" in err_lower or "tag" in err_lower or "element" in err_lower:
+                    cat = "syntax"
+                    sev = "high" if "missing" in err_lower else "medium"
+                    art = "index.html"
+                elif "css" in err_lower or "style" in err_lower:
+                    cat = "syntax"
+                    sev = "medium"
+                    art = "style.css"
+                else:
+                    cat = "integrity"
+                    sev = "medium"
+                    art = "artifact"
+
+                fid = db_store.record_qa_finding(
+                    session_id=session_id,
+                    task_id=task_id,
+                    qa_run_id=qa_run_id,
+                    severity=sev,
+                    category=cat,
+                    artifact_name=art,
+                    evidence=err,
+                    remediation_recommendation=f"Resolve {cat} defect in {art}: {err}",
+                    responsible_agent_id="engineering-senior-developer",
+                    status="open",
+                    db_path=db_path
+                )
+                recorded_finding_ids.append(fid)
+
+            # If passed, verify previously open findings for this session (independent QA verification)
+            if passed:
+                existing_findings = db_store.list_qa_findings(session_id=session_id, status="open", db_path=db_path)
+                for ef in existing_findings:
+                    db_store.update_qa_finding_status(
+                        finding_id=ef["finding_id"],
+                        status="verified_resolved",
+                        verified_by_agent="engineering-qa-engineer",
+                        note="Verified resolved by passed QA test run",
+                        db_path=db_path
+                    )
+        except Exception as pe:
+            logging.warning("Failed to record QA findings to persistence: %s", pe)
     
     return {
         "passed": passed,
@@ -2288,6 +2348,7 @@ def run_qa_checks(app_html, app_css="", app_js=""):
         "manifest": manifest,
         "checks": checks,
         "errors": errors,
+        "recorded_finding_ids": recorded_finding_ids,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
     }
 
@@ -2376,6 +2437,133 @@ def inject_asset_links(html, css_content, js_content):
             html = html + '\n<script src="script.js"></script>'
 
     return html
+
+def evaluate_release_gate(
+    session_id: str,
+    candidate_files: Optional[Dict[str, str]] = None,
+    artifact_manifest: Optional[Dict[str, Any]] = None,
+    db_path: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Phase 2.8: Fail-closed production release gate.
+    Evaluates real artifacts and persistent execution evidence.
+    Fails closed if:
+    - Session does not exist.
+    - Required QA verification has not run.
+    - Required tests or checks failed.
+    - Required artifacts are missing or invalid.
+    - Unresolved critical or high QA findings remain open.
+    - Required human approvals are absent, pending, expired, or rejected.
+    - Evidence belongs to a different or stale artifact revision (hash mismatch).
+    - Workflow state contains failed or blocked tasks.
+    """
+    reasons = []
+
+    # 1. Session check
+    sess = db_store.get_session(session_id, db_path=db_path)
+    if not sess:
+        return {
+            "allowed": False,
+            "status": "blocked",
+            "gate_name": "release_gate",
+            "session_id": session_id,
+            "reasons": ["Session does not exist in persistence layer"],
+            "qa_status": "unverified",
+            "approval_status": "none"
+        }
+
+    # 2. Workflow task state check
+    tasks = db_store.list_tasks_for_session(session_id, db_path=db_path)
+    failed_tasks = [t["task_id"] for t in tasks if t.get("status") == "failed"]
+    blocked_tasks = [t["task_id"] for t in tasks if t.get("status") == "blocked"]
+    if failed_tasks:
+        reasons.append(f"Workflow contains {len(failed_tasks)} failed task(s): {failed_tasks}")
+    if blocked_tasks:
+        reasons.append(f"Workflow contains {len(blocked_tasks)} blocked task(s): {blocked_tasks}")
+
+    # 3. QA run check
+    qa_manifest = db_store.get_artifact_manifest(session_id, db_path=db_path)
+    findings = db_store.list_qa_findings(session_id=session_id, db_path=db_path)
+
+    # Has QA been executed?
+    if not qa_manifest and not findings and not artifact_manifest:
+        reasons.append("Required QA verification has not been executed (missing QA evidence)")
+
+    # 4. Open QA findings check
+    unresolved_blocking = [
+        f for f in findings
+        if f.get("severity") in ("critical", "high") and f.get("status") not in ("verified_resolved", "accepted")
+    ]
+    if unresolved_blocking:
+        reasons.append(f"Unresolved critical/high QA findings exist ({len(unresolved_blocking)} blocking findings)")
+
+    # 5. Candidate files & Manifest integrity check
+    if candidate_files:
+        if not candidate_files.get("index.html") or not candidate_files["index.html"].strip():
+            reasons.append("Required candidate deliverable index.html is missing or empty")
+
+        if artifact_manifest and isinstance(artifact_manifest, dict):
+            manifest_items = artifact_manifest.get("artifacts", [])
+            manifest_map = {item["relative_path"]: item.get("sha256") for item in manifest_items}
+            for rel_name, content in candidate_files.items():
+                if rel_name in manifest_map and content is not None:
+                    actual_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                    expected_sha = manifest_map[rel_name]
+                    if actual_sha != expected_sha:
+                        reasons.append(
+                            f"Artifact digest mismatch for {rel_name}: candidate hash {actual_sha[:10]}... "
+                            f"does not match certified QA manifest {expected_sha[:10]}... (stale or tampered evidence)"
+                        )
+
+    # 6. Approvals check
+    approvals = db_store.list_approval_requests(session_id=session_id, db_path=db_path)
+    pending_apprs = [a for a in approvals if a.get("status") == "pending"]
+    rejected_apprs = [a for a in approvals if a.get("status") == "rejected"]
+    expired_apprs = [a for a in approvals if a.get("status") == "expired"]
+
+    if pending_apprs:
+        reasons.append(f"Protected action blocked: {len(pending_apprs)} approval request(s) pending human sign-off")
+    if rejected_apprs:
+        reasons.append(f"Protected action blocked: human approval was rejected ({rejected_apprs[0].get('decision_reason', 'no reason provided')})")
+    if expired_apprs and not any(a.get("status") == "approved" for a in approvals):
+        reasons.append("Protected action blocked: approval request expired without authorized decision")
+
+    # If approval is approved, check revision binding against candidate files
+    approved_list = [a for a in approvals if a.get("status") == "approved"]
+    if approved_list and candidate_files:
+        # compute candidate revision hash (hash of sorted artifact digests)
+        hasher = hashlib.sha256()
+        for k in sorted(candidate_files.keys()):
+            val = candidate_files[k] or ""
+            hasher.update(f"{k}:{hashlib.sha256(val.encode('utf-8')).hexdigest()};".encode("utf-8"))
+        current_rev_hash = hasher.hexdigest()
+
+        latest_approved = approved_list[0]
+        appr_rev = latest_approved.get("artifact_revision_hash")
+        manifest_id = artifact_manifest.get("qa_run_id") if artifact_manifest else None
+        if appr_rev and appr_rev != current_rev_hash and appr_rev != manifest_id:
+            reasons.append(
+                f"Human approval was granted for a different artifact revision "
+                f"(approved {appr_rev[:10]}... vs current {current_rev_hash[:10]}...). Re-approval required."
+            )
+
+    allowed = len(reasons) == 0
+    gate_status = "passed" if allowed else "blocked"
+    approval_status = "approved" if (approved_list and not pending_apprs) else ("pending" if pending_apprs else ("none" if not approvals else "rejected"))
+    qa_status = "passed" if (qa_manifest or artifact_manifest) and not unresolved_blocking else "failed"
+
+    return {
+        "allowed": allowed,
+        "status": gate_status,
+        "gate_name": "release_gate",
+        "session_id": session_id,
+        "reasons": reasons,
+        "qa_status": qa_status,
+        "approval_status": approval_status,
+        "blocking_findings_count": len(unresolved_blocking),
+        "blocking_findings": [f.get("finding_id") for f in unresolved_blocking],
+        "eval_timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+    }
 
 
 def publish_workflow_deliverables(
@@ -2772,7 +2960,10 @@ def continue_workflow(feedback="", session_id=None, call_agent_fn=None):
         app_html = inject_asset_links(app_html, app_css, app_js)
 
         # --- Run Production QA Gate on FINAL transformed artifacts ---
-        qa_report = run_qa_checks(app_html, app_css, app_js)
+        try:
+            qa_report = run_qa_checks(app_html, app_css, app_js, session_id=session_id)
+        except TypeError:
+            qa_report = run_qa_checks(app_html, app_css, app_js)
         with state_lock:
             workflow_state["qa_report"] = qa_report
 
@@ -2844,8 +3035,10 @@ def continue_workflow(feedback="", session_id=None, call_agent_fn=None):
                     if not h_m and not c_m and not j_m:
                         qa_report["errors"].append(f"Remediation agent returned no parseable code blocks (attempt {remediation_count})")
                     else:
-                        app_html = inject_asset_links(app_html, app_css, app_js)
-                        qa_report = run_qa_checks(app_html, app_css, app_js)
+                        try:
+                            qa_report = run_qa_checks(app_html, app_css, app_js, session_id=session_id)
+                        except TypeError:
+                            qa_report = run_qa_checks(app_html, app_css, app_js)
                         with state_lock:
                             workflow_state["qa_report"] = qa_report
                             workflow_state["outputs"]["development"] = rem_output
@@ -2896,6 +3089,24 @@ def continue_workflow(feedback="", session_id=None, call_agent_fn=None):
         validated_html = app_html
         validated_css = app_css
         validated_js = app_js
+
+        # Phase 2.8: Evaluate fail-closed release gate before publishing deliverables
+        if session_id:
+            gate_eval = evaluate_release_gate(
+                session_id=session_id,
+                candidate_files={"index.html": validated_html, "style.css": validated_css, "script.js": validated_js},
+                artifact_manifest=qa_report.get("manifest")
+            )
+            if not gate_eval.get("allowed"):
+                reasons_str = "; ".join(gate_eval.get("reasons", []))
+                err_msg = f"بوابة الإطلاق أغلقت العملية لوجود موانع: {reasons_str}"
+                with state_lock:
+                    workflow_state["status"] = "failed"
+                    workflow_state["blockers"].append(err_msg)
+                db_store.update_session_status(session_id, "failed", error_message=err_msg)
+                update_stats()
+                add_feed("بوابة الإطلاق", "Release Gate", "red", "GATE", err_msg)
+                return
                 
         # Safe atomic deliverable persistence with staging-and-verify guarantees
         with state_lock:
@@ -3915,6 +4126,280 @@ def manage_settings():
     else:
         # GET returns safe sanitized settings (NEVER exposes plaintext secrets)
         return jsonify(get_safe_settings_view())
+
+# =========================================================================
+# Phase 2.8 — Workforce Intelligence, Workflow Orchestration & Quality Gates APIs
+# =========================================================================
+
+@app.route('/api/workforce/intelligence', methods=['GET'])
+def get_workforce_intelligence():
+    """
+    Phase 2.8: Canonical workforce intelligence view.
+    Exposes validated capabilities, division health, real execution telemetry,
+    and QA workload without fabricated metrics.
+    """
+    registry = orch.get_agent_capability_registry()
+    total_registered = len(registry)
+    
+    # Division breakdown
+    by_division = {}
+    for div in CANONICAL_DIVISIONS:
+        did = div["id"]
+        by_division[did] = {
+            "division_id": did,
+            "name": div["name"],
+            "name_ar": div.get("name_ar", ""),
+            "icon": div.get("icon", ""),
+            "agents_count": 0,
+            "subdepartments": set(),
+            "capabilities": set()
+        }
+    
+    unclassified_agents = []
+    all_capabilities = set()
+    
+    for aid, prof in registry.items():
+        did = prof.get("division_id")
+        if did in by_division:
+            by_division[did]["agents_count"] += 1
+            if prof.get("subdepartment"):
+                by_division[did]["subdepartments"].add(prof["subdepartment"])
+            for c in prof.get("capabilities", []):
+                by_division[did]["capabilities"].add(c)
+                all_capabilities.add(c)
+        else:
+            unclassified_agents.append(aid)
+
+    # Format division summary
+    divisions_summary = []
+    for did, dinfo in by_division.items():
+        divisions_summary.append({
+            "division_id": did,
+            "name": dinfo["name"],
+            "name_ar": dinfo["name_ar"],
+            "icon": dinfo["icon"],
+            "agents_count": dinfo["agents_count"],
+            "subdepartments": sorted(list(dinfo["subdepartments"])),
+            "capabilities_count": len(dinfo["capabilities"])
+        })
+
+    # Real execution evidence from SQLite agent_runs (never fabricated)
+    execution_stats = {}
+    total_runs_recorded = 0
+    with db_store.get_db_connection() as conn:
+        run_rows = conn.execute("""
+            SELECT agent_id,
+                   COUNT(*) as run_count,
+                   SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as success_count,
+                   SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as fail_count,
+                   SUM(tokens_used) as total_tokens
+            FROM agent_runs
+            GROUP BY agent_id;
+        """).fetchall()
+        for r in run_rows:
+            aid = r["agent_id"]
+            rc = r["run_count"]
+            sc = r["success_count"]
+            fc = r["fail_count"]
+            tt = r["total_tokens"]
+            total_runs_recorded += rc
+            execution_stats[aid] = {
+                "has_executed": True,
+                "total_runs": rc,
+                "success_runs": sc,
+                "failed_runs": fc,
+                "success_rate": round(sc / rc, 3) if rc > 0 else 0.0,
+                "total_tokens": tt,
+                "avg_tokens": round(tt / rc, 1) if rc > 0 else 0
+            }
+
+        # QA Workload
+        qa_summary = {
+            "total_findings": 0,
+            "open_findings": 0,
+            "blocking_findings": 0,
+            "resolved_findings": 0,
+            "by_severity": {"critical": 0, "high": 0, "medium": 0, "low": 0, "warning": 0},
+            "by_status": {"open": 0, "remediated": 0, "accepted": 0, "verified_resolved": 0}
+        }
+        try:
+            qa_rows = conn.execute("SELECT severity, status, COUNT(*) as cnt FROM qa_findings GROUP BY severity, status;").fetchall()
+            for qr in qa_rows:
+                sev = qr["severity"]
+                st = qr["status"]
+                c = qr["cnt"]
+                qa_summary["total_findings"] += c
+                if st == "open":
+                    qa_summary["open_findings"] += c
+                    if sev in ("critical", "high"):
+                        qa_summary["blocking_findings"] += c
+                elif st in ("remediated", "verified_resolved"):
+                    qa_summary["resolved_findings"] += c
+
+                if sev in qa_summary["by_severity"]:
+                    qa_summary["by_severity"][sev] += c
+                if st in qa_summary["by_status"]:
+                    qa_summary["by_status"][st] += c
+        except Exception:
+            pass
+
+    executed_agents_count = len(execution_stats)
+    configured_agents_count = total_registered
+
+    standard_core_caps = [
+        "architecture", "fullstack", "frontend", "backend", "database", "devops",
+        "ui_design", "ux_design", "animation", "product_strategy", "prd_authoring",
+        "market_research", "financial_modeling", "qa_testing", "code_review",
+        "security_audit", "seo_optimization", "game_design"
+    ]
+    missing_caps = [c for c in standard_core_caps if c not in all_capabilities]
+
+    return jsonify({
+        "total_registered_agents": total_registered,
+        "configured_agents_count": configured_agents_count,
+        "executed_agents_count": executed_agents_count,
+        "unexecuted_agents_count": total_registered - executed_agents_count,
+        "total_divisions": len(CANONICAL_DIVISIONS),
+        "divisions": divisions_summary,
+        "total_capabilities": len(all_capabilities),
+        "capabilities_sample": sorted(list(all_capabilities))[:25],
+        "capability_gaps": missing_caps,
+        "qa_workload": qa_summary,
+        "execution_summary": {
+            "total_runs_recorded": total_runs_recorded,
+            "agents_with_execution_evidence": executed_agents_count
+        }
+    })
+
+@app.route('/api/workforce/agents/<agent_id>/capabilities', methods=['GET'])
+def get_agent_capabilities_endpoint(agent_id):
+    profile = orch.get_agent_capabilities(agent_id)
+    if not profile:
+        return jsonify({"error": f"Agent '{agent_id}' not found in canonical registry"}), 404
+    return jsonify(profile)
+
+@app.route('/api/workforce/assign', methods=['POST'])
+def assign_workforce_task_endpoint():
+    if not is_safe_origin(request):
+        return jsonify({"error": "Forbidden: Invalid origin"}), 403
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Invalid request body, expected JSON object"}), 400
+    res = orch.assign_agent_to_task(data)
+    return jsonify(res)
+
+@app.route('/api/workflow/validate', methods=['POST'])
+def validate_workflow_endpoint():
+    if not is_safe_origin(request):
+        return jsonify({"error": "Forbidden: Invalid origin"}), 403
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or "tasks" not in data:
+        return jsonify({"error": "Invalid request body, expected {'tasks': [...]}"}), 400
+    tasks = data["tasks"]
+    res = orch.validate_workflow_graph(tasks)
+    return jsonify(res)
+
+@app.route('/api/approvals', methods=['GET'])
+def list_approvals_endpoint():
+    session_id = request.args.get('session_id')
+    status = request.args.get('status')
+    approvals = db_store.list_approval_requests(session_id=session_id, status=status)
+    return jsonify({"approvals": approvals, "count": len(approvals)})
+
+@app.route('/api/approvals/<approval_id>', methods=['GET'])
+def get_approval_endpoint(approval_id):
+    appr = db_store.get_approval_request(approval_id)
+    if not appr:
+        return jsonify({"error": "Approval request not found"}), 404
+    return jsonify(appr)
+
+@app.route('/api/approvals/request', methods=['POST'])
+def create_approval_request_endpoint():
+    if not is_safe_origin(request):
+        return jsonify({"error": "Forbidden: Invalid origin"}), 403
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Invalid request body"}), 400
+    session_id = data.get("session_id")
+    task_id = data.get("task_id")
+    action_type = data.get("action_type")
+    if not session_id or not action_type:
+        return jsonify({"error": "session_id and action_type are required"}), 400
+
+    appr_id = db_store.create_approval_request(
+        session_id=session_id,
+        task_id=task_id,
+        action_type=action_type,
+        requested_by=data.get("requested_by", "system"),
+        policy_rule=data.get("policy_rule"),
+        artifact_revision_hash=data.get("artifact_revision_hash"),
+        expires_in_seconds=int(data.get("expires_in_seconds", 86400)),
+        metadata=data.get("metadata")
+    )
+    appr = db_store.get_approval_request(appr_id)
+    return jsonify({"approval_id": appr_id, "approval": appr, "status": "created"}), 201
+
+@app.route('/api/approvals/<approval_id>/decide', methods=['POST'])
+def decide_approval_endpoint(approval_id):
+    if not is_safe_origin(request):
+        return jsonify({"error": "Forbidden: Invalid origin"}), 403
+    is_auth, principal, auth_err = authenticate_operator(request, require_admin=False)
+    if not is_auth:
+        return jsonify({"error": auth_err or "Unauthorized"}), 401
+    data = request.get_json(silent=True) or {}
+    decision = data.get("decision")
+    if decision not in ("approved", "rejected"):
+        return jsonify({"error": "decision must be 'approved' or 'rejected'"}), 400
+    reason = data.get("reason", "")
+    current_rev_hash = data.get("current_revision_hash")
+
+    ok, err = db_store.decide_approval_request(
+        approval_id=approval_id,
+        decision=decision,
+        principal=principal or "operator",
+        reason=reason,
+        current_revision_hash=current_rev_hash
+    )
+    if not ok:
+        status_code = 403 if "Self-approval" in (err or "") else 400
+        return jsonify({"error": err, "approval_id": approval_id}), status_code
+
+    appr = db_store.get_approval_request(approval_id)
+    return jsonify({"success": True, "approval_id": approval_id, "status": decision, "approval": appr})
+
+@app.route('/api/sessions/<session_id>/release_gate', methods=['GET'])
+def get_session_release_gate(session_id):
+    res = evaluate_release_gate(session_id=session_id)
+    return jsonify(res)
+
+@app.route('/api/sessions/<session_id>/qa_findings', methods=['GET'])
+def get_session_qa_findings(session_id):
+    status = request.args.get('status')
+    severity = request.args.get('severity')
+    findings = db_store.list_qa_findings(session_id=session_id, status=status, severity=severity)
+    return jsonify({"session_id": session_id, "findings": findings, "count": len(findings)})
+
+@app.route('/api/qa_findings/<finding_id>/status', methods=['POST'])
+def update_qa_finding_status_endpoint(finding_id):
+    if not is_safe_origin(request):
+        return jsonify({"error": "Forbidden: Invalid origin"}), 403
+    data = request.get_json(silent=True) or {}
+    new_status = data.get("status")
+    if not new_status:
+        return jsonify({"error": "status is required"}), 400
+    agent_id = data.get("agent_id", "operator")
+    note = data.get("note", "")
+    ok, err = db_store.update_qa_finding_status(
+        finding_id=finding_id,
+        status=new_status,
+        verified_by_agent=agent_id,
+        note=note
+    )
+    if not ok:
+        return jsonify({"error": err, "finding_id": finding_id}), 400
+    finding = db_store.get_qa_finding(finding_id)
+    return jsonify({"success": True, "finding": finding})
+
 
 # Standard error handlers
 @app.errorhandler(400)

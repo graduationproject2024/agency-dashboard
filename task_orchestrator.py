@@ -2,6 +2,7 @@ import os
 import json
 import time
 import re
+import copy
 import logging
 import hashlib
 from typing import Dict, List, Optional, Any, Callable, Tuple
@@ -66,6 +67,540 @@ def detect_cycles(task_defs: Any) -> Tuple[bool, List[str]]:
                 return True, cycle_path
 
     return False, []
+
+
+def validate_workflow_graph(task_defs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Validate a workflow graph before starting execution:
+    1. Reject empty task list.
+    2. Enforce unique task IDs (no duplicates).
+    3. Enforce valid references: all dependencies must reference existing task IDs within the graph.
+    4. Detect circular dependencies and extract exact cycle path.
+    5. Compute deterministic topological execution levels (for parallel execution stages).
+    6. Validate input/output contract continuity between dependent tasks.
+    """
+    errors = []
+    warnings = []
+
+    if not task_defs or not isinstance(task_defs, list):
+        return {
+            "is_valid": False,
+            "errors": ["Task list cannot be empty or non-list"],
+            "warnings": [],
+            "task_count": 0,
+            "execution_levels": [],
+            "has_cycles": False,
+            "cycle_path": []
+        }
+
+    seen_ids = set()
+    duplicate_ids = set()
+    task_map = {}
+
+    for t in task_defs:
+        if not isinstance(t, dict):
+            errors.append(f"Task definition must be a dictionary, got: {type(t)}")
+            continue
+        tid = t.get("id") or t.get("task_id")
+        if not tid or not str(tid).strip():
+            errors.append("Task definition missing required 'id' or 'task_id'")
+            continue
+        tid_str = str(tid).strip()
+        if tid_str in seen_ids:
+            duplicate_ids.add(tid_str)
+        seen_ids.add(tid_str)
+        task_map[tid_str] = t
+
+    if duplicate_ids:
+        errors.append(f"Duplicate task IDs detected: {sorted(list(duplicate_ids))}")
+
+    # Dependency existence check
+    missing_deps = []
+    for tid, t in task_map.items():
+        deps = t.get("dependencies") or []
+        if not isinstance(deps, list):
+            errors.append(f"Task '{tid}' dependencies must be a list, got {type(deps)}")
+            continue
+        for d in deps:
+            d_str = str(d).strip()
+            if d_str not in seen_ids:
+                missing_deps.append((tid, d_str))
+
+    if missing_deps:
+        for tid, dep in missing_deps:
+            errors.append(f"Missing dependency reference: task '{tid}' depends on non-existent task '{dep}'")
+
+    # Cycle detection
+    has_cycle, cycle_path = detect_cycles(task_defs)
+    if has_cycle:
+        errors.append(f"Cycle detected / Circular dependency detected in task graph: {' -> '.join(cycle_path)}")
+
+    # Contract continuity checks
+    for tid, t in task_map.items():
+        req_contract = t.get("required_contract") or t.get("input_contract")
+        if req_contract:
+            deps = t.get("dependencies") or []
+            for d in deps:
+                dep_task = task_map.get(str(d).strip())
+                if dep_task:
+                    dep_output_contract = dep_task.get("output_contract")
+                    if dep_output_contract and dep_output_contract != req_contract:
+                        warnings.append(
+                            f"Contract mismatch: task '{tid}' requires '{req_contract}', but dependency '{d}' produces '{dep_output_contract}'"
+                        )
+
+    # Compute topological execution levels if no cycles and no missing dependencies
+    execution_levels = []
+    if not has_cycle and not missing_deps and not duplicate_ids:
+        in_degree = {tid: 0 for tid in seen_ids}
+        adj = {tid: [] for tid in seen_ids}
+        for tid, t in task_map.items():
+            deps = [str(d).strip() for d in (t.get("dependencies") or [])]
+            in_degree[tid] = len(deps)
+            for d in deps:
+                adj[d].append(tid)
+
+        current_level = sorted([tid for tid, deg in in_degree.items() if deg == 0])
+        remaining = set(seen_ids)
+
+        while current_level:
+            execution_levels.append(current_level)
+            next_level = []
+            for node in current_level:
+                remaining.remove(node)
+                for downstream in adj[node]:
+                    in_degree[downstream] -= 1
+                    if in_degree[downstream] == 0:
+                        next_level.append(downstream)
+            current_level = sorted(next_level)
+
+    is_valid = len(errors) == 0
+    return {
+        "is_valid": is_valid,
+        "errors": errors,
+        "warnings": warnings,
+        "task_count": len(seen_ids),
+        "execution_levels": execution_levels,
+        "has_cycles": has_cycle,
+        "cycle_path": cycle_path
+    }
+
+
+class WorkflowDAG:
+    """Validated Directed Acyclic Graph wrapper for enterprise task orchestration."""
+    def __init__(self, tasks: List[Dict[str, Any]]):
+        self.raw_tasks = copy.deepcopy(tasks)
+        self.validation = validate_workflow_graph(self.raw_tasks)
+        if not self.validation["is_valid"]:
+            raise ValueError(f"Invalid workflow task graph: {'; '.join(self.validation['errors'])}")
+        self.task_map = {
+            (t.get("id") or t.get("task_id")): t
+            for t in self.raw_tasks
+        }
+
+    @property
+    def is_valid(self) -> bool:
+        return self.validation["is_valid"]
+
+    @property
+    def execution_levels(self) -> List[List[str]]:
+        return self.validation["execution_levels"]
+
+    def get_ready_tasks(self, completed_ids: set) -> List[Dict[str, Any]]:
+        ready = []
+        for tid, t in self.task_map.items():
+            deps = set(t.get("dependencies") or [])
+            if deps.issubset(completed_ids) and t.get("status") in ("ready", "pending"):
+                ready.append(t)
+        return ready
+
+    def get_downstream_dependents(self, task_id: str) -> List[str]:
+        """Transitively discover all downstream tasks depending on task_id."""
+        dependents = set()
+        queue = [task_id]
+        while queue:
+            curr = queue.pop(0)
+            for tid, t in self.task_map.items():
+                if curr in (t.get("dependencies") or []):
+                    if tid not in dependents:
+                        dependents.add(tid)
+                        queue.append(tid)
+        return sorted(list(dependents))
+
+
+def fail_task_and_propagate(
+    task_id: str,
+    error_message: str,
+    session_id: Optional[str] = None,
+    db_path: Optional[str] = None
+) -> List[str]:
+    """
+    Mark target task as failed, and transitively propagate failure to all downstream
+    dependent tasks by updating their status to 'blocked'.
+    Returns list of newly blocked task IDs.
+    """
+    blocked_ids = []
+    with db.get_db_connection(db_path) as conn:
+        conn.execute("""
+            UPDATE workflow_tasks
+            SET status = 'failed',
+                error_message = ?,
+                completed_at = COALESCE(completed_at, ?)
+            WHERE task_id = ?;
+        """, (db.sanitize_memory_content(error_message), time.time(), task_id))
+
+        sess_clause = "session_id = (SELECT session_id FROM workflow_tasks WHERE task_id = ?)" if not session_id else "session_id = ?"
+        sess_param = task_id if not session_id else session_id
+        rows = conn.execute(f"SELECT task_id, status, dependencies_json FROM workflow_tasks WHERE {sess_clause};", (sess_param,)).fetchall()
+        
+        all_tasks = {r["task_id"]: {"status": r["status"], "dependencies": json.loads(r["dependencies_json"] or "[]")} for r in rows}
+
+        queue = [task_id]
+        while queue:
+            curr = queue.pop(0)
+            for tid, info in all_tasks.items():
+                if curr in info["dependencies"]:
+                    if info["status"] not in ("completed", "failed", "blocked", "cancelled"):
+                        conn.execute("""
+                            UPDATE workflow_tasks
+                            SET status = 'blocked',
+                                error_message = ?
+                            WHERE task_id = ?;
+                        """, (f"Blocked by upstream prerequisite task failure ({task_id}): {db.sanitize_memory_content(error_message)}", tid))
+                        info["status"] = "blocked"
+                        blocked_ids.append(tid)
+                    if tid not in queue:
+                        queue.append(tid)
+        conn.commit()
+    return blocked_ids
+
+
+# =========================================================================
+# Canonical Agent Capability Registry & Deterministic Assignment
+# =========================================================================
+
+_CAPABILITY_REGISTRY_CACHE: Dict[str, Dict[str, Any]] = {}
+
+def parse_agent_capabilities(
+    agent_id: str,
+    raw_content: str = "",
+    metadata: Optional[Dict[str, Any]] = None,
+    prompt_file: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Parse canonical capability profile from agent definition and frontmatter.
+    Populates only verified metadata. Unknown fields remain explicitly unknown/empty.
+    """
+    meta = metadata or {}
+    name = meta.get("name") or agent_id.replace('-', ' ').title()
+    desc = meta.get("description") or ""
+
+    division_id = (meta.get("division_id") or meta.get("division") or meta.get("department") or "").lower()
+    if not division_id and "-" in agent_id:
+        division_id = agent_id.split("-")[0].lower()
+    if not division_id:
+        division_id = "specialized"
+
+    subdept = meta.get("subdepartment") or meta.get("department")
+
+    role = "unknown"
+    if raw_content:
+        for line in raw_content.splitlines():
+            clean = line.strip()
+            if (clean.lower().startswith("- **role**:") or 
+                clean.lower().startswith("**role**:") or 
+                clean.lower().startswith("role:") or 
+                clean.lower().startswith("- role:")):
+                role = clean.split(":", 1)[1].strip().strip("* ")
+                break
+    if role == "unknown" and desc:
+        role = desc.split(".")[0].strip()
+
+    seniority = "unknown"
+    check_str = f"{name} {role} {agent_id}".lower()
+    if any(k in check_str for k in ("chief", "head of", "principal", "lead")):
+        seniority = "lead"
+    elif any(k in check_str for k in ("senior", "sr.", "sr ", "architect", "staff")):
+        seniority = "senior"
+    elif any(k in check_str for k in ("specialist", "expert", "consultant", "strategist", "manager")):
+        seniority = "specialist"
+    elif any(k in check_str for k in ("junior", "jr.", "associate")):
+        seniority = "junior"
+
+    responsibilities = []
+    if raw_content:
+        in_mission = False
+        for line in raw_content.splitlines():
+            if "###" in line or "##" in line:
+                if any(h in line.lower() for h in ("mission", "responsibilities", "excellence", "duties")):
+                    in_mission = True
+                elif in_mission and ("rules" in line.lower() or "identity" in line.lower()):
+                    in_mission = False
+            elif in_mission and line.strip().startswith("- "):
+                resp = line.strip()[2:].strip()
+                if resp and len(resp) > 5 and resp not in responsibilities:
+                    responsibilities.append(resp[:120])
+                if len(responsibilities) >= 8:
+                    break
+
+    text_corpus = f"{name} {role} {desc} {agent_id} {raw_content}".lower()
+    capabilities_set = set()
+
+    div_caps = {
+        "academic": ["academic_research", "domain_analysis", "literature_review"],
+        "engineering": ["software_engineering", "code_implementation"],
+        "testing": ["qa_evaluation", "syntax_verification", "test_automation", "code_review"],
+        "security": ["security_audit", "vulnerability_assessment", "access_control"],
+        "design": ["ui_design", "ux_architecture", "visual_identity"],
+        "product": ["requirements_gathering", "prd_authoring", "roadmap_planning"],
+        "specialized": ["business_strategy", "feasibility_analysis"],
+        "marketing": ["seo_optimization", "content_strategy"],
+        "paid-media": ["campaign_management", "ad_analytics"],
+        "finance": ["budget_management", "financial_modeling", "cost_accounting"],
+        "game-development": ["game_mechanics", "interactive_systems"],
+        "gis": ["spatial_analysis", "cartography", "geo_modeling"],
+        "healthcare": ["clinical_compliance", "health_informatics"],
+        "project-management": ["workflow_orchestration", "delivery_management"],
+        "research": ["market_intelligence", "user_research"],
+        "sales": ["sales_pipeline", "revenue_strategy"],
+        "spatial-computing": ["spatial_computing", "3d_interface_design"],
+        "support": ["customer_support", "incident_triage"]
+    }
+    for c in div_caps.get(division_id, []):
+        capabilities_set.add(c)
+
+    keyword_map = {
+        "backend": "backend_architecture",
+        "database": "database_design",
+        "api": "api_design",
+        "frontend": "frontend_development",
+        "review": "code_review",
+        "security": "security_audit",
+        "test": "test_automation",
+        "architect": "system_architecture",
+        "mobile": "mobile_development",
+        "devops": "devops_automation",
+        "cloud": "cloud_infrastructure",
+        "animation": "animation_design",
+        "seo": "seo_optimization",
+        "strategy": "business_strategy",
+        "prd": "prd_authoring",
+        "remediation": "code_remediation"
+    }
+    for kw, cap in keyword_map.items():
+        if kw in text_corpus:
+            capabilities_set.add(cap)
+    if "system_architecture" in capabilities_set:
+        capabilities_set.add("architecture")
+
+    raw_tools = meta.get("tools") or []
+    if isinstance(raw_tools, str):
+        tools_list = [t.strip() for t in raw_tools.split(",") if t.strip()]
+    elif isinstance(raw_tools, list):
+        tools_list = [str(t).strip() for t in raw_tools if str(t).strip()]
+    else:
+        tools_list = []
+
+    if division_id in ("security",):
+        permissions = ["read_artifacts", "audit_code", "flag_vulnerabilities"]
+    elif division_id in ("engineering", "design"):
+        permissions = ["read_artifacts", "write_code"]
+    elif division_id in ("finance",):
+        permissions = ["manage_budget", "financial_reconciliation"]
+    elif division_id in ("project-management",):
+        permissions = ["orchestrate_workflow", "verify_release"]
+    else:
+        permissions = ["read_artifacts"]
+
+    is_qa = division_id in ("testing",) or any(k in text_corpus for k in ("code reviewer", "qa", "quality assurance", "audit"))
+    qa_resp = ["code_review", "syntax_validation", "artifact_integrity"] if is_qa else []
+    is_high_risk = division_id in ("security", "finance") or any(k in text_corpus for k in ("deploy", "release", "administrator", "billing"))
+
+    status = "available" if (prompt_file and os.path.exists(prompt_file)) else "available"
+
+    return {
+        "agent_id": agent_id,
+        "name": name,
+        "division_id": division_id,
+        "subdepartment": subdept,
+        "role": role,
+        "seniority": seniority,
+        "responsibilities": responsibilities,
+        "capabilities": sorted(list(capabilities_set)),
+        "input_contracts": ["requirements_spec", "task_context"] if division_id != "testing" else ["candidate_code", "test_suite"],
+        "output_contracts": ["code_deliverable"] if division_id == "engineering" else (["qa_findings", "qa_report"] if is_qa else ["context_document"]),
+        "required_context": ["task_description", "upstream_outputs"],
+        "produced_artifacts": ["source_code"] if division_id == "engineering" else (["audit_report"] if is_qa else ["document"]),
+        "supported_task_types": sorted(list(capabilities_set)),
+        "dependencies": [],
+        "handoff_targets": [],
+        "required_tools": tools_list,
+        "security_permissions": permissions,
+        "qa_responsibilities": qa_resp,
+        "failure_policy": {"max_retries": 2, "retryable_errors": ["timeout", "rate_limit", "connection_error"]},
+        "approval_required": is_high_risk,
+        "status": status,
+        "prompt_file": prompt_file
+    }
+
+def get_agent_capability_registry(agents_dir: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """Build and cache the canonical agent capability registry."""
+    global _CAPABILITY_REGISTRY_CACHE
+    if _CAPABILITY_REGISTRY_CACHE and not agents_dir:
+        return _CAPABILITY_REGISTRY_CACHE
+
+    from app import discover_agents, get_agents_dir
+    target_dir = agents_dir or get_agents_dir()
+    inv = discover_agents(agents_dir=target_dir)
+
+    registry = {}
+    for a in inv.get("agents", []):
+        aid = a["id"]
+        rel_p = a.get("relative_path")
+        full_p = os.path.join(target_dir, rel_p) if (target_dir and rel_p) else None
+        content = ""
+        if full_p and os.path.exists(full_p):
+            try:
+                with open(full_p, "r", encoding="utf-8", errors="replace") as fp:
+                    content = fp.read()
+            except OSError:
+                pass
+        profile = parse_agent_capabilities(aid, content, metadata=a, prompt_file=full_p)
+        registry[aid] = profile
+
+    if not agents_dir:
+        _CAPABILITY_REGISTRY_CACHE = registry
+    return registry
+
+def get_agent_capabilities(agent_id: str, agents_dir: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Retrieve capability profile for a single agent."""
+    reg = get_agent_capability_registry(agents_dir=agents_dir)
+    return reg.get(agent_id)
+
+def assign_agent_to_task(
+    task_requirements: Dict[str, Any],
+    candidates: Optional[List[Dict[str, Any]]] = None,
+    agents_dir: Optional[str] = None,
+    db_path: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Deterministic capability-based task assignment mechanism.
+    Evaluates requirements against candidate capabilities and attributes.
+    Returns:
+    {
+        "selected_agent_id": Optional[str],
+        "assigned": bool,
+        "score": float,
+        "reason": str,
+        "matched_capabilities": List[str],
+        "candidate_count": int,
+        "evaluated_candidates": int
+    }
+    """
+    req_caps = [c.lower().strip() for c in (task_requirements.get("required_capabilities") or [])]
+    pref_div = (task_requirements.get("preferred_division") or "").lower().strip()
+    req_tools = set(t.lower().strip() for t in (task_requirements.get("required_tools") or []))
+    req_perms = set(p.lower().strip() for p in (task_requirements.get("required_permissions") or []))
+    min_seniority = (task_requirements.get("min_seniority") or "").lower().strip()
+    exclude_ids = set(task_requirements.get("exclude_agent_ids") or [])
+    approval_constrained = bool(task_requirements.get("approval_constrained", False))
+
+    seniority_ranks = {"lead": 3, "senior": 2, "specialist": 1, "junior": 0, "unknown": 0}
+    min_rank = seniority_ranks.get(min_seniority, 0)
+
+    if candidates is None:
+        reg = get_agent_capability_registry(agents_dir=agents_dir)
+        pool = list(reg.values())
+    else:
+        pool = []
+        for c in candidates:
+            if isinstance(c, dict) and "capabilities" in c:
+                pool.append(c)
+            elif isinstance(c, dict) and ("id" in c or "agent_id" in c):
+                cid = c.get("agent_id") or c.get("id")
+                pool.append(parse_agent_capabilities(cid, "", c))
+
+    evaluated_candidates = len(pool)
+    scored_candidates = []
+
+    for cand in pool:
+        cid = cand.get("agent_id") or cand.get("id")
+        if not cid or cid in exclude_ids:
+            continue
+        if cand.get("status") not in ("available", None):
+            continue
+        if approval_constrained and cand.get("approval_required", False):
+            continue
+
+        cand_perms = set(p.lower() for p in cand.get("security_permissions", []))
+        if req_perms and not req_perms.issubset(cand_perms):
+            continue
+
+        cand_tools = set(t.lower() for t in cand.get("required_tools", []))
+        if req_tools and not req_tools.issubset(cand_tools):
+            continue
+
+        cand_sen = cand.get("seniority", "unknown")
+        if min_seniority and seniority_ranks.get(cand_sen, 0) < min_rank:
+            continue
+
+        cand_caps = set(c.lower() for c in cand.get("capabilities", []))
+
+        def _cap_match(rc: str, cc_set: set) -> bool:
+            if rc in cc_set:
+                return True
+            return any(rc in c or c in rc for c in cc_set)
+
+        matched = [c for c in req_caps if _cap_match(c, cand_caps)]
+        
+        # If required_capabilities specified, must match ALL required capabilities
+        if req_caps:
+            if len(matched) < len(req_caps):
+                continue
+
+        score = len(matched) * 10
+        div_match = (cand.get("division_id") == pref_div) if pref_div else False
+        if div_match:
+            score += 5
+        score += seniority_ranks.get(cand_sen, 0)
+
+        scored_candidates.append({
+            "agent": cand,
+            "score": score,
+            "matched_capabilities": matched,
+            "div_match": div_match
+        })
+
+    if not scored_candidates:
+        return {
+            "selected_agent_id": None,
+            "assigned": False,
+            "score": 0,
+            "reason": f"No suitable agent found satisfying required capabilities: {req_caps}" if req_caps else "No suitable agent found meeting requirements",
+            "matched_capabilities": [],
+            "candidate_count": 0,
+            "evaluated_candidates": evaluated_candidates
+        }
+
+    scored_candidates.sort(key=lambda x: (-x["score"], x["agent"]["agent_id"]))
+    best = scored_candidates[0]
+    best_agent = best["agent"]
+
+    reason_parts = [f"Satisfied required capabilities ({len(best['matched_capabilities'])} matched: {best['matched_capabilities']})"]
+    if best["div_match"]:
+        reason_parts.append(f"affinity with division '{pref_div}'")
+    reason_parts.append(f"seniority tier '{best_agent.get('seniority', 'unknown')}'")
+    reason_str = "; ".join(reason_parts) + f". Selected from {len(scored_candidates)} qualified candidates."
+
+    return {
+        "selected_agent_id": best_agent["agent_id"],
+        "assigned": True,
+        "score": best["score"],
+        "reason": reason_str,
+        "matched_capabilities": best["matched_capabilities"],
+        "candidate_count": len(scored_candidates),
+        "evaluated_candidates": evaluated_candidates
+    }
 
 
 def get_ready_tasks(tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -422,6 +957,12 @@ def execute_single_task(
     stage = task["stage"]
     project_id = session.get("project_name", session_id)
 
+    # Prevent duplicate execution: check if task is already completed
+    existing_task = db.get_task(task_id, db_path=db_path)
+    if existing_task and existing_task.get("status") == "completed":
+        logging.info("Task %s is already completed. Skipping duplicate execution.", task_id)
+        return True, existing_task.get("output_text"), None
+
     # 1. Transition task status to running
     db.update_task_status(task_id, "running", db_path=db_path)
     
@@ -490,15 +1031,32 @@ def execute_single_task(
         provider = None
         model = None
 
-        if isinstance(output_res, tuple) and len(output_res) >= 3:
-            output = output_res[0]
-            tokens_used = output_res[1]
-            token_source = output_res[2]
-            if len(output_res) >= 4:
-                provider_request_id = output_res[3]
-        elif isinstance(output_res, dict) and "output" in output_res:
-            output = output_res["output"]
-            tokens_used = output_res.get("tokens_used")
+        if isinstance(output_res, tuple):
+            if len(output_res) == 0:
+                output = ""
+            elif len(output_res) == 1:
+                output = output_res[0]
+            elif len(output_res) == 2:
+                output = output_res[0]
+                if isinstance(output_res[1], dict):
+                    m = output_res[1]
+                    tokens_used = m.get("tokens_used") or m.get("tokens")
+                    token_source = m.get("token_source", "provider_reported" if tokens_used else "estimated")
+                    provider_request_id = m.get("provider_request_id")
+                    provider = m.get("provider")
+                    model = m.get("model")
+                elif isinstance(output_res[1], (int, float)):
+                    tokens_used = int(output_res[1])
+                    token_source = "provider_reported"
+            elif len(output_res) >= 3:
+                output = output_res[0]
+                tokens_used = output_res[1]
+                token_source = output_res[2]
+                if len(output_res) >= 4:
+                    provider_request_id = output_res[3]
+        elif isinstance(output_res, dict):
+            output = output_res.get("output") or output_res.get("content") or output_res.get("text") or ""
+            tokens_used = output_res.get("tokens_used") or output_res.get("tokens")
             token_source = output_res.get("token_source")
             provider_request_id = output_res.get("provider_request_id")
             provider = output_res.get("provider")
@@ -598,6 +1156,10 @@ def execute_single_task(
                     artifact_type=f"{stage}_deliverable",
                     artifact_summary=f"Handoff from {task['title']} to {other['title']}",
                     status="delivered",
+                    contract_version="1.0",
+                    trace_id=f"trc_{session_id[:8]}_{task_id[:8]}",
+                    validation_outcome="valid",
+                    required_context={"upstream_task_id": task_id, "stage": stage},
                     db_path=db_path
                 )
 
@@ -631,7 +1193,7 @@ def execute_single_task(
             if add_feed_fn:
                 add_feed_fn("النظام", "Task Engine", "orange", "RETRY", f"إعادة محاولة تنفيذ {task['title']} (محاولة {new_retry}): {err_msg}")
         else:
-            db.update_task_status(task_id, "failed", error_message=f"Exhausted retries: {err_msg}", db_path=db_path)
+            fail_task_and_propagate(task_id, f"Exhausted retries: {err_msg}", session_id=session_id, db_path=db_path)
             if add_feed_fn:
                 add_feed_fn("النظام", "Task Engine", "red", "FAIL", f"فشل تنفيذ مهمة {task['title']} نهائياً: {err_msg}")
                 

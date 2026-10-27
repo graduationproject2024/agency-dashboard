@@ -509,6 +509,12 @@
                     <button class="btn btn-sm btn-secondary orch-tab-btn" id="tab-btn-sessions" onclick="switchOrchTab('sessions', this)">
                         <i class="fa-solid fa-clock-rotate-left"></i> سجل الجلسات السابقة (Sessions History)
                     </button>
+                    <button class="btn btn-sm btn-secondary orch-tab-btn" id="tab-btn-gates" onclick="switchOrchTab('gates', this)">
+                        <i class="fa-solid fa-shield-halved"></i> بوابات الإطلاق وفحص الجودة (Release Gates)
+                    </button>
+                    <button class="btn btn-sm btn-secondary orch-tab-btn" id="tab-btn-workforce" onclick="switchOrchTab('workforce', this)">
+                        <i class="fa-solid fa-brain"></i> ذكاء القوى العاملة (Workforce Intelligence)
+                    </button>
                 </div>
 
                 <!-- Tab 1: Directed Task Graph (DAG) -->
@@ -544,6 +550,31 @@
                 <div id="orch-tab-sessions" class="orch-tab-content" style="display: none;">
                     <div id="orch-sessions-history-container" style="display: flex; flex-direction: column; gap: 12px;">
                         <!-- Sessions history table/cards populated via JS -->
+                    </div>
+                </div>
+
+                <!-- Tab 5: Release Gates & QA Findings -->
+                <div id="orch-tab-gates" class="orch-tab-content" style="display: none;">
+                    <div id="orch-gates-status-card" class="glass-panel" style="margin-bottom: 20px; padding: 18px; border-radius: 10px;">
+                        <!-- Gate evaluation populated via JS -->
+                        <div style="text-align: center; color: var(--text-muted);"><i class="fa-solid fa-spinner fa-spin"></i> جاري فحص حالة البوابات...</div>
+                    </div>
+                    <div class="glass-panel" style="padding: 18px; border-radius: 10px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; flex-wrap: wrap; gap: 10px;">
+                            <h3 style="margin: 0;"><i class="fa-solid fa-list-check"></i> نتائج وتدقيقات الجودة البرمجية (QA Findings)</h3>
+                            <button class="btn btn-sm btn-secondary" onclick="loadQualityGatesData()"><i class="fa-solid fa-rotate"></i> تحديث الفحوصات</button>
+                        </div>
+                        <div id="orch-qa-findings-container" style="display: flex; flex-direction: column; gap: 12px;">
+                            <!-- QA findings populated via JS -->
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Tab 6: Workforce Intelligence -->
+                <div id="orch-tab-workforce" class="orch-tab-content" style="display: none;">
+                    <div id="orch-workforce-container">
+                        <!-- Workforce intelligence summary populated via JS -->
+                        <div style="text-align: center; color: var(--text-muted); padding: 40px;"><i class="fa-solid fa-spinner fa-spin"></i> جاري تحميل بيانات ذكاء القوى العاملة...</div>
                     </div>
                 </div>
             </div>

@@ -446,9 +446,32 @@ function copyModalOutput() {
     });
 }
 
-function loadApprovalHistory() {
+async function loadApprovalHistory() {
     const historyTbody = document.getElementById('approvals-history');
     if (!historyTbody) return;
+    
+    try {
+        const res = await fetch('/api/approvals');
+        if (res.ok) {
+            const data = await res.json();
+            const approvals = data.approvals || [];
+            if (approvals.length > 0) {
+                historyTbody.innerHTML = approvals.map(item => `
+                    <tr style="border-bottom: 1px solid rgba(255,255,255,0.05);">
+                        <td style="padding: 12px 10px; color: var(--text-muted); font-size: 0.9rem;">${escapeHtml(item.requested_at || item.created_at || '')}</td>
+                        <td style="padding: 12px 10px; font-weight: 600; color: #fff;">${escapeHtml(item.action_type || item.policy_rule || item.approval_id)}</td>
+                        <td style="padding: 12px 10px;"><span style="background: rgba(88,166,255,0.1); color: var(--accent-blue); padding: 3px 8px; border-radius: 6px; font-size: 0.85rem;">${escapeHtml(item.session_id || 'general')}</span></td>
+                        <td style="padding: 12px 10px; color: ${item.status === 'approved' ? 'var(--accent-green)' : (item.status === 'pending' ? 'var(--accent-yellow)' : '#da3633')}; font-weight: 600;">
+                            <i class="fa-solid ${item.status === 'approved' ? 'fa-circle-check' : (item.status === 'pending' ? 'fa-clock' : 'fa-circle-xmark')}"></i> ${escapeHtml(item.status)}
+                        </td>
+                    </tr>
+                `).join('');
+                return;
+            }
+        }
+    } catch(e) {
+        console.warn("Could not fetch server approvals, falling back to local storage:", e);
+    }
     
     let history = [];
     try {
@@ -1306,6 +1329,12 @@ function switchOrchTab(tabId, btnElement) {
     const buttons = document.querySelectorAll('.orch-tab-btn');
     buttons.forEach(b => b.classList.remove('active'));
     if (btnElement) btnElement.classList.add('active');
+
+    if (tabId === 'gates') {
+        loadQualityGatesData();
+    } else if (tabId === 'workforce') {
+        loadWorkforceIntelligenceData();
+    }
 }
 
 async function resumeCurrentSession() {
@@ -1376,5 +1405,225 @@ function viewTaskOutputModal(taskId, title) {
             if (modal) modal.style.display = 'flex';
         })
         .catch(err => alert('تعذر تحميل مخرجات المهمة: ' + err));
+}
+
+// =========================================================================
+// Phase 2.8 Quality Gates, Findings & Workforce Intelligence Handlers
+// =========================================================================
+
+async function loadQualityGatesData() {
+    const cardEl = document.getElementById('orch-gates-status-card');
+    const container = document.getElementById('orch-qa-findings-container');
+    if (!cardEl || !container) return;
+
+    if (!currentOrchSessionId) {
+        cardEl.innerHTML = '<div style="text-align: center; color: var(--text-muted); padding: 15px;">لا توجد جلسة نشطة حالياً لتقييم بوابات الإطلاق.</div>';
+        container.innerHTML = '<div style="text-align: center; color: var(--text-muted); padding: 20px;">لا توجد جلسة نشطة.</div>';
+        return;
+    }
+
+    try {
+        const gateRes = await fetch(`/api/sessions/${encodeURIComponent(currentOrchSessionId)}/release_gate`);
+        if (gateRes.ok) {
+            const gate = await gateRes.json();
+            const isAllowed = Boolean(gate.allowed);
+            const statusLabel = isAllowed ? 'مصرح بالنشر (Passed)' : 'محظور النشر (Blocked)';
+            const statusColor = isAllowed ? '#3fb950' : '#da3633';
+            const statusBg = isAllowed ? 'rgba(46, 160, 67, 0.15)' : 'rgba(218, 54, 51, 0.15)';
+            const reasonsHtml = (gate.reasons && gate.reasons.length > 0)
+                ? `<ul style="margin: 10px 0 0; padding-right: 20px; color: #f85149; font-size: 0.9rem;">${gate.reasons.map(r => `<li>${escapeHtml(r)}</li>`).join('')}</ul>`
+                : '<p style="color: #7ee787; margin: 8px 0 0; font-size: 0.9rem;">✅ كافة معايير الإطلاق وفحوصات الجودة البرمجية مستوفاة بالكامل.</p>';
+
+            cardEl.innerHTML = `
+                <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
+                    <div style="display: flex; align-items: center; gap: 12px;">
+                        <div style="width: 44px; height: 44px; border-radius: 10px; background: ${statusBg}; display: flex; align-items: center; justify-content: center; color: ${statusColor}; font-size: 1.4rem;">
+                            <i class="fa-solid ${isAllowed ? 'fa-shield-check' : 'fa-shield-halved'}"></i>
+                        </div>
+                        <div>
+                            <h3 style="margin: 0; font-size: 1.15rem; color: #fff;">حالة بوابة الإطلاق (Release Gate)</h3>
+                            <div style="font-size: 0.85rem; color: #8b949e; margin-top: 3px;">
+                                <span>حالة الجودة: <strong style="color: ${gate.qa_status === 'passed' ? '#7ee787' : '#f85149'};">${escapeHtml(gate.qa_status)}</strong></span> &bull;
+                                <span>الموافقات: <strong style="color: ${gate.approval_status === 'approved' ? '#7ee787' : '#d29922'};">${escapeHtml(gate.approval_status)}</strong></span> &bull;
+                                <span>الموانع الحرجة: <strong style="color: ${gate.blocking_findings_count > 0 ? '#f85149' : '#7ee787'};">${gate.blocking_findings_count || 0}</strong></span>
+                            </div>
+                        </div>
+                    </div>
+                    <span class="badge" style="background: ${statusBg}; color: ${statusColor}; font-size: 0.9rem; padding: 6px 14px; border-radius: 20px; font-weight: 700;">
+                        ${statusLabel}
+                    </span>
+                </div>
+                <div style="margin-top: 15px; border-top: 1px solid rgba(255,255,255,0.06); padding-top: 12px;">
+                    <strong style="font-size: 0.9rem; color: #c9d1d9;">تقرير التدقيق والتحقق:</strong>
+                    ${reasonsHtml}
+                </div>
+            `;
+        }
+
+        const findRes = await fetch(`/api/sessions/${encodeURIComponent(currentOrchSessionId)}/qa_findings`);
+        if (findRes.ok) {
+            const findData = await findRes.json();
+            const findings = findData.findings || [];
+            container.innerHTML = '';
+            if (findings.length === 0) {
+                container.innerHTML = '<div style="text-align: center; color: var(--text-muted); padding: 30px;"><i class="fa-solid fa-circle-check" style="color: #3fb950; font-size: 1.8rem; margin-bottom: 8px; display: block;"></i>لا توجد أي ملاحظات أو أخطاء جودة مفتوحة لهذه الجلسة.</div>';
+                return;
+            }
+
+            findings.forEach(f => {
+                const item = document.createElement('div');
+                const sev = f.severity || 'medium';
+                const st = f.status || 'open';
+                const sevColors = { critical: '#da3633', high: '#f85149', medium: '#d29922', low: '#58a6ff', warning: '#d29922' };
+                const sevBgs = { critical: 'rgba(218,54,51,0.15)', high: 'rgba(248,81,73,0.15)', medium: 'rgba(210,153,34,0.15)', low: 'rgba(88,166,255,0.15)', warning: 'rgba(210,153,34,0.15)' };
+                const color = sevColors[sev] || '#8b949e';
+                const bg = sevBgs[sev] || 'rgba(255,255,255,0.05)';
+
+                item.style.cssText = `background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.08); border-right: 4px solid ${color}; border-radius: 8px; padding: 14px 18px;`;
+
+                item.innerHTML = `
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; flex-wrap: wrap; gap: 8px;">
+                        <div style="display: flex; align-items: center; gap: 8px;">
+                            <span style="background: ${bg}; color: ${color}; font-size: 0.75rem; font-weight: 700; padding: 2px 8px; border-radius: 4px; text-transform: uppercase;">${escapeHtml(sev)}</span>
+                            <span style="background: rgba(255,255,255,0.08); color: #c9d1d9; font-size: 0.75rem; padding: 2px 8px; border-radius: 4px;">${escapeHtml(f.category || 'general')}</span>
+                            <code style="color: var(--accent-blue); font-size: 0.8rem;">${escapeHtml(f.artifact_name || '')}</code>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span class="badge" style="background: rgba(255,255,255,0.08); color: #fff; font-size: 0.8rem;">${escapeHtml(st)}</span>
+                            ${st === 'open' ? `<button class="btn btn-sm btn-secondary" onclick="updateFindingStatusPrompt('${escapeHtml(f.finding_id)}')">تغيير الحالة</button>` : ''}
+                        </div>
+                    </div>
+                    <div style="color: #fff; font-size: 0.9rem; margin-bottom: 6px;">
+                        <strong>الدليل (Evidence):</strong> <span style="font-family: monospace; color: #e6edf3;">${escapeHtml(f.evidence)}</span>
+                    </div>
+                    ${f.remediation_recommendation ? `<div style="color: #8b949e; font-size: 0.85rem; margin-bottom: 6px;"><strong>التوصية:</strong> ${escapeHtml(f.remediation_recommendation)}</div>` : ''}
+                    <div style="display: flex; justify-content: space-between; font-size: 0.75rem; color: #6e7681; margin-top: 8px; border-top: 1px solid rgba(255,255,255,0.04); padding-top: 6px;">
+                        <span>المسؤول: <strong style="color: #58a6ff;">${escapeHtml(f.responsible_agent_id || 'system')}</strong></span>
+                        <span>المعرف: <code>${escapeHtml(f.finding_id)}</code></span>
+                    </div>
+                `;
+                container.appendChild(item);
+            });
+        }
+    } catch (err) {
+        console.error("Error loading quality gates data:", err);
+    }
+}
+
+async function updateFindingStatusPrompt(findingId) {
+    const status = prompt("أدخل الحالة الجديدة (remediated / accepted):", "accepted");
+    if (!status || !['remediated', 'accepted'].includes(status)) return;
+    const note = prompt("ملاحظات / تبرير التغيير:") || "";
+    try {
+        const res = await fetch(`/api/qa_findings/${encodeURIComponent(findingId)}/status`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ status: status, note: note, agent_id: 'human_operator' })
+        });
+        if (res.ok) {
+            alert("تم تحديث حالة الفحص بنجاح!");
+            loadQualityGatesData();
+        } else {
+            const data = await res.json();
+            alert("فشل التحديث: " + (data.error || 'خطأ غير معروف'));
+        }
+    } catch (e) {
+        alert("فشل الاتصال: " + e);
+    }
+}
+
+async function loadWorkforceIntelligenceData() {
+    const container = document.getElementById('orch-workforce-container');
+    if (!container) return;
+
+    try {
+        const res = await fetch('/api/workforce/intelligence');
+        if (!res.ok) return;
+        const data = await res.json();
+
+        const totalAgents = data.total_registered_agents || 0;
+        const executedCount = data.executed_agents_count || 0;
+        const unexecutedCount = data.unexecuted_agents_count || 0;
+        const totalDivs = data.total_divisions || 0;
+        const totalCaps = data.total_capabilities || 0;
+        const gapsCount = (data.capability_gaps || []).length;
+
+        let divsHtml = (data.divisions || []).map(d => `
+            <div style="background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; padding: 14px;">
+                <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        <i class="fa-solid ${escapeHtml(d.icon || 'fa-folder')}" style="color: var(--accent-blue);"></i>
+                        <strong style="color: #fff; font-size: 0.95rem;">${escapeHtml(d.name_ar || d.name)}</strong>
+                    </div>
+                    <span style="background: rgba(88,166,255,0.15); color: #58a6ff; font-size: 0.8rem; padding: 2px 8px; border-radius: 12px; font-weight: bold;">
+                        ${d.agents_count} موظف
+                    </span>
+                </div>
+                <div style="font-size: 0.8rem; color: #8b949e;">
+                    <div>المجالات: <strong>${d.capabilities_count} قدرة معتمدة</strong></div>
+                    <div>الأقسام الفرعية: ${d.subdepartments && d.subdepartments.length > 0 ? escapeHtml(d.subdepartments.join('، ')) : 'عام'}</div>
+                </div>
+            </div>
+        `).join('');
+
+        let gapsHtml = gapsCount === 0
+            ? '<span style="color: #7ee787;"><i class="fa-solid fa-check"></i> تغطية كاملة لكافة القدرات المعيارية.</span>'
+            : `<span style="color: #f85149;"><i class="fa-solid fa-triangle-exclamation"></i> قدرات غير مغطاة: ${(data.capability_gaps || []).map(g => `<code style="background: rgba(255,255,255,0.08); padding: 1px 6px; border-radius: 4px; margin-left: 4px;">${escapeHtml(g)}</code>`).join(' ')}</span>`;
+
+        container.innerHTML = `
+            <div class="stats-grid" style="margin-bottom: 25px;">
+                <div class="stat-card">
+                    <div class="icon-wrapper blue"><i class="fa-solid fa-users-gear"></i></div>
+                    <div class="stat-info">
+                        <h3>${totalAgents}</h3>
+                        <p>وكيل معتمد بالكتالوج (282)</p>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="icon-wrapper green"><i class="fa-solid fa-chart-line"></i></div>
+                    <div class="stat-info">
+                        <h3>${executedCount}</h3>
+                        <p>وكلاء لديهم تنفيذ موثق في DB</p>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="icon-wrapper yellow"><i class="fa-solid fa-clock"></i></div>
+                    <div class="stat-info">
+                        <h3>${unexecutedCount}</h3>
+                        <p>وكلاء مهيأون بانتظار مهام</p>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="icon-wrapper purple" style="color: #d2a8ff; background: rgba(138,43,226,0.1);"><i class="fa-solid fa-sitemap"></i></div>
+                    <div class="stat-info">
+                        <h3>${totalDivs}</h3>
+                        <p>أقسام معيارية (Canonical)</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="glass-panel" style="margin-bottom: 20px; padding: 18px; border-radius: 10px;">
+                <h3 style="margin: 0 0 12px;"><i class="fa-solid fa-layer-group"></i> تغطية القدرات التخصصية (Capability Coverage)</h3>
+                <div style="font-size: 0.9rem; color: #c9d1d9; margin-bottom: 10px;">
+                    إجمالي القدرات المعتمدة: <strong style="color: #58a6ff;">${totalCaps} قدرة فريدة</strong>
+                </div>
+                <div style="margin-bottom: 12px; display: flex; flex-wrap: wrap; gap: 6px;">
+                    ${(data.capabilities_sample || []).map(c => `<span style="background: rgba(255,255,255,0.06); padding: 3px 8px; border-radius: 6px; font-size: 0.8rem; color: #a5d6ff;">#${escapeHtml(c)}</span>`).join('')}
+                </div>
+                <div style="border-top: 1px solid rgba(255,255,255,0.06); padding-top: 10px; font-size: 0.85rem;">
+                    ${gapsHtml}
+                </div>
+            </div>
+
+            <div class="glass-panel" style="padding: 18px; border-radius: 10px;">
+                <h3 style="margin: 0 0 15px;"><i class="fa-solid fa-building-user"></i> توزيع الوكلاء عبر الأقسام الـ 18</h3>
+                <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 14px;">
+                    ${divsHtml}
+                </div>
+            </div>
+        `;
+    } catch (e) {
+        console.error("Error loading workforce intelligence:", e);
+    }
 }
 

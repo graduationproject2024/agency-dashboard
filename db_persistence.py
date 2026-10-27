@@ -585,6 +585,76 @@ def init_db(db_path: Optional[str] = None):
             cursor.execute("ALTER TABLE workflow_sessions_migrated RENAME TO workflow_sessions;")
             cursor.execute("PRAGMA foreign_keys=ON;")
 
+        # 12. QA Findings table (Phase 2.8 Independent QA & Quality Gates)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS qa_findings (
+            finding_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            task_id TEXT,
+            qa_run_id TEXT NOT NULL,
+            severity TEXT NOT NULL CHECK(severity IN ('critical', 'high', 'medium', 'low', 'warning')),
+            category TEXT NOT NULL CHECK(category IN ('security', 'syntax', 'contract', 'accessibility', 'integrity', 'performance')),
+            artifact_name TEXT NOT NULL,
+            evidence TEXT,
+            remediation_recommendation TEXT,
+            responsible_agent_id TEXT,
+            status TEXT NOT NULL CHECK(status IN ('open', 'remediated', 'accepted', 'verified_resolved')),
+            verification_history_json TEXT NOT NULL DEFAULT '[]',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES workflow_sessions(session_id) ON DELETE CASCADE
+        );
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_qa_findings_session ON qa_findings(session_id);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_qa_findings_status ON qa_findings(status);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_qa_findings_severity ON qa_findings(severity);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_qa_findings_run ON qa_findings(qa_run_id);")
+
+        # 13. Human Approvals table (Phase 2.8 Approval & Authorization Lifecycle)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS human_approvals (
+            approval_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            task_id TEXT,
+            action_type TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('pending', 'approved', 'rejected', 'expired', 'cancelled')),
+            requested_by TEXT NOT NULL,
+            requested_at REAL NOT NULL,
+            expires_at REAL NOT NULL,
+            artifact_revision_hash TEXT,
+            policy_rule TEXT,
+            decision_by TEXT,
+            decision_at REAL,
+            decision_reason TEXT,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            FOREIGN KEY(session_id) REFERENCES workflow_sessions(session_id) ON DELETE CASCADE
+        );
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_approvals_session ON human_approvals(session_id);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_approvals_status ON human_approvals(status);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_approvals_action ON human_approvals(action_type);")
+
+        # 14. Phase 2.8 schema enhancements to task_handoffs and workflow_tasks
+        cursor.execute("PRAGMA table_info(task_handoffs);")
+        hoff_cols = {row[1] for row in cursor.fetchall()}
+        if "contract_version" not in hoff_cols:
+            cursor.execute("ALTER TABLE task_handoffs ADD COLUMN contract_version TEXT DEFAULT '1.0';")
+        if "trace_id" not in hoff_cols:
+            cursor.execute("ALTER TABLE task_handoffs ADD COLUMN trace_id TEXT;")
+        if "validation_outcome" not in hoff_cols:
+            cursor.execute("ALTER TABLE task_handoffs ADD COLUMN validation_outcome TEXT DEFAULT 'valid';")
+        if "required_context_json" not in hoff_cols:
+            cursor.execute("ALTER TABLE task_handoffs ADD COLUMN required_context_json TEXT DEFAULT '{}';")
+
+        cursor.execute("PRAGMA table_info(workflow_tasks);")
+        task_cols = {row[1] for row in cursor.fetchall()}
+        if "required_capabilities_json" not in task_cols:
+            cursor.execute("ALTER TABLE workflow_tasks ADD COLUMN required_capabilities_json TEXT DEFAULT '[]';")
+        if "output_contract" not in task_cols:
+            cursor.execute("ALTER TABLE workflow_tasks ADD COLUMN output_contract TEXT;")
+        if "assigned_reason" not in task_cols:
+            cursor.execute("ALTER TABLE workflow_tasks ADD COLUMN assigned_reason TEXT;")
+
         conn.commit()
 
 
@@ -813,10 +883,14 @@ def create_task(
     max_retries: int = 2,
     status: Optional[str] = None,
     output_text: Optional[str] = None,
+    required_capabilities: Optional[List[str]] = None,
+    output_contract: Optional[str] = None,
+    assigned_reason: Optional[str] = None,
     db_path: Optional[str] = None
 ) -> str:
     task_id = f"task_{uuid.uuid4().hex[:12]}"
     deps_json = json.dumps(dependencies or [])
+    caps_json = json.dumps(required_capabilities or [])
     initial_status = status or "ready"
     with get_db_connection(db_path) as conn:
         if not status and dependencies:
@@ -828,12 +902,22 @@ def create_task(
             if completed_count < len(dependencies):
                 initial_status = "pending"
 
-        conn.execute("""
-            INSERT INTO workflow_tasks (
-                task_id, session_id, parent_task_id, title, division_id,
-                assigned_agent_id, stage, status, dependencies_json, input_context, max_retries, output_text
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-        """, (task_id, session_id, parent_task_id, title, division_id, assigned_agent_id, stage, initial_status, deps_json, input_context, max_retries, output_text))
+        cols = [c[1] for c in conn.execute("PRAGMA table_info(workflow_tasks);").fetchall()]
+        if "required_capabilities_json" in cols:
+            conn.execute("""
+                INSERT INTO workflow_tasks (
+                    task_id, session_id, parent_task_id, title, division_id,
+                    assigned_agent_id, stage, status, dependencies_json, input_context, max_retries, output_text,
+                    required_capabilities_json, output_contract, assigned_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """, (task_id, session_id, parent_task_id, title, division_id, assigned_agent_id, stage, initial_status, deps_json, input_context, max_retries, output_text, caps_json, output_contract, assigned_reason))
+        else:
+            conn.execute("""
+                INSERT INTO workflow_tasks (
+                    task_id, session_id, parent_task_id, title, division_id,
+                    assigned_agent_id, stage, status, dependencies_json, input_context, max_retries, output_text
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """, (task_id, session_id, parent_task_id, title, division_id, assigned_agent_id, stage, initial_status, deps_json, input_context, max_retries, output_text))
         conn.commit()
     return task_id
 
@@ -844,6 +928,7 @@ def get_task(task_id: str, db_path: Optional[str] = None) -> Optional[Dict[str, 
             return None
         res = dict(row)
         res["dependencies"] = json.loads(res.get("dependencies_json") or "[]")
+        res["required_capabilities"] = json.loads(res.get("required_capabilities_json") or "[]")
         return res
 
 def list_tasks_for_session(session_id: str, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -859,6 +944,7 @@ def list_tasks_for_session(session_id: str, db_path: Optional[str] = None) -> Li
             d["output"] = d.get("output_text")
             d["assigned_agent"] = d.get("assigned_agent_id")
             d["dependencies"] = json.loads(d.get("dependencies_json") or "[]")
+            d["required_capabilities"] = json.loads(d.get("required_capabilities_json") or "[]")
             result.append(d)
         return result
 
@@ -1456,6 +1542,30 @@ def complete_task_with_agent_run(
 # Task Handoffs (Agent-to-Agent Collaboration)
 # =========================================================================
 
+class HandoffResult(str):
+    def __new__(cls, val, data=None):
+        s = super().__new__(cls, str(val))
+        s._data = data or {}
+        return s
+    def __getitem__(self, item):
+        if isinstance(item, str):
+            return self._data.get(item)
+        return super().__getitem__(item)
+    def get(self, key, default=None):
+        return self._data.get(key, default)
+
+class FindingResult(str):
+    def __new__(cls, val, data=None):
+        s = super().__new__(cls, str(val))
+        s._data = data or {}
+        return s
+    def __getitem__(self, item):
+        if isinstance(item, str):
+            return self._data.get(item)
+        return super().__getitem__(item)
+    def get(self, key, default=None):
+        return self._data.get(key, default)
+
 def record_task_handoff(
     session_id: str,
     from_task_id: str,
@@ -1469,8 +1579,12 @@ def record_task_handoff(
     artifacts: Optional[Any] = None,
     artifact_type: str = "context",
     status: str = "delivered",
+    contract_version: str = "1.0",
+    trace_id: Optional[str] = None,
+    validation_outcome: str = "valid",
+    required_context: Optional[Dict[str, Any]] = None,
     db_path: Optional[str] = None
-) -> Dict[str, Any]:
+) -> HandoffResult:
     now = time.time()
     src_agent = from_agent or from_agent_id or "unknown"
     dst_agent = to_agent or to_agent_id or "unknown"
@@ -1481,74 +1595,120 @@ def record_task_handoff(
         "artifacts": art_dict
     }
     payload_json = json.dumps(stored_payload, ensure_ascii=False)
+    req_ctx_json = json.dumps(required_context or {}, ensure_ascii=False)
+    
+    # Payload bounds verification: reject oversized payloads
+    if len(summary) > 100000 or len(payload_json) > 100000:
+        raise ValueError("Handoff artifact_summary exceeds max payload (100,000 characters)")
+    if not contract_version or not isinstance(contract_version, str):
+        raise ValueError("Handoff contract_version must be a non-empty string")
     
     with get_db_connection(db_path) as conn:
         cursor = conn.cursor()
 
-        # 1. Source task verification if it exists in DB
-        src_task = cursor.execute("SELECT session_id, status FROM workflow_tasks WHERE task_id = ?;", (from_task_id,)).fetchone()
-        if src_task:
-            if src_task["session_id"] != session_id:
-                raise ValueError(
-                    f"Cross-session handoff rejected: source task {from_task_id} belongs to session {src_task['session_id']}, not {session_id}"
-                )
-            if status in ("delivered", "acknowledged"):
-                if src_task["status"] in ("failed", "cancelled", "blocked"):
-                    raise ValueError(f"Cannot record successful handoff from {src_task['status']} task {from_task_id}")
-                if src_task["status"] != "completed":
-                    raise ValueError(
-                        f"Cannot record successful handoff from incomplete task {from_task_id} (status: {src_task['status']}). Source task must be 'completed'."
-                    )
-
-        # 2. Destination task verification if it exists in DB
+        # 1. Destination task verification if it exists in DB
         if to_task_id:
             dst_task = cursor.execute(
-                "SELECT session_id, dependencies_json FROM workflow_tasks WHERE task_id = ?;", 
+                "SELECT session_id, assigned_agent_id, dependencies_json FROM workflow_tasks WHERE task_id = ?;", 
                 (to_task_id,)
             ).fetchone()
             if dst_task:
-                if dst_task["session_id"] != session_id:
+                dst_d = dict(dst_task)
+                if dst_d["session_id"] != session_id:
                     raise ValueError(
-                        f"Cross-session handoff rejected: destination task {to_task_id} belongs to session {dst_task['session_id']}, not {session_id}"
+                        f"Cross-session handoff rejected: destination task {to_task_id} belongs to session {dst_d['session_id']}, not {session_id}"
                     )
                 if from_task_id != to_task_id:
-                    deps = json.loads(dst_task["dependencies_json"] or "[]")
+                    if dst_d.get("assigned_agent_id") and dst_agent not in ("unknown", "production-environment", "user", "external", dst_d["assigned_agent_id"]):
+                        raise ValueError(
+                            f"Destination agent mismatch: destination task {to_task_id} is assigned to '{dst_d['assigned_agent_id']}', got '{dst_agent}'"
+                        )
+                    deps = json.loads(dst_d["dependencies_json"] or "[]")
                     if deps and from_task_id not in deps:
                         raise ValueError(
                             f"Invalid handoff: destination task {to_task_id} does not depend on source task {from_task_id} in DAG"
                         )
 
+        # 2. Source task verification if it exists in DB
+        src_task = cursor.execute("SELECT session_id, status FROM workflow_tasks WHERE task_id = ?;", (from_task_id,)).fetchone()
+        if src_task:
+            src_d = dict(src_task)
+            if src_d["session_id"] != session_id:
+                raise ValueError(
+                    f"Cross-session handoff rejected: source task {from_task_id} belongs to session {src_d['session_id']}, not {session_id}"
+                )
+            if src_d["status"] in ("failed", "cancelled", "blocked"):
+                raise ValueError(f"Cannot record successful handoff from {src_d['status']} task {from_task_id}")
+            if status in ("delivered", "acknowledged"):
+                if from_task_id != to_task_id and src_d["status"] != "completed":
+                    raise ValueError(
+                        f"Cannot record successful handoff from incomplete task {from_task_id} (status: {src_d['status']}). Source task must be 'completed'."
+                    )
+
         # 3. Enforce deterministic identity and idempotency for handoff records via atomic upsert
         h = hashlib.sha256(f"{session_id}_{from_task_id}_{to_task_id}".encode("utf-8")).hexdigest()[:16]
         handoff_id = f"hoff_{h}"
 
-        try:
-            cursor.execute("""
-                INSERT INTO task_handoffs (
-                    handoff_id, session_id, from_task_id, to_task_id,
-                    from_agent_id, to_agent_id, artifact_type,
-                    artifact_summary, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(handoff_id) DO UPDATE SET
-                    from_agent_id = excluded.from_agent_id,
-                    to_agent_id = excluded.to_agent_id,
-                    artifact_type = excluded.artifact_type,
-                    artifact_summary = excluded.artifact_summary,
-                    status = excluded.status,
-                    created_at = excluded.created_at;
-            """, (handoff_id, session_id, from_task_id, to_task_id, src_agent, dst_agent, artifact_type, payload_json, status, now))
-        except sqlite3.OperationalError:
-            # Fallback for legacy SQLite engines without ON CONFLICT support
-            cursor.execute("""
-                INSERT OR REPLACE INTO task_handoffs (
-                    handoff_id, session_id, from_task_id, to_task_id,
-                    from_agent_id, to_agent_id, artifact_type,
-                    artifact_summary, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-            """, (handoff_id, session_id, from_task_id, to_task_id, src_agent, dst_agent, artifact_type, payload_json, status, now))
+        cols = [c[1] for c in cursor.execute("PRAGMA table_info(task_handoffs);").fetchall()]
+        has_new_cols = "contract_version" in cols
+
+        if has_new_cols:
+            try:
+                cursor.execute("""
+                    INSERT INTO task_handoffs (
+                        handoff_id, session_id, from_task_id, to_task_id,
+                        from_agent_id, to_agent_id, artifact_type,
+                        artifact_summary, status, contract_version, trace_id, validation_outcome,
+                        required_context_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(handoff_id) DO UPDATE SET
+                        from_agent_id = excluded.from_agent_id,
+                        to_agent_id = excluded.to_agent_id,
+                        artifact_type = excluded.artifact_type,
+                        artifact_summary = excluded.artifact_summary,
+                        status = excluded.status,
+                        contract_version = excluded.contract_version,
+                        trace_id = excluded.trace_id,
+                        validation_outcome = excluded.validation_outcome,
+                        required_context_json = excluded.required_context_json,
+                        created_at = excluded.created_at;
+                """, (handoff_id, session_id, from_task_id, to_task_id, src_agent, dst_agent, artifact_type, payload_json, status, contract_version, trace_id, validation_outcome, req_ctx_json, now))
+            except sqlite3.OperationalError:
+                cursor.execute("""
+                    INSERT OR REPLACE INTO task_handoffs (
+                        handoff_id, session_id, from_task_id, to_task_id,
+                        from_agent_id, to_agent_id, artifact_type,
+                        artifact_summary, status, contract_version, trace_id, validation_outcome,
+                        required_context_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """, (handoff_id, session_id, from_task_id, to_task_id, src_agent, dst_agent, artifact_type, payload_json, status, contract_version, trace_id, validation_outcome, req_ctx_json, now))
+        else:
+            try:
+                cursor.execute("""
+                    INSERT INTO task_handoffs (
+                        handoff_id, session_id, from_task_id, to_task_id,
+                        from_agent_id, to_agent_id, artifact_type,
+                        artifact_summary, status, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(handoff_id) DO UPDATE SET
+                        from_agent_id = excluded.from_agent_id,
+                        to_agent_id = excluded.to_agent_id,
+                        artifact_type = excluded.artifact_type,
+                        artifact_summary = excluded.artifact_summary,
+                        status = excluded.status,
+                        created_at = excluded.created_at;
+                """, (handoff_id, session_id, from_task_id, to_task_id, src_agent, dst_agent, artifact_type, payload_json, status, now))
+            except sqlite3.OperationalError:
+                cursor.execute("""
+                    INSERT OR REPLACE INTO task_handoffs (
+                        handoff_id, session_id, from_task_id, to_task_id,
+                        from_agent_id, to_agent_id, artifact_type,
+                        artifact_summary, status, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """, (handoff_id, session_id, from_task_id, to_task_id, src_agent, dst_agent, artifact_type, payload_json, status, now))
         conn.commit()
 
-    return {
+    return HandoffResult(handoff_id, {
         "id": handoff_id,
         "handoff_id": handoff_id,
         "session_id": session_id,
@@ -1562,9 +1722,13 @@ def record_task_handoff(
         "artifact_summary": summary,
         "context_summary": summary,
         "artifacts": art_dict,
+        "contract_version": contract_version,
+        "trace_id": trace_id,
+        "validation_outcome": validation_outcome,
+        "required_context": required_context or {},
         "status": status,
         "created_at": now
-    }
+    })
 
 create_task_handoff = record_task_handoff
 
@@ -1577,6 +1741,9 @@ def get_session_handoffs(session_id: str, db_path: Optional[str] = None) -> List
             d["id"] = d.get("handoff_id")
             d["from_agent"] = d.get("from_agent_id")
             d["to_agent"] = d.get("to_agent_id")
+            d["contract_version"] = d.get("contract_version", "1.0")
+            d["trace_id"] = d.get("trace_id")
+            d["validation_outcome"] = d.get("validation_outcome", "valid")
             raw_summary = d.get("artifact_summary") or ""
             if raw_summary.startswith("{"):
                 try:
@@ -1584,19 +1751,418 @@ def get_session_handoffs(session_id: str, db_path: Optional[str] = None) -> List
                     if isinstance(parsed, dict) and "artifacts" in parsed:
                         d["context_summary"] = parsed.get("context_summary") or ""
                         d["artifacts"] = parsed.get("artifacts") or {}
+                        d["artifact_summary"] = d["context_summary"]
                     else:
                         d["context_summary"] = raw_summary
                         d["artifacts"] = parsed if isinstance(parsed, dict) else {"summary": raw_summary}
+                        d["artifact_summary"] = raw_summary
                 except Exception:
                     d["context_summary"] = raw_summary
                     d["artifacts"] = {"summary": raw_summary}
+                    d["artifact_summary"] = raw_summary
             else:
                 d["context_summary"] = raw_summary
                 d["artifacts"] = {"summary": raw_summary}
+                d["artifact_summary"] = raw_summary
+            raw_req = d.get("required_context_json")
+            d["required_context"] = json.loads(raw_req) if raw_req else {}
             result.append(d)
         return result
 
 list_task_handoffs = get_session_handoffs
+
+
+# =========================================================================
+# QA Findings & Quality Gates (Phase 2.8 Independent QA Execution)
+# =========================================================================
+
+VALID_QA_SEVERITIES = {'critical', 'high', 'medium', 'low', 'warning'}
+VALID_QA_CATEGORIES = {'security', 'syntax', 'contract', 'accessibility', 'integrity', 'performance'}
+VALID_QA_STATUSES = {'open', 'remediated', 'accepted', 'verified_resolved'}
+
+def record_qa_finding(
+    session_id: str,
+    qa_run_id: str,
+    severity: str,
+    category: str,
+    artifact_name: str,
+    evidence: Optional[str] = None,
+    remediation_recommendation: Optional[str] = None,
+    responsible_agent_id: Optional[str] = None,
+    task_id: Optional[str] = None,
+    status: str = "open",
+    db_path: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Persist structured QA finding with audit trail.
+    Ensures that verification history and findings remain durable and tamper-resistant.
+    """
+    if severity not in VALID_QA_SEVERITIES:
+        raise ValueError(f"Invalid QA finding severity: '{severity}'. Must be one of {sorted(VALID_QA_SEVERITIES)}")
+    if category not in VALID_QA_CATEGORIES:
+        raise ValueError(f"Invalid QA finding category: '{category}'. Must be one of {sorted(VALID_QA_CATEGORIES)}")
+    if status not in VALID_QA_STATUSES:
+        raise ValueError(f"Invalid QA finding status: '{status}'. Must be one of {sorted(VALID_QA_STATUSES)}")
+
+    finding_id = f"fnd_{uuid.uuid4().hex[:12]}"
+    now = time.time()
+    safe_evidence = sanitize_memory_content(evidence) if evidence else None
+    safe_remed = sanitize_memory_content(remediation_recommendation) if remediation_recommendation else None
+
+    with get_db_connection(db_path) as conn:
+        conn.execute("""
+            INSERT INTO qa_findings (
+                finding_id, session_id, task_id, qa_run_id, severity, category,
+                artifact_name, evidence, remediation_recommendation, responsible_agent_id,
+                status, verification_history_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?);
+        """, (
+            finding_id, session_id, task_id, qa_run_id, severity, category,
+            artifact_name, safe_evidence, safe_remed, responsible_agent_id,
+            status, now, now
+        ))
+        conn.commit()
+
+    return FindingResult(finding_id, {
+        "finding_id": finding_id,
+        "session_id": session_id,
+        "task_id": task_id,
+        "qa_run_id": qa_run_id,
+        "severity": severity,
+        "category": category,
+        "artifact_name": artifact_name,
+        "evidence": safe_evidence,
+        "remediation_recommendation": safe_remed,
+        "responsible_agent_id": responsible_agent_id,
+        "status": status,
+        "verification_history": [],
+        "created_at": now,
+        "updated_at": now
+    })
+
+def get_qa_finding(finding_id: Any, db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Retrieve a single QA finding by ID."""
+    if isinstance(finding_id, dict):
+        finding_id = finding_id.get("finding_id") or finding_id.get("id")
+    with get_db_connection(db_path) as conn:
+        row = conn.execute("SELECT * FROM qa_findings WHERE finding_id = ?;", (str(finding_id),)).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["verification_history"] = json.loads(d.get("verification_history_json") or "[]")
+        return d
+
+def list_qa_findings(
+    session_id: Optional[str] = None,
+    qa_run_id: Optional[str] = None,
+    status: Optional[str] = None,
+    min_severity: Optional[str] = None,
+    db_path: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    List QA findings with optional filters.
+    Orders results deterministically by severity (critical first) then created_at.
+    """
+    severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "warning": 4}
+    min_rank = severity_order.get(min_severity, 5) if min_severity else 5
+
+    conditions = []
+    params = []
+    if session_id:
+        conditions.append("session_id = ?")
+        params.append(session_id)
+    if qa_run_id:
+        conditions.append("qa_run_id = ?")
+        params.append(qa_run_id)
+    if status:
+        conditions.append("status = ?")
+        params.append(status)
+
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    query = f"SELECT * FROM qa_findings {where_clause} ORDER BY created_at ASC;"
+
+    with get_db_connection(db_path) as conn:
+        rows = conn.execute(query, params).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["verification_history"] = json.loads(d.get("verification_history_json") or "[]")
+            sev_rank = severity_order.get(d.get("severity"), 99)
+            if min_severity and sev_rank > min_rank:
+                continue
+            result.append(d)
+
+        result.sort(key=lambda x: (severity_order.get(x["severity"], 99), x["created_at"]))
+        return result
+
+def update_qa_finding_status(
+    finding_id: Any,
+    status: Optional[str] = None,
+    verified_by_agent: Optional[str] = None,
+    note: str = "",
+    new_status: Optional[str] = None,
+    verification_note: Optional[str] = None,
+    db_path: Optional[str] = None
+) -> Tuple[bool, str]:
+    """
+    Update QA finding status with mandatory verification audit trail.
+    CRITICAL QUALITY INVARIANT:
+    An implementation agent cannot unilaterally mark its own failed QA finding as 'verified_resolved'.
+    Independent verification is strictly enforced.
+    Returns (success, error_or_empty_str).
+    """
+    if isinstance(finding_id, dict):
+        finding_id = finding_id.get("finding_id") or finding_id.get("id")
+
+    eff_status = new_status or status
+    eff_note = verification_note if verification_note is not None else note
+
+    if eff_status not in VALID_QA_STATUSES:
+        return (False, f"Invalid QA finding status: '{eff_status}'. Must be one of {sorted(VALID_QA_STATUSES)}")
+
+    now = time.time()
+    with get_db_connection(db_path) as conn:
+        row = conn.execute("SELECT * FROM qa_findings WHERE finding_id = ?;", (finding_id,)).fetchone()
+        if not row:
+            return (False, f"QA finding {finding_id} not found")
+
+        finding = dict(row)
+        # Prevent self-certification
+        if eff_status == "verified_resolved":
+            if verified_by_agent and verified_by_agent == finding.get("responsible_agent_id"):
+                return (
+                    False,
+                    f"Self-certification rejected: responsible agent '{verified_by_agent}' cannot verify and resolve their own finding {finding_id}"
+                )
+
+        history = json.loads(finding.get("verification_history_json") or "[]")
+        history.append({
+            "timestamp": now,
+            "status": eff_status,
+            "verified_by": verified_by_agent,
+            "note": sanitize_memory_content(eff_note)
+        })
+        history_json = json.dumps(history, ensure_ascii=False)
+
+        conn.execute("""
+            UPDATE qa_findings
+            SET status = ?,
+                verification_history_json = ?,
+                updated_at = ?
+            WHERE finding_id = ?;
+        """, (eff_status, history_json, now, finding_id))
+        conn.commit()
+
+    return (True, "")
+
+
+# =========================================================================
+# Human Approval & Authorization Lifecycle (Phase 2.8 Governance)
+# =========================================================================
+
+VALID_APPROVAL_STATUSES = {'pending', 'approved', 'rejected', 'expired', 'cancelled'}
+VALID_APPROVAL_ACTIONS = {
+    'release_deployment', 'high_cost_execution', 'destructive_action',
+    'policy_override', 'manual_adjustment', 'code_remediation', 'production_release', 'release'
+}
+
+def create_approval_request(
+    session_id: str,
+    action_type: str,
+    requested_by: str,
+    artifact_revision_hash: Optional[str] = None,
+    policy_rule: Optional[str] = None,
+    timeout_seconds: float = 3600.0,
+    expires_in_seconds: Optional[float] = None,
+    task_id: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    db_path: Optional[str] = None
+) -> str:
+    """
+    Create a durable, revision-bound human approval request.
+    Idempotent: If an active pending request for the same session, action, and revision exists, returns its ID.
+    Returns approval_id: str.
+    """
+    now = time.time()
+    eff_timeout = expires_in_seconds if expires_in_seconds is not None else timeout_seconds
+    expires_at = now + max(60.0, float(eff_timeout))
+    meta_json = json.dumps(metadata or {}, ensure_ascii=False)
+
+    with get_db_connection(db_path) as conn:
+        # Check for existing active pending request for exact same action and revision
+        existing = conn.execute("""
+            SELECT * FROM human_approvals
+            WHERE session_id = ? AND action_type = ? AND status = 'pending';
+        """, (session_id, action_type)).fetchall()
+
+        for ex in existing:
+            ex_d = dict(ex)
+            # Lazily expire if time has passed
+            if now > ex_d["expires_at"]:
+                conn.execute("UPDATE human_approvals SET status = 'expired' WHERE approval_id = ?;", (ex_d["approval_id"],))
+                continue
+            # If revision matches, return existing idempotent request id
+            if ex_d.get("artifact_revision_hash") == artifact_revision_hash:
+                conn.commit()
+                return ex_d["approval_id"]
+
+        approval_id = f"apr_{uuid.uuid4().hex[:12]}"
+        conn.execute("""
+            INSERT INTO human_approvals (
+                approval_id, session_id, task_id, action_type, status,
+                requested_by, requested_at, expires_at, artifact_revision_hash,
+                policy_rule, metadata_json
+            ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?);
+        """, (
+            approval_id, session_id, task_id, action_type,
+            requested_by, now, expires_at, artifact_revision_hash,
+            policy_rule, meta_json
+        ))
+        conn.commit()
+
+    return approval_id
+
+def get_approval_request(approval_id: Any, db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Retrieve an approval request with lazy expiry evaluation."""
+    if isinstance(approval_id, dict):
+        approval_id = approval_id.get("approval_id") or approval_id.get("id")
+    now = time.time()
+    with get_db_connection(db_path) as conn:
+        row = conn.execute("SELECT * FROM human_approvals WHERE approval_id = ?;", (approval_id,)).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        if d["status"] == "pending" and now > d["expires_at"]:
+            conn.execute("UPDATE human_approvals SET status = 'expired' WHERE approval_id = ?;", (approval_id,))
+            conn.commit()
+            d["status"] = "expired"
+        d["metadata"] = json.loads(d.get("metadata_json") or "{}")
+        return d
+
+def list_approval_requests(
+    session_id: Optional[str] = None,
+    status: Optional[str] = None,
+    action_type: Optional[str] = None,
+    db_path: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """List approval requests with lazy expiry updates."""
+    now = time.time()
+    with get_db_connection(db_path) as conn:
+        # Lazily expire overdue pending requests
+        conn.execute("""
+            UPDATE human_approvals
+            SET status = 'expired'
+            WHERE status = 'pending' AND expires_at < ?;
+        """, (now,))
+        conn.commit()
+
+        conditions = []
+        params = []
+        if session_id:
+            conditions.append("session_id = ?")
+            params.append(session_id)
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        if action_type:
+            conditions.append("action_type = ?")
+            params.append(action_type)
+
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        rows = conn.execute(f"SELECT * FROM human_approvals {where_clause} ORDER BY requested_at DESC;", params).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["metadata"] = json.loads(d.get("metadata_json") or "{}")
+            result.append(d)
+        return result
+
+def decide_approval_request(
+    approval_id: Any,
+    decision: str,
+    principal: str,
+    reason: str = "",
+    current_revision_hash: Optional[str] = None,
+    allow_self_approval: bool = False,
+    db_path: Optional[str] = None
+) -> Tuple[bool, str]:
+    """
+    Atomically record human approval decision.
+    Enforces:
+    - Rejects expired requests.
+    - Rejects terminal requests (already rejected/cancelled).
+    - Idempotent on repeated identical approval.
+    - Binds decision strictly to candidate artifact revision hash.
+    - Blocks unauthorized self-approval unless explicitly permitted.
+    Returns (success: bool, error_or_empty_str: str).
+    """
+    if isinstance(approval_id, dict):
+        approval_id = approval_id.get("approval_id") or approval_id.get("id")
+
+    decision_clean = str(decision).strip().lower()
+    decision_map = {
+        "approve": "approved",
+        "approved": "approved",
+        "reject": "rejected",
+        "rejected": "rejected",
+        "cancel": "cancelled",
+        "cancelled": "cancelled"
+    }
+    if decision_clean not in decision_map:
+        return (False, f"Invalid approval decision: '{decision}'. Must be one of ('approve', 'approved', 'reject', 'rejected', 'cancel', 'cancelled')")
+    target_status = decision_map[decision_clean]
+
+    now = time.time()
+    with get_db_connection(db_path) as conn:
+        row = conn.execute("SELECT * FROM human_approvals WHERE approval_id = ?;", (approval_id,)).fetchone()
+        if not row:
+            return (False, f"Approval request {approval_id} not found")
+
+        req = dict(row)
+
+        # 1. Expiration check
+        if req["status"] == "expired" or (req["status"] == "pending" and now > req["expires_at"]):
+            conn.execute("UPDATE human_approvals SET status = 'expired' WHERE approval_id = ?;", (approval_id,))
+            conn.commit()
+            return (False, f"Cannot decide on expired approval request {approval_id}")
+
+        # 2. Terminal state check
+        if req["status"] in ("rejected", "cancelled"):
+            return (False, f"Cannot decide on terminal approval request (status: {req['status']})")
+
+        # 3. Idempotency check
+        if req["status"] == "approved":
+            if target_status == "approved" and req.get("decision_by") == principal:
+                return (True, "")
+            return (False, f"Approval request {approval_id} has already been approved by '{req.get('decision_by')}'")
+
+        # 4. Revision-bound staleness check
+        if current_revision_hash and req.get("artifact_revision_hash"):
+            if current_revision_hash != req["artifact_revision_hash"]:
+                return (
+                    False,
+                    f"Revision mismatch: candidate artifact revision ({current_revision_hash[:8]}) does not match approval requested revision ({req['artifact_revision_hash'][:8]})"
+                )
+
+        # 5. Authorization / Self-approval policy check
+        if not allow_self_approval and principal and principal == req.get("requested_by"):
+            return (
+                False,
+                f"Self-approval is forbidden: requester '{principal}' cannot approve their own request under strict authorization policy"
+            )
+
+        # 6. Apply decision atomically
+        conn.execute("""
+            UPDATE human_approvals
+            SET status = ?,
+                decision_by = ?,
+                decision_at = ?,
+                decision_reason = ?
+            WHERE approval_id = ?;
+        """, (target_status, principal, now, sanitize_memory_content(reason), approval_id))
+        conn.commit()
+
+    return (True, "")
 
 
 # =========================================================================
