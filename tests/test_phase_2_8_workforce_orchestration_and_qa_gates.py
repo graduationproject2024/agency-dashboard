@@ -493,12 +493,22 @@ def test_group_e_prevention_of_self_certification(temp_db):
         db_path=temp_db
     )
 
+    # Record passing QA execution evidence for run_1
+    db_store.record_qa_run(
+        qa_run_id="run_1",
+        session_id=sess_id,
+        artifact_revision=valid_rev,
+        validation_status="passed",
+        db_path=temp_db
+    )
+
     # Attempt self-certification by responsible agent -> must fail
     ok, err = db_store.update_qa_finding_status(
         finding_id=fid,
         status="verified_resolved",
         verified_by_agent="engineering-senior-developer",
         artifact_revision=valid_rev,
+        qa_run_id="run_1",
         db_path=temp_db
     )
     assert ok is False
@@ -510,6 +520,7 @@ def test_group_e_prevention_of_self_certification(temp_db):
         status="verified_resolved",
         verified_by_agent="engineering-qa-engineer",
         artifact_revision=valid_rev,
+        qa_run_id="run_1",
         db_path=temp_db
     )
     assert ok2 is True

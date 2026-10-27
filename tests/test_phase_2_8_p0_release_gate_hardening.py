@@ -714,16 +714,26 @@ def test_resolution_record_tied_to_different_revision_is_rejected(temp_db):
         db_path=temp_db
     )
 
+    # Record passing QA run for run_1
+    db_store.record_qa_run(
+        qa_run_id="run_1",
+        session_id=sess_id,
+        artifact_revision=rev_actual,
+        validation_status="passed",
+        db_path=temp_db
+    )
+
     # Attempt resolution with different revision -> rejected
     ok, err = db_store.update_qa_finding_status(
         finding_id=fid,
         status="verified_resolved",
         verified_by_agent="engineering-qa-engineer",
         artifact_revision=rev_forged,
+        qa_run_id="run_1",
         db_path=temp_db
     )
     assert ok is False
-    assert "does not match finding artifact_revision" in err
+    assert "does not match" in err
 
     # Resolve with correct revision
     ok_res, _ = db_store.update_qa_finding_status(
@@ -731,13 +741,14 @@ def test_resolution_record_tied_to_different_revision_is_rejected(temp_db):
         status="verified_resolved",
         verified_by_agent="engineering-qa-engineer",
         artifact_revision=rev_actual,
+        qa_run_id="run_1",
         db_path=temp_db
     )
     assert ok_res is True
 
     # Tamper resolution history to simulate stale resolution from older revision
     with db_store.get_db_connection(temp_db) as conn:
-        stale_history = json.dumps([{"status": "verified_resolved", "artifact_revision": rev_forged, "timestamp": 123456}])
+        stale_history = json.dumps([{"status": "verified_resolved", "artifact_revision": rev_forged, "qa_run_id": "run_1", "timestamp": 123456}])
         conn.execute("UPDATE qa_findings SET verification_history_json = ? WHERE finding_id = ?", (stale_history, fid))
         conn.commit()
 
@@ -810,21 +821,31 @@ def test_missing_revision_identity_cannot_be_bypassed_via_alternate_resolution_p
         status="open", artifact_revision=None, db_path=temp_db
     )
 
-    # Attempt 1: Call endpoint without artifact_revision in payload
-    resp1 = test_client.post(
+    # Attempt 1a: Call endpoint without qa_run_id in payload
+    resp1a = test_client.post(
         f"/api/qa_findings/{fid_none_rev}/status",
         headers={"Origin": "http://127.0.0.1:8080"},
-        json={"status": "verified_resolved", "agent_id": "engineering-qa-engineer"}
+        json={"status": "verified_resolved", "agent_id": "engineering-qa-engineer", "artifact_revision": "a" * 64}
     )
-    assert resp1.status_code == 400
-    assert "missing, empty, or malformed artifact_revision" in resp1.get_json()["error"]
+    assert resp1a.status_code == 400
+    assert "qa_run_id is required" in resp1a.get_json()["error"]
+    assert db_store.get_qa_finding(fid_none_rev, db_path=temp_db)["status"] == "open"
+
+    # Attempt 1b: Call endpoint without artifact_revision in payload
+    resp1b = test_client.post(
+        f"/api/qa_findings/{fid_none_rev}/status",
+        headers={"Origin": "http://127.0.0.1:8080"},
+        json={"status": "verified_resolved", "agent_id": "engineering-qa-engineer", "qa_run_id": "r1"}
+    )
+    assert resp1b.status_code == 400
+    assert "artifact_revision is required" in resp1b.get_json()["error"] or "missing, empty, or malformed artifact_revision" in resp1b.get_json()["error"]
     assert db_store.get_qa_finding(fid_none_rev, db_path=temp_db)["status"] == "open"
 
     # Attempt 2: Call endpoint supplying forged revision on finding that has None revision
     resp2 = test_client.post(
         f"/api/qa_findings/{fid_none_rev}/status",
         headers={"Origin": "http://127.0.0.1:8080"},
-        json={"status": "verified_resolved", "agent_id": "engineering-qa-engineer", "artifact_revision": "f" * 64}
+        json={"status": "verified_resolved", "agent_id": "engineering-qa-engineer", "artifact_revision": "f" * 64, "qa_run_id": "r1"}
     )
     assert resp2.status_code == 400
     assert db_store.get_qa_finding(fid_none_rev, db_path=temp_db)["status"] == "open"
@@ -899,3 +920,564 @@ def test_candidate_content_changed_after_qa_certification_fails_closed(temp_db):
     assert res["allowed"] is False
     assert any("Artifact revision mismatch" in r or "digest mismatch" in r for r in res["reasons"])
 
+
+# =========================================================================
+# Phase 2.8 Mandatory Trusted QA Certification Regression Suite
+# =========================================================================
+
+def test_qa_trust_01_missing_qa_run_id_rejected(temp_db):
+    """verified_resolved with missing qa_run_id is rejected and fails closed."""
+    sess_id = db_store.create_session("Trust01", "Task", db_path=temp_db)
+    cand = _make_candidate_files()
+    rev = compute_artifact_revision(cand)
+    fid = db_store.record_qa_finding(
+        session_id=sess_id, task_id=None, qa_run_id="run_init", severity="high",
+        category="syntax", artifact_name="index.html", evidence="Missing doctype",
+        status="open", artifact_revision=rev, db_path=temp_db
+    )
+    ok, err = db_store.update_qa_finding_status(
+        finding_id=fid, status="verified_resolved", verified_by_agent="qa-eng",
+        artifact_revision=rev, qa_run_id=None, db_path=temp_db
+    )
+    assert ok is False
+    assert "qa_run_id" in err.lower()
+    f = db_store.get_qa_finding(fid, db_path=temp_db)
+    assert f["status"] == "open"
+
+
+def test_qa_trust_02_empty_or_whitespace_qa_run_id_rejected(temp_db):
+    """verified_resolved with empty or whitespace-only qa_run_id is rejected."""
+    sess_id = db_store.create_session("Trust02", "Task", db_path=temp_db)
+    cand = _make_candidate_files()
+    rev = compute_artifact_revision(cand)
+    fid = db_store.record_qa_finding(
+        session_id=sess_id, task_id=None, qa_run_id="run_init", severity="high",
+        category="syntax", artifact_name="index.html", evidence="Missing doctype",
+        status="open", artifact_revision=rev, db_path=temp_db
+    )
+    for bad_id in ["", "   ", "\t\n  "]:
+        ok, err = db_store.update_qa_finding_status(
+            finding_id=fid, status="verified_resolved", verified_by_agent="qa-eng",
+            artifact_revision=rev, qa_run_id=bad_id, db_path=temp_db
+        )
+        assert ok is False
+        assert "qa_run_id" in err.lower()
+        assert db_store.get_qa_finding(fid, db_path=temp_db)["status"] == "open"
+
+
+def test_qa_trust_03_nonexistent_qa_run_id_rejected(temp_db):
+    """verified_resolved with nonexistent qa_run_id in persistence is rejected."""
+    sess_id = db_store.create_session("Trust03", "Task", db_path=temp_db)
+    cand = _make_candidate_files()
+    rev = compute_artifact_revision(cand)
+    fid = db_store.record_qa_finding(
+        session_id=sess_id, task_id=None, qa_run_id="run_init", severity="high",
+        category="syntax", artifact_name="index.html", evidence="Missing doctype",
+        status="open", artifact_revision=rev, db_path=temp_db
+    )
+    ok, err = db_store.update_qa_finding_status(
+        finding_id=fid, status="verified_resolved", verified_by_agent="qa-eng",
+        artifact_revision=rev, qa_run_id="qa_run_ghost_99999", db_path=temp_db
+    )
+    assert ok is False
+    assert "does not exist in authoritative persistence layer" in err
+    assert db_store.get_qa_finding(fid, db_path=temp_db)["status"] == "open"
+
+
+def test_qa_trust_04_failed_qa_run_rejected(temp_db):
+    """Resolution referencing a failed QA run is rejected."""
+    sess_id = db_store.create_session("Trust04", "Task", db_path=temp_db)
+    cand = _make_candidate_files()
+    rev = compute_artifact_revision(cand)
+    db_store.record_qa_run(
+        qa_run_id="run_failed_1", session_id=sess_id, artifact_revision=rev,
+        validation_status="failed", errors=["Critical syntax failure"], db_path=temp_db
+    )
+    fid = db_store.record_qa_finding(
+        session_id=sess_id, task_id=None, qa_run_id="run_init", severity="high",
+        category="syntax", artifact_name="index.html", evidence="Syntax error",
+        status="open", artifact_revision=rev, db_path=temp_db
+    )
+    ok, err = db_store.update_qa_finding_status(
+        finding_id=fid, status="verified_resolved", verified_by_agent="qa-eng",
+        artifact_revision=rev, qa_run_id="run_failed_1", db_path=temp_db
+    )
+    assert ok is False
+    assert "failed or incomplete" in err
+    assert db_store.get_qa_finding(fid, db_path=temp_db)["status"] == "open"
+
+
+def test_qa_trust_05_incomplete_or_interrupted_qa_run_rejected(temp_db):
+    """Resolution referencing an incomplete or interrupted QA run is rejected."""
+    sess_id = db_store.create_session("Trust05", "Task", db_path=temp_db)
+    cand = _make_candidate_files()
+    rev = compute_artifact_revision(cand)
+
+    # 1. record_qa_run fails closed on non-terminal statuses
+    for bad_status in ["running", "pending", "interrupted"]:
+        with pytest.raises(ValueError, match="must be 'passed' or 'failed'"):
+            db_store.record_qa_run(
+                qa_run_id=f"run_err_{bad_status}", session_id=sess_id, artifact_revision=rev,
+                validation_status=bad_status, db_path=temp_db
+            )
+
+    # 2. SQLite CHECK constraint prevents raw insertion of non-terminal status
+    for bad_status in ["running", "pending", "interrupted"]:
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+            with db_store.get_db_connection(temp_db) as conn:
+                conn.execute("""
+                    INSERT INTO qa_runs (qa_run_id, session_id, artifact_revision, validation_status, checks_json, errors_json, created_at)
+                    VALUES (?, ?, ?, ?, '{}', '[]', 1000.0);
+                """, (f"run_raw_{bad_status}", sess_id, rev, bad_status))
+                conn.commit()
+
+    # 3. An interrupted/failed run recorded as failed cannot resolve finding
+    db_store.record_qa_run(
+        qa_run_id="run_interrupted_failed", session_id=sess_id, artifact_revision=rev,
+        validation_status="failed", errors=["Interrupted execution"], db_path=temp_db
+    )
+    fid = db_store.record_qa_finding(
+        session_id=sess_id, task_id=None, qa_run_id="run_init", severity="high",
+        category="syntax", artifact_name="index.html", evidence="Syntax error",
+        status="open", artifact_revision=rev, db_path=temp_db
+    )
+    ok, err = db_store.update_qa_finding_status(
+        finding_id=fid, status="verified_resolved", verified_by_agent="qa-eng",
+        artifact_revision=rev, qa_run_id="run_interrupted_failed", db_path=temp_db
+    )
+    assert ok is False
+    assert "failed or incomplete" in err
+    assert db_store.get_qa_finding(fid, db_path=temp_db)["status"] == "open"
+
+
+def test_qa_trust_06_qa_run_different_session_rejected(temp_db):
+    """Resolution referencing a QA run from a different session is rejected."""
+    sess_a = db_store.create_session("Trust06 A", "Task", db_path=temp_db)
+    sess_b = db_store.create_session("Trust06 B", "Task", db_path=temp_db)
+    cand = _make_candidate_files()
+    rev = compute_artifact_revision(cand)
+    db_store.record_qa_run(
+        qa_run_id="run_sess_b", session_id=sess_b, artifact_revision=rev,
+        validation_status="passed", db_path=temp_db
+    )
+    fid = db_store.record_qa_finding(
+        session_id=sess_a, task_id=None, qa_run_id="run_init", severity="high",
+        category="syntax", artifact_name="index.html", evidence="Syntax error",
+        status="open", artifact_revision=rev, db_path=temp_db
+    )
+    ok, err = db_store.update_qa_finding_status(
+        finding_id=fid, status="verified_resolved", verified_by_agent="qa-eng",
+        artifact_revision=rev, qa_run_id="run_sess_b", db_path=temp_db
+    )
+    assert ok is False
+    assert "belongs to session" in err
+    assert db_store.get_qa_finding(fid, db_path=temp_db)["status"] == "open"
+
+
+def test_qa_trust_07_qa_run_different_workflow_scope_rejected(temp_db):
+    """Resolution referencing a QA run from a different workflow/task scope is rejected."""
+    sess_id = db_store.create_session("Trust07", "Task", db_path=temp_db)
+    cand = _make_candidate_files()
+    rev = compute_artifact_revision(cand)
+    db_store.record_qa_run(
+        qa_run_id="run_task_api", session_id=sess_id, task_id="task_api",
+        artifact_revision=rev, validation_status="passed", db_path=temp_db
+    )
+    fid = db_store.record_qa_finding(
+        session_id=sess_id, task_id="task_frontend", qa_run_id="run_init",
+        severity="high", category="syntax", artifact_name="index.html",
+        evidence="Missing doctype", status="open", artifact_revision=rev, db_path=temp_db
+    )
+    ok, err = db_store.update_qa_finding_status(
+        finding_id=fid, status="verified_resolved", verified_by_agent="qa-eng",
+        artifact_revision=rev, qa_run_id="run_task_api", db_path=temp_db
+    )
+    assert ok is False
+    assert "belongs to task" in err
+    assert db_store.get_qa_finding(fid, db_path=temp_db)["status"] == "open"
+
+
+def test_qa_trust_08_qa_run_different_artifact_revision_rejected(temp_db):
+    """Resolution referencing a QA run for a different artifact revision is rejected."""
+    sess_id = db_store.create_session("Trust08", "Task", db_path=temp_db)
+    cand_a = _make_candidate_files()
+    rev_a = compute_artifact_revision(cand_a)
+    cand_b = copy.deepcopy(cand_a)
+    cand_b["script.js"] = "console.log('Rev B version');"
+    rev_b = compute_artifact_revision(cand_b)
+    assert rev_a != rev_b
+
+    db_store.record_qa_run(
+        qa_run_id="run_for_rev_b", session_id=sess_id, artifact_revision=rev_b,
+        validation_status="passed", db_path=temp_db
+    )
+    fid = db_store.record_qa_finding(
+        session_id=sess_id, task_id=None, qa_run_id="run_init", severity="high",
+        category="syntax", artifact_name="index.html", evidence="Syntax error",
+        status="open", artifact_revision=rev_a, db_path=temp_db
+    )
+    ok, err = db_store.update_qa_finding_status(
+        finding_id=fid, status="verified_resolved", verified_by_agent="qa-eng",
+        artifact_revision=rev_a, qa_run_id="run_for_rev_b", db_path=temp_db
+    )
+    assert ok is False
+    assert "does not match resolution revision" in err
+    assert db_store.get_qa_finding(fid, db_path=temp_db)["status"] == "open"
+
+
+def test_qa_trust_09_resolution_history_revision_differing_from_candidate_blocks_gate(temp_db):
+    """Resolution history revision differing from candidate revision blocks the release gate."""
+    sess_id = db_store.create_session("Trust09", "Task", db_path=temp_db)
+    cand = _make_candidate_files()
+    rev = compute_artifact_revision(cand)
+    other_rev = "b" * 64
+
+    rep = run_qa_checks(cand["index.html"], cand["style.css"], cand["script.js"], session_id=sess_id, db_path=temp_db)
+    assert rep["passed"] is True
+
+    # Insert a finding marked verified_resolved whose history record has other_rev
+    with db_store.get_db_connection(temp_db) as conn:
+        conn.execute("""
+            INSERT INTO qa_findings (
+                finding_id, session_id, task_id, qa_run_id, severity, category,
+                artifact_name, evidence, responsible_agent_id, status,
+                verification_history_json, artifact_revision, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """, (
+            "fnd_mismatched_history", sess_id, None, rep["qa_run_id"], "high", "syntax",
+            "index.html", "Stale finding", "dev", "verified_resolved",
+            json.dumps([{"status": "verified_resolved", "artifact_revision": other_rev, "qa_run_id": rep["qa_run_id"], "timestamp": 1000}]),
+            rev, 1000, 1000
+        ))
+        conn.commit()
+
+    res = evaluate_release_gate(sess_id, candidate_files=cand, artifact_manifest=rep["manifest"], db_path=temp_db)
+    assert res["allowed"] is False
+    assert res["status"] == "blocked"
+    assert any("tied to a different artifact revision" in r for r in res["reasons"])
+
+
+def test_qa_trust_10_finding_revision_differing_from_candidate_blocks_gate_when_unresolved(temp_db):
+    """Release gate isolates findings by revision; an unresolved critical finding on the candidate revision blocks release."""
+    sess_id = db_store.create_session("Trust10", "Task", db_path=temp_db)
+    cand = _make_candidate_files()
+    rev = compute_artifact_revision(cand)
+
+    rep = run_qa_checks(cand["index.html"], cand["style.css"], cand["script.js"], session_id=sess_id, db_path=temp_db)
+    assert rep["passed"] is True
+
+    # Open critical finding on current candidate revision
+    db_store.record_qa_finding(
+        session_id=sess_id, task_id=None, qa_run_id="run_old", severity="critical",
+        category="security", artifact_name="index.html", evidence="Unresolved XSS",
+        status="open", artifact_revision=rev, db_path=temp_db
+    )
+
+    res = evaluate_release_gate(sess_id, candidate_files=cand, artifact_manifest=rep["manifest"], db_path=temp_db)
+    assert res["allowed"] is False
+    assert res["status"] == "blocked"
+    assert res["blocking_findings_count"] >= 1
+
+
+def test_qa_trust_11_forged_client_status_without_persisted_qa_run_rejected(test_client, temp_db):
+    """A forged client-supplied resolution without a persisted successful QA run is rejected."""
+    sess_id = db_store.create_session("Trust11", "Task", db_path=temp_db)
+    cand = _make_candidate_files()
+    rev = compute_artifact_revision(cand)
+
+    fid = db_store.record_qa_finding(
+        session_id=sess_id, task_id=None, qa_run_id="run_init", severity="high",
+        category="syntax", artifact_name="index.html", evidence="Missing doctype",
+        status="open", artifact_revision=rev, db_path=temp_db
+    )
+
+    resp = test_client.post(
+        f"/api/qa_findings/{fid}/status",
+        headers={"Origin": "http://127.0.0.1:8080"},
+        json={
+            "status": "verified_resolved",
+            "agent_id": "engineering-qa-engineer",
+            "artifact_revision": rev,
+            "qa_run_id": "forged_qa_run_id_never_persisted"
+        }
+    )
+    assert resp.status_code == 400
+    assert "does not exist in authoritative persistence layer" in resp.get_json()["error"]
+    assert db_store.get_qa_finding(fid, db_path=temp_db)["status"] == "open"
+
+
+def test_qa_trust_12_qa_run_missing_persisted_revision_rejected(temp_db):
+    """A QA run with missing or malformed persisted artifact_revision cannot be used for resolution."""
+    sess_id = db_store.create_session("Trust12", "Task", db_path=temp_db)
+    cand = _make_candidate_files()
+    rev = compute_artifact_revision(cand)
+
+    # 1. record_qa_run rejects missing revision
+    with pytest.raises(ValueError, match="artifact_revision is required and cannot be empty"):
+        db_store.record_qa_run(
+            qa_run_id="run_no_rev", session_id=sess_id, artifact_revision=None,
+            validation_status="passed", db_path=temp_db
+        )
+
+    # 2. SQLite NOT NULL constraint prevents raw insertion of NULL artifact_revision
+    with pytest.raises(sqlite3.IntegrityError, match="NOT NULL constraint failed"):
+        with db_store.get_db_connection(temp_db) as conn:
+            conn.execute("""
+                INSERT INTO qa_runs (qa_run_id, session_id, artifact_revision, validation_status, checks_json, errors_json, created_at)
+                VALUES (?, ?, ?, 'passed', '{}', '[]', 1000.0);
+            """, ("run_raw_no_rev", sess_id, None))
+            conn.commit()
+
+    # 3. If a QA run row in persistence has malformed non-hash revision, update_qa_finding_status fails closed
+    with db_store.get_db_connection(temp_db) as conn:
+        conn.execute("""
+            INSERT INTO qa_runs (qa_run_id, session_id, artifact_revision, validation_status, checks_json, errors_json, created_at)
+            VALUES (?, ?, ?, 'passed', '{}', '[]', 1000.0);
+        """, ("run_raw_malformed_rev", sess_id, "malformed-short-hash"))
+        conn.commit()
+
+    fid = db_store.record_qa_finding(
+        session_id=sess_id, task_id=None, qa_run_id="run_init", severity="high",
+        category="syntax", artifact_name="index.html", evidence="Syntax error",
+        status="open", artifact_revision=rev, db_path=temp_db
+    )
+    ok, err = db_store.update_qa_finding_status(
+        finding_id=fid, status="verified_resolved", verified_by_agent="qa-eng",
+        artifact_revision=rev, qa_run_id="run_raw_malformed_rev", db_path=temp_db
+    )
+    assert ok is False
+    assert "artifact_revision" in err.lower()
+    assert db_store.get_qa_finding(fid, db_path=temp_db)["status"] == "open"
+
+
+def test_qa_trust_13_qa_run_deleted_before_gate_evaluation_fails_closed(temp_db):
+    """If a QA run is deleted from DB before release-gate evaluation, the gate fails closed."""
+    sess_id = db_store.create_session("Trust13", "Task", db_path=temp_db)
+    cand = _make_candidate_files()
+    rev = compute_artifact_revision(cand)
+
+    rep = run_qa_checks(cand["index.html"], cand["style.css"], cand["script.js"], session_id=sess_id, db_path=temp_db)
+    assert rep["passed"] is True
+    valid_run_id = rep["qa_run_id"]
+
+    fid = db_store.record_qa_finding(
+        session_id=sess_id, task_id=None, qa_run_id=valid_run_id, severity="high",
+        category="syntax", artifact_name="index.html", evidence="Syntax error",
+        status="open", artifact_revision=rev, db_path=temp_db
+    )
+    ok, _ = db_store.update_qa_finding_status(
+        finding_id=fid, status="verified_resolved", verified_by_agent="qa-eng",
+        artifact_revision=rev, qa_run_id=valid_run_id, db_path=temp_db
+    )
+    assert ok is True
+
+    # Delete the QA run from SQLite to simulate unavailable persistence record
+    with db_store.get_db_connection(temp_db) as conn:
+        conn.execute("DELETE FROM qa_runs WHERE qa_run_id = ?;", (valid_run_id,))
+        conn.commit()
+
+    res = evaluate_release_gate(sess_id, candidate_files=cand, artifact_manifest=rep["manifest"], db_path=temp_db)
+    assert res["allowed"] is False
+    assert res["status"] == "blocked"
+    assert any("does not exist in authoritative persistence layer" in r or "references nonexistent or unpersisted" in r for r in res["reasons"])
+
+
+def test_qa_trust_14_reuse_qa_evidence_from_unrelated_session_fails_closed(temp_db):
+    """Attempt to reuse QA evidence from an unrelated session in release gate fails closed."""
+    sess_a = db_store.create_session("Trust14 Session A", "Task", db_path=temp_db)
+    sess_b = db_store.create_session("Trust14 Session B", "Task", db_path=temp_db)
+    cand = _make_candidate_files()
+
+    rep_a = run_qa_checks(cand["index.html"], cand["style.css"], cand["script.js"], session_id=sess_a, db_path=temp_db)
+    assert rep_a["passed"] is True
+
+    # Attempt to use Session A's certified manifest in Session B's release evaluation
+    res = evaluate_release_gate(sess_b, candidate_files=cand, artifact_manifest=rep_a["manifest"], db_path=temp_db)
+    assert res["allowed"] is False
+    assert res["status"] == "blocked"
+    assert any("belongs to session" in r for r in res["reasons"])
+
+
+def test_qa_trust_15_verified_finding_missing_or_corrupt_history_fails_closed(temp_db):
+    """A verified finding with missing or corrupted verification history fails closed in release gate."""
+    sess_id = db_store.create_session("Trust15", "Task", db_path=temp_db)
+    cand = _make_candidate_files()
+    rev = compute_artifact_revision(cand)
+
+    rep = run_qa_checks(cand["index.html"], cand["style.css"], cand["script.js"], session_id=sess_id, db_path=temp_db)
+    assert rep["passed"] is True
+
+    # Insert finding with empty verification history
+    with db_store.get_db_connection(temp_db) as conn:
+        conn.execute("""
+            INSERT INTO qa_findings (
+                finding_id, session_id, task_id, qa_run_id, severity, category,
+                artifact_name, evidence, responsible_agent_id, status,
+                verification_history_json, artifact_revision, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """, (
+            "fnd_no_history", sess_id, None, rep["qa_run_id"], "high", "syntax",
+            "index.html", "Issue", "dev", "verified_resolved",
+            "[]", rev, 1000, 1000
+        ))
+        conn.commit()
+
+    res = evaluate_release_gate(sess_id, candidate_files=cand, artifact_manifest=rep["manifest"], db_path=temp_db)
+    assert res["allowed"] is False
+    assert any("missing verification history record" in r for r in res["reasons"])
+
+
+def test_qa_trust_16_failed_qa_run_followed_by_attempted_resolution_fails_closed(temp_db):
+    """A failed QA run followed by an attempted resolution using the failed run's ID fails closed."""
+    sess_id = db_store.create_session("Trust16", "Task", db_path=temp_db)
+    bad_html = "<html><body>Missing doctype and broken tags"
+    cand = {"index.html": bad_html, "style.css": VALID_CSS, "script.js": VALID_JS}
+    rev = compute_artifact_revision(cand)
+
+    rep = run_qa_checks(cand["index.html"], cand["style.css"], cand["script.js"], session_id=sess_id, db_path=temp_db)
+    assert rep["passed"] is False
+    failed_run_id = rep["qa_run_id"]
+
+    # Verify qa_run recorded with status failed
+    qa_run_record = db_store.get_qa_run(failed_run_id, db_path=temp_db)
+    assert qa_run_record is not None
+    assert qa_run_record["validation_status"] == "failed"
+
+    # Attempt resolution with this failed run's ID
+    fid = rep["recorded_finding_ids"][0]
+    ok, err = db_store.update_qa_finding_status(
+        finding_id=fid, status="verified_resolved", verified_by_agent="qa-eng",
+        artifact_revision=rev, qa_run_id=failed_run_id, db_path=temp_db
+    )
+    assert ok is False
+    assert "failed or incomplete" in err
+    assert db_store.get_qa_finding(fid, db_path=temp_db)["status"] == "open"
+
+
+def test_qa_trust_17_api_rejects_missing_or_whitespace_qa_run_id(test_client, temp_db):
+    """API endpoint rejects verified_resolved when qa_run_id is missing or whitespace."""
+    sess_id = db_store.create_session("Trust17", "Task", db_path=temp_db)
+    cand = _make_candidate_files()
+    rev = compute_artifact_revision(cand)
+    fid = db_store.record_qa_finding(
+        session_id=sess_id, task_id=None, qa_run_id="run_init", severity="high",
+        category="syntax", artifact_name="index.html", evidence="Issue",
+        status="open", artifact_revision=rev, db_path=temp_db
+    )
+    for bad_id in [None, "", "   "]:
+        payload = {"status": "verified_resolved", "agent_id": "qa-eng", "artifact_revision": rev}
+        if bad_id is not None:
+            payload["qa_run_id"] = bad_id
+        resp = test_client.post(
+            f"/api/qa_findings/{fid}/status",
+            headers={"Origin": "http://127.0.0.1:8080"},
+            json=payload
+        )
+        assert resp.status_code == 400
+        assert "qa_run_id is required" in resp.get_json()["error"]
+        assert db_store.get_qa_finding(fid, db_path=temp_db)["status"] == "open"
+
+
+def test_qa_trust_18_positive_legitimate_persisted_successful_qa_run_resolves_and_passes_gate(temp_db):
+    """Positive: legitimate persisted successful QA run resolves finding and passes release gate."""
+    sess_id = db_store.create_session("Trust18", "Task", db_path=temp_db)
+    cand = _make_candidate_files()
+    rev = compute_artifact_revision(cand)
+
+    fid = db_store.record_qa_finding(
+        session_id=sess_id, task_id=None, qa_run_id="run_old", severity="high",
+        category="syntax", artifact_name="index.html", evidence="Old issue",
+        status="open", artifact_revision=rev, db_path=temp_db
+    )
+
+    # Run QA checks which pass and automatically resolve fid
+    rep = run_qa_checks(
+        cand["index.html"], cand["style.css"], cand["script.js"],
+        session_id=sess_id, verified_finding_ids=[fid], db_path=temp_db
+    )
+    assert rep["passed"] is True
+    assert fid in rep["resolved_findings"]
+    f = db_store.get_qa_finding(fid, db_path=temp_db)
+    assert f["status"] == "verified_resolved"
+    assert len(f["verification_history"]) == 1
+    assert f["verification_history"][0]["qa_run_id"] == rep["qa_run_id"]
+    assert f["verification_history"][0]["artifact_revision"] == rev
+
+    # Evaluate release gate
+    res = evaluate_release_gate(sess_id, candidate_files=cand, artifact_manifest=rep["manifest"], db_path=temp_db)
+    assert res["allowed"] is True
+    assert res["status"] == "passed"
+    assert res["blocking_findings_count"] == 0
+    assert res["reasons"] == []
+
+
+def test_qa_trust_19_positive_non_resolution_status_transitions_work_normally(temp_db):
+    """Positive: non-resolution status transitions (remediated, accepted, open) work without qa_run_id."""
+    sess_id = db_store.create_session("Trust19", "Task", db_path=temp_db)
+    cand = _make_candidate_files()
+    rev = compute_artifact_revision(cand)
+
+    fid = db_store.record_qa_finding(
+        session_id=sess_id, task_id=None, qa_run_id="run_init", severity="medium",
+        category="syntax", artifact_name="index.html", evidence="Minor issue",
+        status="open", artifact_revision=rev, db_path=temp_db
+    )
+
+    # Transition to remediated without qa_run_id
+    ok, err = db_store.update_qa_finding_status(
+        finding_id=fid, status="remediated", verified_by_agent="dev-agent",
+        note="Code patched by dev", db_path=temp_db
+    )
+    assert ok is True
+    assert db_store.get_qa_finding(fid, db_path=temp_db)["status"] == "remediated"
+
+    # Transition to accepted without qa_run_id
+    ok, err = db_store.update_qa_finding_status(
+        finding_id=fid, status="accepted", verified_by_agent="lead-agent",
+        note="Accepted technical debt", db_path=temp_db
+    )
+    assert ok is True
+    assert db_store.get_qa_finding(fid, db_path=temp_db)["status"] == "accepted"
+
+    # Transition back to open
+    ok, err = db_store.update_qa_finding_status(
+        finding_id=fid, status="open", verified_by_agent="lead-agent",
+        note="Reopened", db_path=temp_db
+    )
+    assert ok is True
+    assert db_store.get_qa_finding(fid, db_path=temp_db)["status"] == "open"
+
+
+def test_qa_trust_20_positive_idempotent_resolution_with_same_valid_qa_evidence(temp_db):
+    """Positive: repeating verified_resolved with same valid QA evidence succeeds idempotently."""
+    sess_id = db_store.create_session("Trust20", "Task", db_path=temp_db)
+    cand = _make_candidate_files()
+    rev = compute_artifact_revision(cand)
+
+    rep = run_qa_checks(cand["index.html"], cand["style.css"], cand["script.js"], session_id=sess_id, db_path=temp_db)
+    assert rep["passed"] is True
+    valid_run_id = rep["qa_run_id"]
+
+    fid = db_store.record_qa_finding(
+        session_id=sess_id, task_id=None, qa_run_id=valid_run_id, severity="high",
+        category="syntax", artifact_name="index.html", evidence="Syntax error",
+        status="open", artifact_revision=rev, db_path=temp_db
+    )
+
+    # First resolution
+    ok1, _ = db_store.update_qa_finding_status(
+        finding_id=fid, status="verified_resolved", verified_by_agent="qa-eng",
+        artifact_revision=rev, qa_run_id=valid_run_id, db_path=temp_db
+    )
+    assert ok1 is True
+    f1 = db_store.get_qa_finding(fid, db_path=temp_db)
+    assert len(f1["verification_history"]) == 1
+
+    # Second resolution with exact same valid evidence -> idempotent, history not duplicated
+    ok2, _ = db_store.update_qa_finding_status(
+        finding_id=fid, status="verified_resolved", verified_by_agent="qa-eng",
+        artifact_revision=rev, qa_run_id=valid_run_id, db_path=temp_db
+    )
+    assert ok2 is True
+    f2 = db_store.get_qa_finding(fid, db_path=temp_db)
+    assert len(f2["verification_history"]) == 1

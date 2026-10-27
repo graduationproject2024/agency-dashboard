@@ -2837,6 +2837,9 @@ def evaluate_release_gate(
                 else:
                     latest_res = resolved_entries[-1]
                     res_rev = latest_res.get("artifact_revision")
+                    res_run_id = latest_res.get("qa_run_id")
+
+                    # 1. Revision format and match check on resolution record
                     if not res_rev or not db_store.is_valid_artifact_revision(res_rev):
                         reasons.append(
                             f"Resolution record for finding '{fid}' has missing, empty, or malformed artifact_revision and fails closed"
@@ -2850,6 +2853,74 @@ def evaluate_release_gate(
                         )
                         if sev in ("critical", "high"):
                             unresolved_blocking.append(f)
+
+                    # 2. Mandatory trusted QA certification evidence: valid non-empty qa_run_id
+                    if not res_run_id or not str(res_run_id).strip():
+                        reasons.append(
+                            f"Resolution record for finding '{fid}' has missing, empty, or whitespace qa_run_id and fails closed (untrusted resolution evidence)"
+                        )
+                        if sev in ("critical", "high"):
+                            unresolved_blocking.append(f)
+                    else:
+                        clean_res_run_id = str(res_run_id).strip()
+                        res_qa_run = db_store.get_qa_run(clean_res_run_id, db_path=db_path)
+                        if not res_qa_run:
+                            reasons.append(
+                                f"Resolution record for finding '{fid}' references nonexistent or unpersisted qa_run_id '{clean_res_run_id}'"
+                            )
+                            if sev in ("critical", "high"):
+                                unresolved_blocking.append(f)
+                        else:
+                            # 2a. Validation status must be terminal 'passed'
+                            if res_qa_run.get("validation_status") != "passed":
+                                reasons.append(
+                                    f"Resolution record for finding '{fid}' references failed or incomplete QA run '{clean_res_run_id}' "
+                                    f"(status '{res_qa_run.get('validation_status')}')"
+                                )
+                                if sev in ("critical", "high"):
+                                    unresolved_blocking.append(f)
+
+                            # 2b. Session scope must match release session and finding session
+                            qa_sess = res_qa_run.get("session_id")
+                            if qa_sess != session_id:
+                                reasons.append(
+                                    f"Resolution record for finding '{fid}' references QA run '{clean_res_run_id}' from another session "
+                                    f"('{qa_sess}' vs '{session_id}')"
+                                )
+                                if sev in ("critical", "high"):
+                                    unresolved_blocking.append(f)
+
+                            qa_task = res_qa_run.get("task_id")
+                            f_task = f.get("task_id")
+                            if f_task and qa_task and f_task != qa_task:
+                                reasons.append(
+                                    f"Resolution record for finding '{fid}' references QA run '{clean_res_run_id}' from another task "
+                                    f"('{qa_task}' vs '{f_task}')"
+                                )
+                                if sev in ("critical", "high"):
+                                    unresolved_blocking.append(f)
+
+                            # 2c. QA run revision must match candidate revision and resolution record revision
+                            qa_run_rev = res_qa_run.get("artifact_revision")
+                            if not qa_run_rev or not db_store.is_valid_artifact_revision(qa_run_rev):
+                                reasons.append(
+                                    f"QA run '{clean_res_run_id}' referenced by finding '{fid}' has missing, empty, or malformed artifact revision"
+                                )
+                                if sev in ("critical", "high"):
+                                    unresolved_blocking.append(f)
+                            elif qa_run_rev.strip().lower() != candidate_rev_hash.strip().lower():
+                                reasons.append(
+                                    f"QA run '{clean_res_run_id}' referenced by finding '{fid}' certified revision '{qa_run_rev[:10]}...', "
+                                    f"which does not match candidate revision '{candidate_rev_hash[:10]}...'"
+                                )
+                                if sev in ("critical", "high"):
+                                    unresolved_blocking.append(f)
+                            elif res_rev and qa_run_rev.strip().lower() != res_rev.strip().lower():
+                                reasons.append(
+                                    f"Resolution record revision '{res_rev[:10]}...' does not match referenced QA run revision '{qa_run_rev[:10]}...'"
+                                )
+                                if sev in ("critical", "high"):
+                                    unresolved_blocking.append(f)
             elif st == "accepted":
                 pass
             else:
@@ -4781,6 +4852,13 @@ def update_qa_finding_status_endpoint(finding_id):
     note = data.get("note", "")
     artifact_revision = data.get("artifact_revision")
     qa_run_id = data.get("qa_run_id")
+
+    if new_status == "verified_resolved":
+        if not qa_run_id or not str(qa_run_id).strip():
+            return jsonify({"error": "qa_run_id is required and cannot be empty for verified_resolved", "finding_id": finding_id}), 400
+        if not artifact_revision or not db_store.is_valid_artifact_revision(artifact_revision):
+            return jsonify({"error": "Valid artifact_revision is required for verified_resolved", "finding_id": finding_id}), 400
+
     ok, err = db_store.update_qa_finding_status(
         finding_id=finding_id,
         status=new_status,

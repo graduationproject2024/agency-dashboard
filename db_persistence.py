@@ -2008,6 +2008,60 @@ def update_qa_finding_status(
                     f"Resolution rejected: resolution revision '{artifact_revision}' does not match finding artifact_revision '{f_rev}'"
                 )
 
+            # 5. Mandatory trusted QA certification evidence: valid non-empty qa_run_id
+            if not qa_run_id or not str(qa_run_id).strip():
+                return (
+                    False,
+                    f"Resolution rejected: resolution requires a valid, non-empty qa_run_id, got '{qa_run_id}'"
+                )
+            clean_qa_run_id = str(qa_run_id).strip()
+
+            # 6. Authoritative persistence lookup
+            qa_run_row = conn.execute("SELECT * FROM qa_runs WHERE qa_run_id = ?;", (clean_qa_run_id,)).fetchone()
+            if not qa_run_row:
+                return (
+                    False,
+                    f"Resolution rejected: qa_run_id '{clean_qa_run_id}' does not exist in authoritative persistence layer"
+                )
+            qa_run = dict(qa_run_row)
+
+            # 7. Authoritative validation status must be terminal 'passed'
+            if qa_run.get("validation_status") != "passed":
+                return (
+                    False,
+                    f"Resolution rejected: referenced qa_run '{clean_qa_run_id}' failed or incomplete (status: '{qa_run.get('validation_status')}')"
+                )
+
+            # 8. Scope check: session_id must match finding's session
+            f_sess = finding.get("session_id")
+            if not f_sess or qa_run.get("session_id") != f_sess:
+                return (
+                    False,
+                    f"Resolution rejected: referenced qa_run '{clean_qa_run_id}' belongs to session '{qa_run.get('session_id')}', but finding belongs to '{f_sess}'"
+                )
+
+            # 8b. Workflow/task scope check: if finding has task_id and qa_run has task_id, they must match
+            f_task = finding.get("task_id")
+            qa_task = qa_run.get("task_id")
+            if f_task and qa_task and f_task != qa_task:
+                return (
+                    False,
+                    f"Resolution rejected: referenced qa_run '{clean_qa_run_id}' belongs to task '{qa_task}', but finding belongs to '{f_task}'"
+                )
+
+            # 9. Artifact revision of the QA run must match resolution revision
+            qa_run_rev = qa_run.get("artifact_revision")
+            if not qa_run_rev or not is_valid_artifact_revision(qa_run_rev):
+                return (
+                    False,
+                    f"Resolution rejected: referenced qa_run '{clean_qa_run_id}' has missing, empty, or malformed artifact_revision ('{qa_run_rev}')"
+                )
+            if qa_run_rev.strip().lower() != artifact_revision.strip().lower():
+                return (
+                    False,
+                    f"Resolution rejected: referenced qa_run '{clean_qa_run_id}' verified revision '{qa_run_rev[:10]}...', which does not match resolution revision '{artifact_revision[:10]}...'"
+                )
+
         # Idempotent state transition guard: preserve audit integrity on repeat runs
         if finding.get("status") == eff_status:
             return (True, "")
@@ -2021,8 +2075,7 @@ def update_qa_finding_status(
         }
         if eff_status == "verified_resolved":
             history_entry["artifact_revision"] = artifact_revision.strip().lower()
-            if qa_run_id:
-                history_entry["qa_run_id"] = str(qa_run_id).strip()
+            history_entry["qa_run_id"] = clean_qa_run_id
         history.append(history_entry)
         history_json = json.dumps(history, ensure_ascii=False)
 
