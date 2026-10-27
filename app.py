@@ -1298,7 +1298,10 @@ def record_token_usage(agent_name, dept_name, task_name, tokens_count, source="p
     with budget_lock:
         budget = load_budget()
         try:
-            tokens_count = max(int(tokens_count or 0), 0)
+            if isinstance(tokens_count, bool):
+                tokens_count = 0
+            else:
+                tokens_count = max(0, int(tokens_count or 0))
         except (ValueError, TypeError):
             tokens_count = 0
         budget["tokens_used"] = budget.get("tokens_used", 0) + tokens_count
@@ -3502,11 +3505,9 @@ def manual_run_adjustment_endpoint(run_id):
         return jsonify({"error": "Missing required field 'adjusted_tokens'"}), 400
 
     try:
-        adjusted_tokens = int(adjusted_tokens_raw)
-        if not is_incremental and adjusted_tokens < 0:
-            return jsonify({"error": "'adjusted_tokens' must be non-negative"}), 400
-    except (ValueError, TypeError):
-        return jsonify({"error": "'adjusted_tokens' must be an integer"}), 400
+        adjusted_tokens = db_store.validate_token_count(adjusted_tokens_raw, field_name="adjusted_tokens", allow_negative=is_incremental)
+    except (ValueError, TypeError) as val_err:
+        return jsonify({"error": f"Invalid 'adjusted_tokens': {val_err}"}), 400
 
     if not reason:
         return jsonify({"error": "Missing required non-empty field 'reason'"}), 400
@@ -3515,11 +3516,9 @@ def manual_run_adjustment_endpoint(run_id):
 
     if cost is not None:
         try:
-            cost = float(cost)
-            if not is_incremental and cost < 0.0:
-                return jsonify({"error": "'cost' cannot be negative"}), 400
-        except (ValueError, TypeError):
-            return jsonify({"error": "'cost' must be a valid number"}), 400
+            cost = db_store.validate_financial_numeric(cost, field_name="cost", allow_none=False, allow_negative=is_incremental)
+        except (ValueError, TypeError) as cost_err:
+            return jsonify({"error": f"Invalid 'cost': {cost_err}"}), 400
 
     try:
         res = db_store.apply_manual_run_adjustment(
@@ -3540,7 +3539,9 @@ def manual_run_adjustment_endpoint(run_id):
     except db_store.IdempotencyConflictError as idemp_err:
         return jsonify({"error": str(idemp_err)}), 409
     except db_store.IdempotencyInProgressError as in_prog_err:
-        return jsonify({"error": str(in_prog_err)}), 409
+        return jsonify({"error": str(in_prog_err), "in_progress": True}), 409
+    except db_store.ConcurrencyConflictError as conc_err:
+        return jsonify({"error": str(conc_err)}), 409
     except LookupError as lk_err:
         return jsonify({"error": str(lk_err)}), 404
     except ValueError as val_err:

@@ -326,7 +326,7 @@ jobs:
         run: |
           python -m pytest tests/test_adversarial_paths.py tests/test_agent_security_and_divisions.py tests/test_csrf_origin_policy.py -v --tb=short
 
-      - name: Run Phase 2.5 and Phase 2.6 production reliability & reconciliation suites on Windows
+      - name: Run Phase 2.5, Phase 2.6, and Phase 2.7 production reliability, financial integrity & crash recovery suites on Windows
         run: |
-          python -m pytest tests/test_phase_2_4_h_independent_acceptance.py tests/test_phase_2_4_k_production_recovery_and_accounting.py tests/test_phase_2_5_reconciliation_and_billing_integrity.py tests/test_phase_2_6_production_readiness_remediation.py -v --tb=short
+          python -m pytest tests/test_phase_2_4_h_independent_acceptance.py tests/test_phase_2_4_k_production_recovery_and_accounting.py tests/test_phase_2_5_reconciliation_and_billing_integrity.py tests/test_phase_2_6_production_readiness_remediation.py tests/test_phase_2_7_financial_integrity_and_crash_recovery.py -v --tb=short
 

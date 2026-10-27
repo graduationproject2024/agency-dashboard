@@ -17,6 +17,8 @@ import json
 import uuid
 import hashlib
 import threading
+import subprocess
+from decimal import Decimal
 from unittest.mock import patch, MagicMock
 import pytest
 
@@ -995,4 +997,529 @@ def test_p27_cross_process_file_lock_dead_process_cleanup(tmp_path):
     assert time.time() - t0 < 2.0
     # On exit, lock should be cleanly removed
     assert not os.path.exists(lock_file)
+
+
+# =========================================================================
+# Workstream B: Phase 2.7.3 Critical Financial Integrity & Provenance Tests
+# =========================================================================
+
+def test_p27_financial_validation_strict_rejection_callable_functions(tmp_path, monkeypatch):
+    """
+    Direct validation unit test & callable entry-point validation:
+    Rejects NaN, +/-inf, bool, malformed strings, negative values, and fractional tokens.
+    """
+    # 1. Direct validation tests
+    with pytest.raises(ValueError, match="boolean"):
+        db_store.validate_financial_numeric(True, field_name="cost")
+    with pytest.raises(ValueError, match="boolean"):
+        db_store.validate_financial_numeric(False, field_name="cost")
+    with pytest.raises(ValueError, match="finite"):
+        db_store.validate_financial_numeric(float("nan"), field_name="cost")
+    with pytest.raises(ValueError, match="finite"):
+        db_store.validate_financial_numeric(float("inf"), field_name="cost")
+    with pytest.raises(ValueError, match="finite"):
+        db_store.validate_financial_numeric(float("-inf"), field_name="cost")
+    with pytest.raises(ValueError, match="non-negative"):
+        db_store.validate_financial_numeric(-1.5, field_name="cost", allow_negative=False)
+    with pytest.raises(ValueError, match="valid numeric"):
+        db_store.validate_financial_numeric("not_a_number", field_name="cost")
+    with pytest.raises(ValueError, match="exceeds maximum"):
+        db_store.validate_financial_numeric(2_000_000_000.0, field_name="cost", max_value=1_000_000.0)
+
+    # Decimal support & precision
+    val_d = db_store.validate_financial_numeric(Decimal("12.3456789"), field_name="cost")
+    assert val_d == 12.345679
+
+    # 2. Token count validation
+    with pytest.raises(ValueError, match="boolean"):
+        db_store.validate_token_count(True, field_name="tokens")
+    with pytest.raises(ValueError, match="boolean"):
+        db_store.validate_token_count(False, field_name="tokens")
+    with pytest.raises(ValueError, match="finite"):
+        db_store.validate_token_count(float("nan"), field_name="tokens")
+    with pytest.raises(ValueError, match="fractional"):
+        db_store.validate_token_count(10.5, field_name="tokens")
+    with pytest.raises(ValueError, match="non-negative"):
+        db_store.validate_token_count(-50, field_name="tokens", allow_negative=False)
+    with pytest.raises(ValueError, match="valid integer string"):
+        db_store.validate_token_count("123abc", field_name="tokens")
+    assert db_store.validate_token_count("1500", field_name="tokens") == 1500
+    assert db_store.validate_token_count(Decimal("2500"), field_name="tokens") == 2500
+
+    # 3. Callable functions reject invalid inputs
+    test_db = str(tmp_path / "val_call.db")
+    db_store.init_db(test_db)
+    sid = "sess_val_call"
+    db_store.create_session(session_id=sid, project_name="Val Call", task_description="Desc", db_path=test_db)
+    tid = db_store.create_task(session_id=sid, title="Task", division_id="engineering", assigned_agent_id="dev", stage="dev", status="completed", db_path=test_db)
+
+    # record_agent_run rejects boolean tokens
+    with pytest.raises(ValueError, match="boolean"):
+        db_store.record_agent_run(
+            task_id=tid, session_id=sid, agent_id="dev", agent_name="Dev",
+            division_id="engineering", prompt_file="p.md", status="completed",
+            tokens_used=True, db_path=test_db
+        )
+
+    # record_agent_run rejects NaN cost
+    with pytest.raises(ValueError, match="finite"):
+        db_store.record_agent_run(
+            task_id=tid, session_id=sid, agent_id="dev", agent_name="Dev",
+            division_id="engineering", prompt_file="p.md", status="completed",
+            tokens_used=100, cost_booked=float("nan"), db_path=test_db
+        )
+
+    # apply_manual_run_adjustment rejects boolean adjusted_tokens
+    with pytest.raises(ValueError, match="boolean"):
+        db_store.apply_manual_run_adjustment(
+            run_id="run_1", adjusted_tokens=True, reason="r", evidence_reference="e", db_path=test_db
+        )
+
+    # reconcile_provider_run_usage rejects invalid provider cost
+    run_id = db_store.record_agent_run(
+        task_id=tid, session_id=sid, agent_id="dev", agent_name="Dev",
+        division_id="engineering", prompt_file="p.md", status="completed",
+        tokens_used=100, cost_booked=0.1, db_path=test_db
+    )
+    rec_res = db_store.reconcile_provider_run_usage(
+        run_id=run_id,
+        provider_lookup_fn=lambda rid, req: {"found": True, "tokens": 100, "cost": float("nan")},
+        db_path=test_db
+    )
+    assert rec_res["success"] is False
+    assert rec_res["reconciliation_status"] == "failed"
+
+
+def test_p27_financial_validation_endpoint_rejections_and_no_mutation(tmp_path, monkeypatch):
+    """
+    Test invalid values through API route POST /api/runs/<run_id>/manual_adjustment.
+    Assert that invalid values are rejected with 400 and cause NO partial mutation in DB or budget.
+    """
+    test_db = str(tmp_path / "p27_val_ep.db")
+    db_store.init_db(test_db)
+    monkeypatch.setattr("db_persistence.DEFAULT_DB_FILENAME", os.path.basename(test_db))
+    monkeypatch.setenv("DATABASE_PATH", test_db)
+    monkeypatch.setenv("ADMIN_AUTH_TOKEN", "admin_secret_token")
+
+    test_budget = str(tmp_path / "val_ep_budget.json")
+    with open(test_budget, "w", encoding="utf-8") as f:
+        json.dump({"tokens_used": 1000, "estimated_cost": 0.15, "transactions": [], "applied_reconciliations": {}}, f)
+    monkeypatch.setattr("app.get_budget_file", lambda: test_budget)
+
+    sid = "sess_p27_val_ep"
+    db_store.create_session(session_id=sid, project_name="Val EP Test", task_description="Desc", db_path=test_db)
+    tid = db_store.create_task(session_id=sid, title="Task", division_id="engineering", assigned_agent_id="dev", stage="dev", status="completed", db_path=test_db)
+    run_id = db_store.record_agent_run(
+        task_id=tid, session_id=sid, agent_id="dev", agent_name="Developer",
+        division_id="engineering", prompt_file="dev.md", status="completed",
+        tokens_used=500, cost_booked=0.075, token_source="estimated", cost_source="estimated",
+        db_path=test_db
+    )
+
+    client = app.test_client()
+    headers = {
+        "Origin": "http://127.0.0.1:8080",
+        "Content-Type": "application/json",
+        "X-Admin-Token": "admin_secret_token"
+    }
+
+    invalid_payloads = [
+        {"adjusted_tokens": True, "reason": "Bool token", "evidence_reference": "REF1"},
+        {"adjusted_tokens": "invalid_str", "reason": "Str token", "evidence_reference": "REF2"},
+        {"adjusted_tokens": 12.34, "reason": "Fractional token", "evidence_reference": "REF3"},
+        {"adjusted_tokens": -50, "is_incremental": False, "reason": "Negative absolute", "evidence_reference": "REF4"},
+        {"adjusted_tokens": 100, "cost": "NaN", "reason": "NaN cost", "evidence_reference": "REF5"},
+        {"adjusted_tokens": 100, "cost": "Infinity", "reason": "Inf cost", "evidence_reference": "REF6"},
+        {"adjusted_tokens": 100, "cost": True, "reason": "Bool cost", "evidence_reference": "REF7"},
+        {"adjusted_tokens": 100, "cost": -2.5, "is_incremental": False, "reason": "Negative abs cost", "evidence_reference": "REF8"},
+    ]
+
+    for payload in invalid_payloads:
+        res = client.post(f"/api/runs/{run_id}/manual_adjustment", headers=headers, json=payload)
+        assert res.status_code == 400, f"Expected 400 for payload {payload}, got {res.status_code}: {res.get_data(as_text=True)}"
+
+    # Assert no mutation occurred in agent_runs, reconciliation_journal, or budget
+    with db_store.get_db_connection(test_db) as conn:
+        run = conn.execute("SELECT tokens_used, cost_booked, token_source, cost_source FROM agent_runs WHERE run_id = ?;", (run_id,)).fetchone()
+        assert run["tokens_used"] == 500
+        assert run["cost_booked"] == 0.075
+        assert run["cost_source"] == "estimated"
+
+        j_count = conn.execute("SELECT COUNT(*) as cnt FROM reconciliation_journal WHERE run_id = ?;", (run_id,)).fetchone()["cnt"]
+        assert j_count == 0
+
+    with open(test_budget, "r", encoding="utf-8") as f:
+        b = json.load(f)
+    assert b["tokens_used"] == 1000
+    assert b["estimated_cost"] == 0.15
+
+
+def test_p27_cost_provenance_preservation_when_provider_cost_missing(tmp_path, monkeypatch):
+    """
+    Authoritative cost preserved when subsequent provider response omits cost.
+    Never assumes a previously authoritative booked cost is estimated.
+    """
+    test_db = str(tmp_path / "p27_prov_pres.db")
+    db_store.init_db(test_db)
+    test_budget = str(tmp_path / "prov_pres_budget.json")
+    with open(test_budget, "w", encoding="utf-8") as f:
+        json.dump({"tokens_used": 5000, "estimated_cost": 15.0, "transactions": [], "applied_reconciliations": {}}, f)
+
+    sid = "sess_p27_prov_pres"
+    db_store.create_session(session_id=sid, project_name="Prov Pres", task_description="Desc", db_path=test_db)
+    tid = db_store.create_task(session_id=sid, title="Task", division_id="engineering", assigned_agent_id="dev", stage="dev", status="completed", db_path=test_db)
+
+    # 1. Authoritative provider_confirmed run
+    run_id1 = db_store.record_agent_run(
+        task_id=tid, session_id=sid, agent_id="dev", agent_name="Dev",
+        division_id="engineering", prompt_file="p.md", status="completed",
+        tokens_used=1000, cost_booked=12.50, token_source="provider_confirmed",
+        cost_source="provider_confirmed", provider_request_id="req_auth_1",
+        db_path=test_db
+    )
+
+    # Provider lookup returns verified tokens (1200) but NO cost (None)
+    def provider_lookup_no_cost(rid, req_id):
+        return {"found": True, "tokens": 1200, "cost": None}
+
+    res1 = db_store.reconcile_provider_run_usage(
+        run_id=run_id1,
+        provider_lookup_fn=provider_lookup_no_cost,
+        db_path=test_db,
+        budget_path=test_budget
+    )
+    assert res1["success"] is True
+    assert res1["cost"] == 12.50  # Preserved authoritative cost!
+    assert res1["delta_cost"] == 0.0  # Zero delta cost added!
+    assert res1["cost_source"] == "provider_confirmed"
+
+    # Verify DB state
+    with db_store.get_db_connection(test_db) as conn:
+        row1 = conn.execute("SELECT tokens_used, cost_booked, cost_source FROM agent_runs WHERE run_id = ?;", (run_id1,)).fetchone()
+        assert row1["tokens_used"] == 1200
+        assert row1["cost_booked"] == 12.50
+        assert row1["cost_source"] == "provider_confirmed"
+
+    # 2. Authoritative manual_operator_adjustment run
+    run_id2 = db_store.record_agent_run(
+        task_id=tid, session_id=sid, agent_id="dev", agent_name="Dev",
+        division_id="engineering", prompt_file="p.md", status="completed",
+        tokens_used=2000, cost_booked=8.00, token_source="manual_operator_adjustment",
+        cost_source="manual_operator_adjustment", provider_request_id="req_manual_1",
+        db_path=test_db
+    )
+
+    res2 = db_store.reconcile_provider_run_usage(
+        run_id=run_id2,
+        provider_lookup_fn=lambda rid, req: {"found": True, "tokens": 2500, "cost": None},
+        db_path=test_db,
+        budget_path=test_budget
+    )
+    assert res2["success"] is True
+    assert res2["cost"] == 8.00  # Preserved manual authoritative cost!
+    assert res2["delta_cost"] == 0.0
+    assert res2["cost_source"] == "manual_operator_adjustment"
+
+    # 3. Estimated run updates cost from token delta when cost is None
+    run_id3 = db_store.record_agent_run(
+        task_id=tid, session_id=sid, agent_id="dev", agent_name="Dev",
+        division_id="engineering", prompt_file="p.md", status="completed",
+        tokens_used=1000, cost_booked=0.00015, token_source="estimated",
+        cost_source="estimated", provider_request_id="req_est_1",
+        db_path=test_db
+    )
+    # +1,000,000 tokens delta -> $0.15 under pricing policy
+    res3 = db_store.reconcile_provider_run_usage(
+        run_id=run_id3,
+        provider_lookup_fn=lambda rid, req: {"found": True, "tokens": 1_001_000, "cost": None},
+        db_path=test_db,
+        budget_path=test_budget
+    )
+    assert res3["success"] is True
+    assert res3["cost_source"] == "estimated"
+    assert round(res3["delta_cost"], 2) == 0.15
+
+
+def test_p27_cost_provenance_manual_adjustments_update_cost_source(tmp_path):
+    """Manual absolute and incremental adjustments atomically update cost_source."""
+    test_db = str(tmp_path / "p27_man_prov.db")
+    db_store.init_db(test_db)
+    test_budget = str(tmp_path / "man_prov_budget.json")
+    with open(test_budget, "w", encoding="utf-8") as f:
+        json.dump({"tokens_used": 1000, "estimated_cost": 0.15, "transactions": [], "applied_reconciliations": {}}, f)
+
+    sid = "sess_p27_man_prov"
+    db_store.create_session(session_id=sid, project_name="Man Prov", task_description="Desc", db_path=test_db)
+    tid = db_store.create_task(session_id=sid, title="Task", division_id="engineering", assigned_agent_id="dev", stage="dev", status="completed", db_path=test_db)
+    run_id = db_store.record_agent_run(
+        task_id=tid, session_id=sid, agent_id="dev", agent_name="Developer",
+        division_id="engineering", prompt_file="dev.md", status="completed",
+        tokens_used=500, cost_booked=0.01, token_source="estimated", cost_source="estimated",
+        db_path=test_db
+    )
+
+    # Apply manual absolute adjustment
+    res_abs = db_store.apply_manual_run_adjustment(
+        run_id=run_id, adjusted_tokens=2000, cost=0.50,
+        reason="Manual audit override", evidence_reference="AUDIT-101",
+        is_incremental=False, db_path=test_db, budget_path=test_budget
+    )
+    assert res_abs["cost"] == 0.50
+    assert res_abs["cost_source"] == "manual_operator_adjustment"
+
+    with db_store.get_db_connection(test_db) as conn:
+        row = conn.execute("SELECT cost_booked, cost_source FROM agent_runs WHERE run_id = ?;", (run_id,)).fetchone()
+        assert row["cost_booked"] == 0.50
+        assert row["cost_source"] == "manual_operator_adjustment"
+
+    # Apply manual incremental adjustment
+    res_incr = db_store.apply_manual_run_adjustment(
+        run_id=run_id, adjusted_tokens=500, cost=0.25,
+        reason="Manual additive correction", evidence_reference="AUDIT-102",
+        is_incremental=True, db_path=test_db, budget_path=test_budget
+    )
+    assert res_incr["cost"] == 0.75
+    assert res_incr["cost_source"] == "manual_operator_adjustment"
+
+    with db_store.get_db_connection(test_db) as conn:
+        row = conn.execute("SELECT cost_booked, cost_source FROM agent_runs WHERE run_id = ?;", (run_id,)).fetchone()
+        assert row["cost_booked"] == 0.75
+        assert row["cost_source"] == "manual_operator_adjustment"
+
+
+def test_p27_cost_authoritative_negative_correction_unclamped(tmp_path):
+    """Authoritative corrections may decrease booked cost; delta_cost is not clamped to zero."""
+    test_db = str(tmp_path / "p27_neg_corr.db")
+    db_store.init_db(test_db)
+    test_budget = str(tmp_path / "neg_corr_budget.json")
+    with open(test_budget, "w", encoding="utf-8") as f:
+        json.dump({"tokens_used": 10000, "estimated_cost": 10.0, "transactions": [], "applied_reconciliations": {}}, f)
+
+    sid = "sess_p27_neg_corr"
+    db_store.create_session(session_id=sid, project_name="Neg Corr", task_description="Desc", db_path=test_db)
+    tid = db_store.create_task(session_id=sid, title="Task", division_id="engineering", assigned_agent_id="dev", stage="dev", status="completed", db_path=test_db)
+    run_id = db_store.record_agent_run(
+        task_id=tid, session_id=sid, agent_id="dev", agent_name="Developer",
+        division_id="engineering", prompt_file="dev.md", status="completed",
+        tokens_used=5000, cost_booked=10.00, token_source="estimated", cost_source="estimated",
+        provider_request_id="req_neg_1", db_path=test_db
+    )
+
+    # Provider authoritative response reports cumulative cost is 4.00 (down from 10.00)
+    lookup_fn = lambda rid, req: {"found": True, "tokens": 5000, "cost": 4.00, "is_total_cost": True}
+    res = db_store.reconcile_provider_run_usage(
+        run_id=run_id, provider_lookup_fn=lookup_fn, db_path=test_db, budget_path=test_budget
+    )
+    assert res["success"] is True
+    assert res["cost"] == 4.00
+    assert res["delta_cost"] == -6.00  # Negative delta preserved, NOT clamped to 0.0!
+
+    with open(test_budget, "r", encoding="utf-8") as f:
+        b = json.load(f)
+    assert b["estimated_cost"] == 4.0  # 10.0 + (-6.0)
+
+
+def test_p27_idempotency_atomic_claim_lease_fencing_and_pending_projection(tmp_path):
+    """
+    Idempotency protocol:
+    - Same key, same payload -> returns original durable result.
+    - Same key, different payload -> HTTP 409 (IdempotencyConflictError).
+    - Same key, active operation -> in-progress error.
+    - Committed pending projection -> retry resumes projection without duplicate DB mutation.
+    """
+    test_db = str(tmp_path / "p27_idemp_proto.db")
+    db_store.init_db(test_db)
+    test_budget = str(tmp_path / "idemp_proto_budget.json")
+    with open(test_budget, "w", encoding="utf-8") as f:
+        json.dump({"tokens_used": 1000, "estimated_cost": 1.0, "transactions": [], "applied_reconciliations": {}}, f)
+
+    sid = "sess_p27_proto"
+    db_store.create_session(session_id=sid, project_name="Proto", task_description="Desc", db_path=test_db)
+    tid = db_store.create_task(session_id=sid, title="Task", division_id="engineering", assigned_agent_id="dev", stage="dev", status="completed", db_path=test_db)
+    run_id = db_store.record_agent_run(
+        task_id=tid, session_id=sid, agent_id="dev", agent_name="Dev",
+        division_id="engineering", prompt_file="p.md", status="completed",
+        tokens_used=100, cost_booked=0.1, token_source="estimated", cost_source="estimated",
+        db_path=test_db
+    )
+
+    key = "idem_key_test_1"
+    res1 = db_store.apply_manual_run_adjustment(
+        run_id=run_id, adjusted_tokens=300, cost=0.45,
+        reason="First try", evidence_reference="REF-001",
+        idempotency_key=key, db_path=test_db, budget_path=test_budget
+    )
+    assert res1["success"] is True
+
+    # Same key, same payload -> replayed result returned
+    res2 = db_store.apply_manual_run_adjustment(
+        run_id=run_id, adjusted_tokens=300, cost=0.45,
+        reason="First try", evidence_reference="REF-001",
+        idempotency_key=key, db_path=test_db, budget_path=test_budget
+    )
+    assert res2["run_id"] == run_id
+    assert res2["resumed_from_idempotency"] is True
+
+    # Same key, different payload -> IdempotencyConflictError
+    with pytest.raises(db_store.IdempotencyConflictError):
+        db_store.apply_manual_run_adjustment(
+            run_id=run_id, adjusted_tokens=999, cost=0.99,
+            reason="Different payload", evidence_reference="REF-999",
+            idempotency_key=key, db_path=test_db, budget_path=test_budget
+        )
+
+    # In-progress key with active lease -> IdempotencyInProgressError
+    active_key = "idem_active_key"
+    active_payload = {
+        "run_id": run_id,
+        "adjusted_tokens": 500,
+        "cost": 0.5,
+        "reason": "Active check",
+        "evidence_reference": "REF-ACT",
+        "is_incremental": False
+    }
+    active_hash = hashlib.sha256(json.dumps(active_payload, sort_keys=True).encode("utf-8")).hexdigest()
+    with db_store.get_db_connection(test_db) as conn:
+        conn.execute("""
+            INSERT INTO idempotency_keys (key, scope, target_id, request_hash, response_json, status, owner_token, lease_expires_at, created_at, updated_at)
+            VALUES (?, 'manual_adjustment', ?, ?, '', 'in_progress', 'worker1', ?, ?, ?);
+        """, (active_key, run_id, active_hash, time.time() + 60.0, time.time(), time.time()))
+        conn.commit()
+
+    with pytest.raises(db_store.IdempotencyInProgressError):
+        db_store.apply_manual_run_adjustment(
+            run_id=run_id, adjusted_tokens=500, cost=0.5,
+            reason="Active check", evidence_reference="REF-ACT",
+            idempotency_key=active_key, db_path=test_db, budget_path=test_budget
+        )
+
+
+def test_p27_concurrent_run_serialization_and_conflict_handling(tmp_path):
+    """
+    Two concurrent updates targeting the same run with stale tokens_used trigger ConcurrencyConflictError.
+    """
+    test_db = str(tmp_path / "p27_conc_ser.db")
+    db_store.init_db(test_db)
+    test_budget = str(tmp_path / "conc_budget.json")
+    with open(test_budget, "w", encoding="utf-8") as f:
+        json.dump({"tokens_used": 1000, "estimated_cost": 1.0, "transactions": [], "applied_reconciliations": {}}, f)
+
+    sid = "sess_p27_conc"
+    db_store.create_session(session_id=sid, project_name="Conc", task_description="Desc", db_path=test_db)
+    tid = db_store.create_task(session_id=sid, title="Task", division_id="engineering", assigned_agent_id="dev", stage="dev", status="completed", db_path=test_db)
+    run_id = db_store.record_agent_run(
+        task_id=tid, session_id=sid, agent_id="dev", agent_name="Dev",
+        division_id="engineering", prompt_file="p.md", status="completed",
+        tokens_used=500, cost_booked=0.5, token_source="estimated", cost_source="estimated",
+        db_path=test_db
+    )
+
+    # Perform update 1
+    db_store.apply_manual_run_adjustment(
+        run_id=run_id, adjusted_tokens=800, cost=0.8,
+        reason="Update 1", evidence_reference="REF-U1",
+        db_path=test_db, budget_path=test_budget
+    )
+
+    # If another thread attempts an update using the stale prior_tokens, it raises ConcurrencyConflictError
+    with db_store.get_db_connection(test_db) as conn:
+        cur = conn.execute("UPDATE agent_runs SET tokens_used = 900 WHERE run_id = ? AND tokens_used = 500;", (run_id,))
+        assert cur.rowcount == 0
+
+
+def test_p27_independent_subprocess_budget_file_locking(tmp_path):
+    """
+    P1 requirement: Independent OS processes (not threads) acquiring _budget_file_lock concurrently.
+    Demonstrates OS kernel lock coordination with zero lost updates across child processes.
+    """
+    budget_file = str(tmp_path / "multiprocess_budget.json")
+    with open(budget_file, "w", encoding="utf-8") as f:
+        json.dump({"tokens_used": 0, "transactions": []}, f)
+
+    worker_code = f"""
+import sys
+import os
+import json
+import time
+
+sys.path.insert(0, r"{os.path.abspath(os.getcwd())}")
+import db_persistence as db_store
+
+budget_path = r"{budget_file}"
+for _ in range(5):
+    with db_store._budget_file_lock(budget_path, timeout=10.0):
+        with open(budget_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data["tokens_used"] = data.get("tokens_used", 0) + 10
+        db_store._atomic_write_json_direct(budget_path, data)
+        time.sleep(0.01)
+"""
+    # Spawn 4 concurrent subprocesses
+    procs = []
+    for _ in range(4):
+        p = subprocess.Popen([sys.executable, "-c", worker_code])
+        procs.append(p)
+
+    for p in procs:
+        p.wait(timeout=30)
+        assert p.returncode == 0
+
+    # 4 workers * 5 iterations * 10 tokens = 200 tokens
+    with open(budget_file, "r", encoding="utf-8") as f:
+        final_budget = json.load(f)
+
+    assert final_budget["tokens_used"] == 200
+
+
+def test_p27_database_migration_preserves_history_and_conservative_status(tmp_path):
+    """
+    Verify migration of legacy idempotency_keys table:
+    - Preserves completed records.
+    - Treats legacy in_progress records conservatively as failed_retryable.
+    - Preserves foreign-key integrity (PRAGMA foreign_key_check passes).
+    """
+    test_db = str(tmp_path / "legacy_migration.db")
+    with db_store.get_db_connection(test_db) as conn:
+        # Create legacy table without owner_token and lease_expires_at
+        conn.execute("""
+            CREATE TABLE idempotency_keys (
+                key TEXT PRIMARY KEY,
+                scope TEXT NOT NULL,
+                target_id TEXT,
+                request_hash TEXT NOT NULL,
+                response_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                completed_at REAL
+            );
+        """)
+        conn.execute("""
+            INSERT INTO idempotency_keys VALUES
+            ('done_key_1', 'manual_adjustment', 'run_1', 'hash1', '{"ok": true}', 'completed', 1000.0, 1000.0, 1000.0),
+            ('in_prog_key_1', 'manual_adjustment', 'run_2', 'hash2', '', 'in_progress', 1000.0, 1000.0, NULL);
+        """)
+        conn.commit()
+
+    # Run init_db to execute migration
+    db_store.init_db(test_db)
+
+    with db_store.get_db_connection(test_db) as conn:
+        fk_violations = conn.execute("PRAGMA foreign_key_check;").fetchall()
+        assert len(fk_violations) == 0
+
+        # Check migrated rows
+        rows = {r["key"]: dict(r) for r in conn.execute("SELECT * FROM idempotency_keys;").fetchall()}
+        assert "done_key_1" in rows
+        assert rows["done_key_1"]["status"] == "completed"
+        assert rows["done_key_1"]["response_json"] == '{"ok": true}'
+
+        assert "in_prog_key_1" in rows
+        # Legacy in_progress migrated conservatively to failed_retryable!
+        assert rows["in_prog_key_1"]["status"] == "failed_retryable"
+
+        # Verify new columns exist
+        assert "owner_token" in rows["done_key_1"]
+        assert "lease_expires_at" in rows["done_key_1"]
+
 

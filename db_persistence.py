@@ -46,12 +46,13 @@ def validate_financial_numeric(
     max_value: float = 1_000_000.0
 ) -> Optional[float]:
     """
-    Phase 2.7.2: Strict financial numeric validation.
+    Phase 2.7.3: Strict financial numeric validation.
     Enforces:
     - Rejects booleans (isinstance(True, int) == True)
     - Rejects NaN, +Infinity, -Infinity
     - Rejects negative values unless allow_negative=True
     - Rejects out-of-range values exceeding max_value
+    - Supports Decimal with precision checks
     - Normalizes precision consistently using round_cost
     """
     if val is None:
@@ -62,22 +63,82 @@ def validate_financial_numeric(
     if isinstance(val, bool):
         raise ValueError(f"{field_name} cannot be a boolean (got {val}).")
 
-    try:
+    if isinstance(val, Decimal):
+        if val.is_nan():
+            raise ValueError(f"{field_name} must be a finite number (got NaN).")
+        if val.is_infinite():
+            raise ValueError(f"{field_name} must be a finite number (got Infinity).")
         num = float(val)
-    except (ValueError, TypeError):
-        raise ValueError(f"{field_name} must be a valid numeric value, got: {val!r}")
+    else:
+        try:
+            num = float(val)
+        except (ValueError, TypeError):
+            raise ValueError(f"{field_name} must be a valid numeric value, got: {val!r}")
 
     import math
     if not math.isfinite(num):
         raise ValueError(f"{field_name} must be a finite number (got {val}).")
 
     if not allow_negative and num < 0.0:
-        raise ValueError(f"{field_name} cannot be negative (got {num}).")
+        raise ValueError(f"'{field_name}' must be non-negative (got {num}).")
 
     if abs(num) > max_value:
         raise ValueError(f"{field_name} exceeds maximum allowable threshold ({max_value}).")
 
     return round_cost(num, 6)
+
+def validate_token_count(
+    val: Any,
+    field_name: str = "tokens",
+    allow_negative: bool = False,
+    max_tokens: int = 1_000_000_000
+) -> int:
+    """
+    Phase 2.7.3: Strict token count integer validation.
+    Enforces:
+    - Rejects booleans (True/False)
+    - Rejects NaN, +Infinity, -Infinity
+    - Rejects floats with fractional part (e.g. 10.5)
+    - Rejects malformed strings
+    - Rejects negative tokens unless allow_negative=True
+    - Enforces maximum threshold
+    """
+    if val is None:
+        raise ValueError(f"{field_name} cannot be None.")
+
+    if isinstance(val, bool):
+        raise ValueError(f"{field_name} cannot be a boolean (got {val}).")
+
+    import math
+    if isinstance(val, float):
+        if not math.isfinite(val):
+            raise ValueError(f"{field_name} must be a finite integer (got {val}).")
+        if not val.is_integer():
+            raise ValueError(f"{field_name} cannot be fractional (got {val}).")
+        num = int(val)
+    elif isinstance(val, str):
+        s = val.strip()
+        if not re.match(r"^-?\d+$", s):
+            raise ValueError(f"{field_name} must be a valid integer string (got {val!r}).")
+        num = int(s)
+    elif isinstance(val, int):
+        num = val
+    elif isinstance(val, Decimal):
+        if val.is_nan() or val.is_infinite():
+            raise ValueError(f"{field_name} must be a finite integer.")
+        if val % 1 != 0:
+            raise ValueError(f"{field_name} cannot be fractional (got {val}).")
+        num = int(val)
+    else:
+        raise ValueError(f"{field_name} must be an integer, got: {val!r}")
+
+    if not allow_negative and num < 0:
+        raise ValueError(f"'{field_name}' must be non-negative (got {num}).")
+
+    if abs(num) > max_tokens:
+        raise ValueError(f"{field_name} exceeds maximum allowable threshold ({max_tokens}).")
+
+    return num
 
 def is_process_alive(pid: int) -> bool:
     """
@@ -430,15 +491,26 @@ def init_db(db_path: Optional[str] = None):
                 completed_at REAL
             );
             """)
-            cursor.execute("""
-            INSERT INTO idempotency_keys (key, scope, target_id, request_hash, response_json, status, created_at, updated_at, completed_at)
+            cursor.execute("PRAGMA table_info(idempotency_keys_old);")
+            old_cols = {row[1] for row in cursor.fetchall()}
+            owner_sel = "owner_token" if "owner_token" in old_cols else "''"
+            lease_sel = "lease_expires_at" if "lease_expires_at" in old_cols else "0.0"
+            journal_sel = "journal_id" if "journal_id" in old_cols else "NULL"
+            cursor.execute(f"""
+            INSERT INTO idempotency_keys (key, scope, target_id, request_hash, response_json, status, owner_token, lease_expires_at, journal_id, created_at, updated_at, completed_at)
             SELECT key, scope, target_id, request_hash, response_json,
-                   CASE WHEN status = 'failed' THEN 'failed_terminal' ELSE status END,
+                   CASE
+                       WHEN status = 'failed' THEN 'failed_terminal'
+                       WHEN status = 'in_progress' THEN 'failed_retryable'
+                       ELSE status
+                   END,
+                   {owner_sel}, {lease_sel}, {journal_sel},
                    created_at, created_at, completed_at
             FROM idempotency_keys_old;
             """)
             cursor.execute("DROP TABLE idempotency_keys_old;")
             cursor.execute("PRAGMA foreign_keys=ON;")
+            cursor.execute("PRAGMA foreign_key_check;")
 
         cursor.execute("PRAGMA table_info(idempotency_keys);")
         idemp_cols = {row[1] for row in cursor.fetchall()}
@@ -974,7 +1046,13 @@ def record_agent_run(
     fin = now if status in ('completed', 'failed') else None
     safe_input = sanitize_memory_content(input_preview[:500]) if input_preview else None
     safe_output = sanitize_memory_content(output_preview[:500]) if output_preview else None
-    safe_error = sanitize_memory_content(error_message) if error_message else None
+    safe_error = sanitize_memory_content(error_message[:500]) if error_message else None
+    if tokens_used is not None:
+        tokens_used = validate_token_count(tokens_used, field_name="tokens_used", allow_negative=False)
+    else:
+        tokens_used = 0
+    if cost_booked is not None:
+        cost_booked = validate_financial_numeric(cost_booked, field_name="cost_booked", allow_none=True, allow_negative=False)
     initial_cost = round_cost(cost_booked if cost_booked is not None else (tokens_used / 1_000_000.0) * 0.15, 6)
     effective_cost_source = cost_source or ("provider_confirmed" if token_source in ("provider_confirmed", "provider_reported") else ("manual_operator_adjustment" if token_source == "manual_operator_adjustment" else "estimated"))
     with get_db_connection(db_path) as conn:
@@ -1175,6 +1253,8 @@ def complete_task_with_agent_run(
         tokens_used = max(0, int(tokens_used or 0))
     except (ValueError, TypeError):
         tokens_used = 0
+    if cost_booked is not None:
+        cost_booked = validate_financial_numeric(cost_booked, field_name="cost_booked", allow_none=True, allow_negative=False)
 
     now = time.time()
     safe_input = sanitize_memory_content(input_preview[:500]) if input_preview else None
@@ -2861,87 +2941,124 @@ def cleanup_abandoned_restore_staging(app_dir: str, max_age_seconds: float = 60.
     return cleaned_count
 
 
+try:
+    import msvcrt
+    HAS_MSVCRT = True
+except ImportError:
+    HAS_MSVCRT = False
+
+try:
+    import fcntl
+    HAS_FCNTL = True
+except ImportError:
+    HAS_FCNTL = False
+
 _BUDGET_THREAD_LOCK = threading.RLock()
+_BUDGET_LOCK_LOCAL = threading.local()
 
 @contextmanager
 def _budget_file_lock(budget_path: str, timeout: float = 15.0):
     """
-    Phase 2.7.1: Hardened cross-process and cross-thread file lock on budget_path.lock.
-    Uses O_CREAT | O_EXCL for atomic mutual exclusion across processes.
-    Writes owner PID and timestamp into lock file with fsync.
+    Phase 2.7.3: Hardened cross-process and cross-thread file lock on budget_path.lock.
+    Uses OS-level kernel file locking (msvcrt on Windows, fcntl on POSIX) on the open file descriptor.
     Does NOT remove locks based on fixed age if the owner process is still actively running.
-    Detects crashed/abandoned lock owners via reliable OS-level process liveness check.
-    Releases only lock files owned by this process.
+    Automatic OS kernel cleanup on process termination without TOCTOU deletion race.
+    Thread-safe and re-entrant within the same thread.
+    Writes owner PID and timestamp into lock file for inspection.
     """
     lock_path = f"{budget_path}.lock"
-    start_time = time.time()
-    acquired = False
-    fd = None
 
-    _BUDGET_THREAD_LOCK.acquire()
-    try:
-        while time.time() - start_time < timeout:
-            try:
-                # O_CREAT | O_EXCL ensures atomic creation across processes
-                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
-                acquired = True
-                try:
-                    payload = f"{os.getpid()}:{time.time()}".encode("utf-8")
-                    os.write(fd, payload)
-                    os.fsync(fd)
-                except Exception:
-                    pass
-                break
-            except (FileExistsError, OSError):
-                # Inspect existing lock owner
-                owner_pid = None
-                try:
-                    if os.path.exists(lock_path):
-                        with open(lock_path, "r", encoding="utf-8") as lf:
-                            lock_text = lf.read().strip()
-                        if ":" in lock_text:
-                            pid_str = lock_text.split(":", 1)[0].strip()
-                            if pid_str.isdigit():
-                                owner_pid = int(pid_str)
+    if not hasattr(_BUDGET_LOCK_LOCAL, "held_locks"):
+        _BUDGET_LOCK_LOCAL.held_locks = {}
 
-                    # If lock has an owner PID and that process is dead, break the abandoned lock
-                    if owner_pid is not None and not is_process_alive(owner_pid):
-                        try:
-                            os.remove(lock_path)
-                            continue
-                        except OSError:
-                            pass
-                    # If file has been empty or unreadable without valid PID for > 5s, break it
-                    elif owner_pid is None and os.path.exists(lock_path):
-                        mtime = os.path.getmtime(lock_path)
-                        if time.time() - mtime > 5.0:
-                            try:
-                                os.remove(lock_path)
-                                continue
-                            except OSError:
-                                pass
-                except OSError:
-                    pass
-
-                time.sleep(0.02)
-
-        if not acquired:
-            raise TimeoutError(f"Could not acquire budget file lock on {lock_path} within {timeout}s: held by active process PID {owner_pid}")
-
+    held = _BUDGET_LOCK_LOCAL.held_locks
+    if lock_path in held and held[lock_path] > 0:
+        held[lock_path] += 1
         try:
             yield
         finally:
+            held[lock_path] -= 1
+        return
+
+    _BUDGET_THREAD_LOCK.acquire()
+    acquired = False
+    fd = None
+    start_time = time.time()
+    try:
+        while time.time() - start_time < timeout:
+            try:
+                fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
+            except OSError:
+                time.sleep(0.02)
+                continue
+
+            try:
+                if HAS_MSVCRT:
+                    os.lseek(fd, 1024, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                elif HAS_FCNTL:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except (OSError, BlockingIOError, PermissionError):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                fd = None
+                time.sleep(0.02)
+
+        if not acquired:
+            owner_pid = "unknown"
+            try:
+                if os.path.exists(lock_path):
+                    with open(lock_path, "r", encoding="utf-8") as lf:
+                        lock_text = lf.read().strip()
+                        if ":" in lock_text:
+                            owner_pid = lock_text.split(":", 1)[0].strip()
+            except Exception:
+                pass
+            raise TimeoutError(f"Could not acquire budget file lock on {lock_path} within {timeout}s: held by process PID {owner_pid}")
+
+        # Once lock acquired, write diagnostic metadata at start of file
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.ftruncate(fd, 0)
+            payload = f"{os.getpid()}:{time.time()}\n".encode("utf-8")
+            os.write(fd, payload)
+            os.fsync(fd)
+        except Exception:
+            pass
+
+        held[lock_path] = 1
+        try:
+            yield
+        finally:
+            held[lock_path] = 0
             if acquired and fd is not None:
+                try:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    os.ftruncate(fd, 0)
+                    os.fsync(fd)
+                except Exception:
+                    pass
+                if HAS_MSVCRT:
+                    try:
+                        os.lseek(fd, 1024, os.SEEK_SET)
+                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                    except Exception:
+                        pass
+                elif HAS_FCNTL:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    except Exception:
+                        pass
                 try:
                     os.close(fd)
                 except OSError:
                     pass
                 try:
-                    if os.path.exists(lock_path):
-                        with open(lock_path, "r", encoding="utf-8") as lf:
-                            content = lf.read().strip()
-                        if content.startswith(f"{os.getpid()}:"):
-                            os.remove(lock_path)
+                    os.remove(lock_path)
                 except OSError:
                     pass
     finally:
@@ -2949,13 +3066,33 @@ def _budget_file_lock(budget_path: str, timeout: float = 15.0):
 
 
 def _atomic_write_json_direct(filepath: str, data: Any):
-    """Atomically write JSON data with fsync durability before replace."""
-    tmp_path = f"{filepath}.tmp_{uuid.uuid4().hex[:6]}"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_path, filepath)
+    """Atomically write JSON data with fsync durability before replace and safe cleanup."""
+    # Backup existing valid file before replacement
+    if os.path.exists(filepath):
+        try:
+            bak_path = f"{filepath}.bak"
+            with open(filepath, "r", encoding="utf-8") as sf:
+                content = sf.read()
+            with open(bak_path, "w", encoding="utf-8") as df:
+                df.write(content)
+                df.flush()
+                os.fsync(df.fileno())
+        except Exception:
+            pass
+
+    tmp_path = f"{filepath}.tmp_{uuid.uuid4().hex[:8]}"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, filepath)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 def project_reconciliation_to_budget(
@@ -3063,6 +3200,8 @@ def project_reconciliation_to_budget(
         return {"projected": True, "already_applied": False, "budget": budget}
 
 
+_RUN_OPERATION_LOCK = threading.RLock()
+
 def apply_manual_run_adjustment(
     run_id: str,
     adjusted_tokens: int,
@@ -3077,16 +3216,18 @@ def apply_manual_run_adjustment(
     budget_path: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Phase 2.7.1: Applies a distinct, operator-audited manual token adjustment to an agent run.
+    Phase 2.7.3: Applies a distinct, operator-audited manual token and cost adjustment to an agent run.
     - Requires non-empty reason and evidence reference.
-    - Supports Idempotency-Key handling with in-progress locks and response replay.
-    - Supports absolute or incremental token/cost adjustments.
-    - Sets token_source = 'manual_operator_adjustment' and reconciliation_status = 'completed'.
-    - Atomically updates agent_runs, reconciliation_journal outbox record, and recovery_audit_log.
-    - Projects delta into budget.json idempotently via truncation-proof registry.
+    - Strict numeric financial validation for tokens and cost values.
+    - Atomic idempotency claim protocol with lease fencing, durable recovery, and rejection of conflicting payloads.
+    - Supports absolute or incremental adjustments with correct mathematical deltas.
+    - Atomically updates cost_booked AND cost_source = 'manual_operator_adjustment'.
+    - Optimistic concurrency control and run-level serialization.
+    - Projects delta into budget.json idempotently via truncation-proof registry under cross-process OS lock.
     """
-    if adjusted_tokens < 0 and not is_incremental:
-        raise ValueError("adjusted_tokens cannot be negative for absolute adjustment.")
+    adjusted_tokens = validate_token_count(adjusted_tokens, field_name="adjusted_tokens", allow_negative=is_incremental)
+    if cost is not None:
+        cost = validate_financial_numeric(cost, field_name="cost", allow_none=True, allow_negative=is_incremental)
     if not reason or not reason.strip():
         raise ValueError("Manual adjustment requires a non-empty reason.")
     if not evidence_reference or not evidence_reference.strip():
@@ -3104,167 +3245,279 @@ def apply_manual_run_adjustment(
     }
     req_hash = hashlib.sha256(json.dumps(request_payload, sort_keys=True).encode("utf-8")).hexdigest()
 
-    with get_db_connection(db_path) as conn:
-        cursor = conn.cursor()
-        cursor.execute("PRAGMA table_info(agent_runs);")
-        cols = {row[1] for row in cursor.fetchall()}
+    owner_token = uuid.uuid4().hex
+    lease_duration = 30.0
 
-        j_table = cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reconciliation_journal';").fetchone()
-        idemp_table = cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='idempotency_keys';").fetchone()
+    with _RUN_OPERATION_LOCK:
+        with get_db_connection(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(agent_runs);")
+            cols = {row[1] for row in cursor.fetchall()}
 
-        if idempotency_key and idemp_table:
-            row_idemp = cursor.execute("SELECT * FROM idempotency_keys WHERE key = ?;", (idempotency_key,)).fetchone()
-            if row_idemp:
-                if row_idemp["request_hash"] != req_hash:
-                    raise IdempotencyConflictError(f"Idempotency key '{idempotency_key}' was previously used with different request parameters.")
-                if row_idemp["status"] == "in_progress":
-                    if time.time() - row_idemp["created_at"] < 60.0:
-                        raise IdempotencyInProgressError(f"Request with idempotency key '{idempotency_key}' is currently in progress.")
-                elif row_idemp["status"] == "completed":
-                    try:
-                        cached_resp = json.loads(row_idemp["response_json"])
-                        cached_resp["resumed_from_idempotency"] = True
-                        return cached_resp
-                    except Exception:
-                        pass
-            now_ts = time.time()
-            cursor.execute("""
-                INSERT OR REPLACE INTO idempotency_keys (key, scope, target_id, request_hash, response_json, status, created_at, updated_at)
-                VALUES (?, 'manual_adjustment', ?, ?, '', 'in_progress', ?, ?);
-            """, (idempotency_key, run_id, req_hash, now_ts, now_ts))
+            j_table = cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='reconciliation_journal';").fetchone()
+            idemp_table = cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='idempotency_keys';").fetchone()
+
+            if idempotency_key and idemp_table:
+                now_ts = time.time()
+                lease_expires = now_ts + lease_duration
+                while True:
+                    row_idemp = cursor.execute("SELECT * FROM idempotency_keys WHERE key = ?;", (idempotency_key,)).fetchone()
+                    if row_idemp:
+                        if row_idemp["request_hash"] != req_hash:
+                            raise IdempotencyConflictError(f"Idempotency key '{idempotency_key}' was previously used with different request parameters.")
+                        if row_idemp["status"] == "completed":
+                            try:
+                                cached_resp = json.loads(row_idemp["response_json"])
+                                cached_resp["resumed_from_idempotency"] = True
+                                return cached_resp
+                            except Exception:
+                                pass
+                        elif row_idemp["status"] == "committed_pending_projection":
+                            # Commit already happened, resume budget projection without re-mutating DB
+                            journal_id = row_idemp["journal_id"]
+                            proj_budget = {}
+                            if journal_id and j_table:
+                                j_row = cursor.execute("SELECT * FROM reconciliation_journal WHERE journal_id = ?;", (journal_id,)).fetchone()
+                                if j_row:
+                                    proj = project_reconciliation_to_budget(
+                                        budget_path=eff_budget_path,
+                                        journal_id=journal_id,
+                                        run_id=run_id,
+                                        delta_tokens=j_row["delta_tokens"],
+                                        delta_cost=j_row["delta_cost"],
+                                        source="manual_operator_adjustment",
+                                        department="إدارة التدقيق المالي اليدوي",
+                                        task_desc=f"تعديل إداري لاستهلاك {run_id}: {reason[:40]}"
+                                    )
+                                    proj_budget = proj.get("budget", {})
+                                    cursor.execute(
+                                        "UPDATE reconciliation_journal SET status = 'completed', completed_at = ? WHERE journal_id = ?;",
+                                        (time.time(), journal_id)
+                                    )
+                            cached_resp = {}
+                            if row_idemp["response_json"]:
+                                try:
+                                    cached_resp = json.loads(row_idemp["response_json"])
+                                except Exception:
+                                    pass
+                            if not cached_resp:
+                                run_row = cursor.execute("SELECT * FROM agent_runs WHERE run_id = ?;", (run_id,)).fetchone()
+                                cached_resp = {
+                                    "success": True,
+                                    "run_id": run_id,
+                                    "adjusted_tokens": run_row["tokens_used"] if run_row else adjusted_tokens,
+                                    "cost": run_row["cost_booked"] if run_row else cost,
+                                    "token_source": "manual_operator_adjustment",
+                                    "cost_source": "manual_operator_adjustment",
+                                    "reconciliation_status": "completed",
+                                    "reason": reason,
+                                    "evidence_reference": evidence_reference,
+                                    "journal_id": journal_id,
+                                    "budget": proj_budget,
+                                    "message": "Manual run adjustment successfully resumed from committed state."
+                                }
+                            cached_resp["resumed_from_idempotency"] = True
+                            cursor.execute(
+                                "UPDATE idempotency_keys SET status = 'completed', response_json = ?, updated_at = ?, completed_at = ? WHERE key = ?;",
+                                (json.dumps(cached_resp), time.time(), time.time(), idempotency_key)
+                            )
+                            conn.commit()
+                            return cached_resp
+                        elif row_idemp["status"] == "in_progress":
+                            if now_ts < row_idemp["lease_expires_at"]:
+                                raise IdempotencyInProgressError(f"Request with idempotency key '{idempotency_key}' is currently in progress.")
+                            # Lease expired: check if previous worker actually committed to reconciliation_journal
+                            if row_idemp["journal_id"] and j_table:
+                                j_row = cursor.execute("SELECT * FROM reconciliation_journal WHERE journal_id = ?;", (row_idemp["journal_id"],)).fetchone()
+                                if j_row and j_row["status"] in ("applied_db", "completed"):
+                                    cursor.execute("UPDATE idempotency_keys SET status = 'committed_pending_projection', updated_at = ? WHERE key = ?;", (time.time(), idempotency_key))
+                                    conn.commit()
+                                    continue
+                            # Previous worker crashed before commit. Claim lease atomically:
+                            claim_cur = cursor.execute("""
+                                UPDATE idempotency_keys
+                                SET owner_token = ?, lease_expires_at = ?, updated_at = ?
+                                WHERE key = ? AND status = 'in_progress' AND lease_expires_at <= ?;
+                            """, (owner_token, lease_expires, now_ts, idempotency_key, now_ts))
+                            if claim_cur.rowcount == 0:
+                                raise IdempotencyInProgressError(f"Request with idempotency key '{idempotency_key}' is currently in progress.")
+                            conn.commit()
+                            break
+                        elif row_idemp["status"] in ("failed_retryable",):
+                            claim_cur = cursor.execute("""
+                                UPDATE idempotency_keys
+                                SET owner_token = ?, lease_expires_at = ?, status = 'in_progress', updated_at = ?
+                                WHERE key = ? AND status = 'failed_retryable';
+                            """, (owner_token, lease_expires, now_ts, idempotency_key))
+                            if claim_cur.rowcount == 0:
+                                raise IdempotencyInProgressError(f"Request with idempotency key '{idempotency_key}' is currently in progress.")
+                            conn.commit()
+                            break
+                        else:
+                            raise IdempotencyConflictError(f"Idempotency key '{idempotency_key}' is in terminal failure state.")
+                    else:
+                        try:
+                            cursor.execute("""
+                                INSERT INTO idempotency_keys (key, scope, target_id, request_hash, response_json, status, owner_token, lease_expires_at, created_at, updated_at)
+                                VALUES (?, 'manual_adjustment', ?, ?, '', 'in_progress', ?, ?, ?, ?);
+                            """, (idempotency_key, run_id, req_hash, owner_token, lease_expires, now_ts, now_ts))
+                            conn.commit()
+                            break
+                        except sqlite3.IntegrityError:
+                            continue
+
+            row = cursor.execute("SELECT * FROM agent_runs WHERE run_id = ?;", (run_id,)).fetchone()
+            if not row:
+                raise LookupError(f"Run {run_id} not found.")
+
+            run_data = dict(row)
+            prior_tokens = int(run_data.get("tokens_used", 0) or 0)
+            prior_cost = float(run_data.get("cost_booked") if "cost_booked" in run_data and run_data["cost_booked"] is not None else round_cost((prior_tokens / 1_000_000.0) * 0.15, 6))
+
+            if is_incremental:
+                final_tokens = max(0, prior_tokens + adjusted_tokens)
+                delta_tokens = adjusted_tokens
+                if cost is not None:
+                    delta_cost = round_cost(cost, 6)
+                    final_cost = max(0.0, round_cost(prior_cost + delta_cost, 6))
+                else:
+                    delta_cost = round_cost((delta_tokens / 1_000_000.0) * 0.15, 6)
+                    final_cost = max(0.0, round_cost(prior_cost + delta_cost, 6))
+            else:
+                final_tokens = max(0, adjusted_tokens)
+                delta_tokens = final_tokens - prior_tokens
+                if cost is not None:
+                    final_cost = max(0.0, round_cost(cost, 6))
+                    delta_cost = round_cost(final_cost - prior_cost, 6)
+                else:
+                    final_cost = max(0.0, round_cost((final_tokens / 1_000_000.0) * 0.15, 6))
+                    delta_cost = round_cost(final_cost - prior_cost, 6)
+
+            final_tokens = validate_token_count(final_tokens, field_name="final_tokens", allow_negative=False)
+            delta_tokens = validate_token_count(delta_tokens, field_name="delta_tokens", allow_negative=True)
+            final_cost = validate_financial_numeric(final_cost, field_name="final_cost", allow_negative=False)
+            delta_cost = validate_financial_numeric(delta_cost, field_name="delta_cost", allow_negative=True)
+
+            if failpoint == "before_db_commit":
+                raise IOError("Crash simulated before SQLite commit")
+
+            journal_id = f"adj_{run_id}_{final_tokens}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+            audit_id = f"aud_{uuid.uuid4().hex[:12]}"
+
+            update_fields = [
+                "tokens_used = ?",
+                "token_source = 'manual_operator_adjustment'",
+                "reconciliation_status = 'completed'"
+            ]
+            params = [final_tokens]
+            if "cost_booked" in cols:
+                update_fields.append("cost_booked = ?")
+                params.append(final_cost)
+            if "cost_source" in cols:
+                update_fields.append("cost_source = ?")
+                params.append("manual_operator_adjustment")
+
+            params.append(run_id)
+            params.append(prior_tokens)
+            cur_up = conn.execute(f"UPDATE agent_runs SET {', '.join(update_fields)} WHERE run_id = ? AND tokens_used = ?;", params)
+            if cur_up.rowcount == 0:
+                raise ConcurrencyConflictError(f"Concurrent conflicting update detected on run {run_id}.")
+
+            if j_table:
+                conn.execute("""
+                    INSERT INTO reconciliation_journal (
+                        journal_id, run_id, target_tokens, delta_tokens, delta_cost,
+                        status, provider_request_id, created_at, target_cost
+                    ) VALUES (?, ?, ?, ?, ?, 'applied_db', ?, ?, ?);
+                """, (journal_id, run_id, final_tokens, delta_tokens, delta_cost, f"manual:{evidence_reference[:50]}", time.time(), final_cost))
+
+            if idempotency_key and idemp_table:
+                fence_cur = conn.execute("""
+                    UPDATE idempotency_keys
+                    SET status = 'committed_pending_projection', journal_id = ?, updated_at = ?
+                    WHERE key = ? AND owner_token = ?;
+                """, (journal_id, time.time(), idempotency_key, owner_token))
+                if fence_cur.rowcount == 0:
+                    raise ConcurrencyConflictError("Idempotency lease ownership superseded; aborting commit.")
+
+            conn.execute("""
+                INSERT INTO recovery_audit_log (
+                    audit_id, timestamp, principal, action, target_id,
+                    force_requested, authorized, outcome, error_message
+                ) VALUES (?, ?, ?, 'manual_adjustment', ?, 1, 1, 'applied_db', ?);
+            """, (audit_id, time.time(), principal or "admin", run_id, f"Adjusted to {final_tokens} tokens (delta: {delta_tokens}, cost: {final_cost}). Reason: {reason}. Ref: {evidence_reference}"))
+
             conn.commit()
 
-        row = cursor.execute("SELECT * FROM agent_runs WHERE run_id = ?;", (run_id,)).fetchone()
-        if not row:
-            raise LookupError(f"Run {run_id} not found.")
+            if failpoint == "after_db_before_budget":
+                raise IOError("Crash simulated after DB commit before budget update")
 
-        run_data = dict(row)
-        prior_tokens = int(run_data.get("tokens_used", 0) or 0)
-        prior_cost = float(run_data.get("cost_booked") if "cost_booked" in run_data and run_data["cost_booked"] is not None else round_cost((prior_tokens / 1_000_000.0) * 0.15, 6))
-
-        if is_incremental:
-            final_tokens = max(0, prior_tokens + adjusted_tokens)
-            delta_tokens = adjusted_tokens
-            if cost is not None:
-                delta_cost = round_cost(float(cost), 6)
-                final_cost = max(0.0, round_cost(prior_cost + delta_cost, 6))
-            else:
-                delta_cost = round_cost((delta_tokens / 1_000_000.0) * 0.15, 6)
-                final_cost = max(0.0, round_cost(prior_cost + delta_cost, 6))
-        else:
-            final_tokens = max(0, adjusted_tokens)
-            delta_tokens = final_tokens - prior_tokens
-            if cost is not None:
-                final_cost = max(0.0, round_cost(float(cost), 6))
-                delta_cost = round_cost(final_cost - prior_cost, 6)
-            else:
-                final_cost = max(0.0, round_cost((final_tokens / 1_000_000.0) * 0.15, 6))
-                delta_cost = round_cost(final_cost - prior_cost, 6)
-
-        if failpoint == "before_db_commit":
-            raise IOError("Crash simulated before SQLite commit")
-
-        journal_id = f"adj_{run_id}_{final_tokens}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
-        audit_id = f"aud_{uuid.uuid4().hex[:12]}"
-
-        update_fields = [
-            "tokens_used = ?",
-            "token_source = 'manual_operator_adjustment'",
-            "reconciliation_status = 'completed'"
-        ]
-        params = [final_tokens]
-        if "cost_booked" in cols:
-            update_fields.append("cost_booked = ?")
-            params.append(final_cost)
-        params.append(run_id)
-
-        conn.execute(f"UPDATE agent_runs SET {', '.join(update_fields)} WHERE run_id = ?;", params)
-
-        if j_table:
-            conn.execute("""
-                INSERT INTO reconciliation_journal (
-                    journal_id, run_id, target_tokens, delta_tokens, delta_cost,
-                    status, provider_request_id, created_at, target_cost
-                ) VALUES (?, ?, ?, ?, ?, 'applied_db', ?, ?, ?);
-            """, (journal_id, run_id, final_tokens, delta_tokens, delta_cost, f"manual:{evidence_reference[:50]}", time.time(), final_cost))
-
-        conn.execute("""
-            INSERT INTO recovery_audit_log (
-                audit_id, timestamp, principal, action, target_id,
-                force_requested, authorized, outcome, error_message
-            ) VALUES (?, ?, ?, 'manual_adjustment', ?, 1, 1, 'applied_db', ?);
-        """, (audit_id, time.time(), principal or "admin", run_id, f"Adjusted to {final_tokens} tokens (delta: {delta_tokens}, cost: {final_cost}). Reason: {reason}. Ref: {evidence_reference}"))
-
-        conn.commit()
-
-        if failpoint == "after_db_before_budget":
-            raise IOError("Crash simulated after DB commit before budget update")
-
-        # Project to budget
-        proj = project_reconciliation_to_budget(
-            budget_path=eff_budget_path,
-            journal_id=journal_id,
-            run_id=run_id,
-            delta_tokens=delta_tokens,
-            delta_cost=delta_cost,
-            source="manual_operator_adjustment",
-            department="إدارة التدقيق المالي اليدوي",
-            task_desc=f"تعديل إداري لاستهلاك {run_id}: {reason[:40]}"
-        )
-
-        if failpoint == "after_budget_before_journal_complete":
-            raise IOError("Crash simulated after budget projection before journal completion")
-
-        if j_table:
-            conn.execute(
-                "UPDATE reconciliation_journal SET status = 'completed', completed_at = ? WHERE journal_id = ?;",
-                (time.time(), journal_id)
+            # Project to budget
+            proj = project_reconciliation_to_budget(
+                budget_path=eff_budget_path,
+                journal_id=journal_id,
+                run_id=run_id,
+                delta_tokens=delta_tokens,
+                delta_cost=delta_cost,
+                source="manual_operator_adjustment",
+                department="إدارة التدقيق المالي اليدوي",
+                task_desc=f"تعديل إداري لاستهلاك {run_id}: {reason[:40]}"
             )
 
-        conn.execute(
-            "UPDATE recovery_audit_log SET outcome = 'success' WHERE audit_id = ?;",
-            (audit_id,)
-        )
+            if failpoint == "after_budget_before_journal_complete":
+                raise IOError("Crash simulated after budget projection before journal completion")
 
-        resp_data = {
-            "success": True,
-            "run_id": run_id,
-            "prior_tokens": prior_tokens,
-            "prior_cost": prior_cost,
-            "adjusted_tokens": final_tokens,
-            "delta_tokens": delta_tokens,
-            "delta_cost": delta_cost,
-            "cost": final_cost,
-            "token_source": "manual_operator_adjustment",
-            "reconciliation_status": "completed",
-            "reason": reason,
-            "evidence_reference": evidence_reference,
-            "journal_id": journal_id,
-            "budget": proj.get("budget", {}),
-            "message": "Manual run adjustment successfully applied and projected."
-        }
+            if j_table:
+                conn.execute(
+                    "UPDATE reconciliation_journal SET status = 'completed', completed_at = ? WHERE journal_id = ?;",
+                    (time.time(), journal_id)
+                )
 
-        if idempotency_key and idemp_table:
             conn.execute(
-                "UPDATE idempotency_keys SET status = 'completed', response_json = ?, updated_at = ?, completed_at = ? WHERE key = ?;",
-                (json.dumps(resp_data), time.time(), time.time(), idempotency_key)
+                "UPDATE recovery_audit_log SET outcome = 'success' WHERE audit_id = ?;",
+                (audit_id,)
             )
 
-        conn.commit()
+            resp_data = {
+                "success": True,
+                "run_id": run_id,
+                "prior_tokens": prior_tokens,
+                "prior_cost": prior_cost,
+                "adjusted_tokens": final_tokens,
+                "delta_tokens": delta_tokens,
+                "delta_cost": delta_cost,
+                "cost": final_cost,
+                "token_source": "manual_operator_adjustment",
+                "cost_source": "manual_operator_adjustment",
+                "reconciliation_status": "completed",
+                "reason": reason,
+                "evidence_reference": evidence_reference,
+                "journal_id": journal_id,
+                "budget": proj.get("budget", {}),
+                "message": "Manual run adjustment successfully applied and projected."
+            }
 
-    # Durably record audit event via function outside connection context (fails closed if audit fails)
-    record_recovery_audit_event(
-        principal=principal or "admin",
-        action="manual_adjustment",
-        target_id=run_id,
-        force_requested=True,
-        authorized=True,
-        outcome="success",
-        error_message=f"Adjusted to {final_tokens} tokens (delta: {delta_tokens}, cost: {final_cost}). Reason: {reason}. Ref: {evidence_reference}",
-        db_path=db_path
-    )
+            if idempotency_key and idemp_table:
+                conn.execute(
+                    "UPDATE idempotency_keys SET status = 'completed', response_json = ?, updated_at = ?, completed_at = ? WHERE key = ?;",
+                    (json.dumps(resp_data), time.time(), time.time(), idempotency_key)
+                )
 
-    return resp_data
+            conn.commit()
+
+        # Durably record audit event via function outside connection context (fails closed if audit fails)
+        record_recovery_audit_event(
+            principal=principal or "admin",
+            action="manual_adjustment",
+            target_id=run_id,
+            force_requested=True,
+            authorized=True,
+            outcome="success",
+            error_message=f"Adjusted to {final_tokens} tokens (delta: {delta_tokens}, cost: {final_cost}). Reason: {reason}. Ref: {evidence_reference}",
+            db_path=db_path
+        )
+
+        return resp_data
 
 
 def record_recovery_audit_event(
@@ -3372,6 +3625,7 @@ def reconcile_provider_run_usage(
                 (time.time(), journal_row["journal_id"])
             )
             conn.commit()
+            run_row = conn.execute("SELECT cost_booked, cost_source FROM agent_runs WHERE run_id = ?;", (run_id,)).fetchone()
             return {
                 "success": True,
                 "already_reconciled": False,
@@ -3380,8 +3634,9 @@ def reconcile_provider_run_usage(
                 "provider_request_id": journal_row["provider_request_id"],
                 "tokens_used": journal_row["target_tokens"],
                 "token_source": "provider_confirmed",
+                "cost_source": run_row["cost_source"] if run_row else "provider_confirmed",
                 "reconciliation_status": "completed",
-                "cost": proj.get("budget", {}).get("estimated_cost"),
+                "cost": run_row["cost_booked"] if run_row else proj.get("budget", {}).get("estimated_cost"),
                 "message": "Authoritative provider usage successfully reconciled from persistent outbox."
             }
 
@@ -3393,6 +3648,7 @@ def reconcile_provider_run_usage(
                 "run_id": run_id,
                 "tokens_used": run_data.get("tokens_used", 0),
                 "token_source": run_data.get("token_source", "provider_confirmed"),
+                "cost_source": run_data.get("cost_source", "provider_confirmed"),
                 "reconciliation_status": "completed",
                 "cost": run_data.get("cost_booked"),
                 "message": "Run usage was previously reconciled with authoritative provider data."
@@ -3478,8 +3734,8 @@ def reconcile_provider_run_usage(
             }
 
         try:
-            confirmed_tokens = int(confirmed_tokens_raw)
-        except (ValueError, TypeError):
+            confirmed_tokens = validate_token_count(confirmed_tokens_raw, field_name="confirmed_tokens", allow_negative=False)
+        except (ValueError, TypeError) as val_err:
             if "reconciliation_status" in cols:
                 conn.execute(
                     "UPDATE agent_runs SET reconciliation_status = 'failed' WHERE run_id = ?;",
@@ -3490,43 +3746,62 @@ def reconcile_provider_run_usage(
                 "success": False,
                 "run_id": run_id,
                 "reconciliation_status": "failed",
-                "error": f"Malformed provider token value: {confirmed_tokens_raw}"
-            }
-
-        # Guard against negative values
-        if confirmed_tokens < 0:
-            if "reconciliation_status" in cols:
-                conn.execute(
-                    "UPDATE agent_runs SET reconciliation_status = 'failed' WHERE run_id = ?;",
-                    (run_id,)
-                )
-                conn.commit()
-            return {
-                "success": False,
-                "run_id": run_id,
-                "reconciliation_status": "failed",
-                "error": f"Negative provider token value rejected: {confirmed_tokens}"
+                "error": f"Malformed provider token value: {val_err}"
             }
 
         # Valid confirmed tokens
         resolved_req_id = lookup_result.get("provider_request_id") or provider_req_id
 
-        prior_tokens = run_data.get("tokens_used", 0)
+        prior_tokens = int(run_data.get("tokens_used", 0) or 0)
         prior_cost = float(run_data.get("cost_booked") if "cost_booked" in run_data and run_data["cost_booked"] is not None else round_cost((prior_tokens / 1_000_000.0) * 0.15, 6))
+        prior_cost_source = run_data.get("cost_source")
         delta_tokens = confirmed_tokens - prior_tokens
         calc_cost = round_cost((delta_tokens / 1_000_000.0) * 0.15, 6)
 
         if lookup_result.get("cost") is not None:
-            reported_cost = float(lookup_result["cost"])
+            try:
+                reported_cost = float(validate_financial_numeric(lookup_result["cost"], field_name="provider_cost", allow_negative=False))
+            except (ValueError, TypeError) as cost_err:
+                if "reconciliation_status" in cols:
+                    conn.execute(
+                        "UPDATE agent_runs SET reconciliation_status = 'failed' WHERE run_id = ?;",
+                        (run_id,)
+                    )
+                    conn.commit()
+                return {
+                    "success": False,
+                    "run_id": run_id,
+                    "reconciliation_status": "failed",
+                    "error": f"Malformed or invalid provider cost value: {cost_err}"
+                }
+
             if lookup_result.get("is_total_cost", True):
-                final_cost = max(0.0, round_cost(reported_cost, 6))
+                final_cost = round_cost(reported_cost, 6)
                 delta_cost = round_cost(final_cost - prior_cost, 6)
             else:
                 delta_cost = round_cost(reported_cost, 6)
-                final_cost = max(0.0, round_cost(prior_cost + delta_cost, 6))
+                final_cost = round_cost(prior_cost + delta_cost, 6)
+            new_cost_source = "provider_confirmed"
         else:
-            delta_cost = calc_cost
-            final_cost = max(0.0, round_cost(prior_cost + delta_cost, 6))
+            # Missing provider cost:
+            # Never assume a previously booked cost is estimated.
+            # Preserve previously authoritative cost if provider supplies no replacement cost.
+            if prior_cost_source in ("provider_confirmed", "manual_operator_adjustment"):
+                final_cost = prior_cost
+                delta_cost = 0.0
+                new_cost_source = prior_cost_source
+            elif prior_cost_source == "estimated" or prior_cost_source is None:
+                delta_cost = calc_cost
+                final_cost = round_cost(prior_cost + delta_cost, 6)
+                new_cost_source = "estimated"
+            else:
+                final_cost = prior_cost
+                delta_cost = 0.0
+                new_cost_source = "unresolved"
+
+        # Validate final calculated financial figures
+        final_cost = validate_financial_numeric(final_cost, field_name="final_cost", allow_negative=False)
+        delta_cost = validate_financial_numeric(delta_cost, field_name="delta_cost", allow_negative=True)
 
         journal_id = f"rec_{run_id}_{confirmed_tokens}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
 
@@ -3534,7 +3809,7 @@ def reconcile_provider_run_usage(
             raise IOError("Crash simulated before SQLite commit")
 
         # Concurrency safety: check if another thread reconciled this run while we performed lookup
-        current_run = conn.execute("SELECT tokens_used, token_source, reconciliation_status FROM agent_runs WHERE run_id = ?;", (run_id,)).fetchone()
+        current_run = conn.execute("SELECT tokens_used, token_source, reconciliation_status, cost_booked, cost_source FROM agent_runs WHERE run_id = ?;", (run_id,)).fetchone()
         if current_run and current_run["reconciliation_status"] == "completed":
             return {
                 "success": True,
@@ -3542,6 +3817,7 @@ def reconcile_provider_run_usage(
                 "run_id": run_id,
                 "tokens_used": current_run["tokens_used"],
                 "token_source": current_run["token_source"],
+                "cost_source": current_run.get("cost_source"),
                 "reconciliation_status": "completed",
                 "cost": current_run.get("cost_booked"),
                 "message": "Run usage was previously reconciled with authoritative provider data."
@@ -3559,13 +3835,33 @@ def reconcile_provider_run_usage(
             update_fields.append("cost_booked = ?")
             params.append(final_cost)
 
+        if "cost_source" in cols:
+            update_fields.append("cost_source = ?")
+            params.append(new_cost_source)
+
         if "provider_request_id" in cols and resolved_req_id:
             update_fields.append("provider_request_id = ?")
             params.append(resolved_req_id)
 
         params.append(run_id)
-        sql = f"UPDATE agent_runs SET {', '.join(update_fields)} WHERE run_id = ?;"
-        conn.execute(sql, params)
+        params.append(prior_tokens)
+        sql = f"UPDATE agent_runs SET {', '.join(update_fields)} WHERE run_id = ? AND tokens_used = ?;"
+        up_cur = conn.execute(sql, params)
+        if up_cur.rowcount == 0:
+            chk = conn.execute("SELECT tokens_used, reconciliation_status, cost_booked, cost_source FROM agent_runs WHERE run_id = ?;", (run_id,)).fetchone()
+            if chk and chk["reconciliation_status"] == "completed":
+                return {
+                    "success": True,
+                    "already_reconciled": True,
+                    "run_id": run_id,
+                    "tokens_used": chk["tokens_used"],
+                    "token_source": "provider_confirmed",
+                    "cost_source": chk.get("cost_source"),
+                    "reconciliation_status": "completed",
+                    "cost": chk.get("cost_booked"),
+                    "message": "Run usage was previously reconciled with authoritative provider data."
+                }
+            raise ConcurrencyConflictError(f"Concurrent update conflict on run {run_id} during reconciliation.")
 
         if j_table:
             conn.execute("""
@@ -3605,6 +3901,7 @@ def reconcile_provider_run_usage(
             "provider_request_id": resolved_req_id,
             "tokens_used": confirmed_tokens,
             "token_source": "provider_confirmed",
+            "cost_source": new_cost_source,
             "reconciliation_status": "completed",
             "delta_tokens": delta_tokens,
             "delta_cost": delta_cost,
