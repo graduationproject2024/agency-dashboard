@@ -463,6 +463,11 @@ def test_group_e_run_qa_checks_records_structured_findings(temp_db):
     sevs = {f["severity"] for f in findings}
     assert "critical" in sevs  # path traversal is critical
 
+    # Verify severity filter parameter
+    crit_findings = db_store.list_qa_findings(session_id=sess_id, severity="critical", db_path=temp_db)
+    assert len(crit_findings) >= 1
+    assert all(f["severity"] == "critical" for f in crit_findings)
+
     sec_finding = next(f for f in findings if f["category"] == "security")
     assert "Path traversal" in sec_finding["evidence"]
     assert sec_finding["status"] == "open"

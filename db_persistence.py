@@ -1887,6 +1887,7 @@ def list_qa_findings(
     qa_run_id: Optional[str] = None,
     status: Optional[str] = None,
     min_severity: Optional[str] = None,
+    severity: Optional[str] = None,
     db_path: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """
@@ -1907,6 +1908,9 @@ def list_qa_findings(
     if status:
         conditions.append("status = ?")
         params.append(status)
+    if severity:
+        conditions.append("severity = ?")
+        params.append(severity)
 
     where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     query = f"SELECT * FROM qa_findings {where_clause} ORDER BY created_at ASC;"
