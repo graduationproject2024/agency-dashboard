@@ -1047,6 +1047,12 @@ def record_agent_run(
     safe_input = sanitize_memory_content(input_preview[:500]) if input_preview else None
     safe_output = sanitize_memory_content(output_preview[:500]) if output_preview else None
     safe_error = sanitize_memory_content(error_message[:500]) if error_message else None
+    if provider_request_id is not None and not isinstance(provider_request_id, str):
+        provider_request_id = None
+    if provider is not None and not isinstance(provider, str):
+        provider = str(provider)
+    if model is not None and not isinstance(model, str):
+        model = str(model)
     if tokens_used is not None:
         tokens_used = validate_token_count(tokens_used, field_name="tokens_used", allow_negative=False)
     else:
@@ -1183,6 +1189,10 @@ def record_agent_run_start(
     run_id = f"run_{uuid.uuid4().hex[:12]}"
     now = time.time()
     safe_input = sanitize_memory_content(input_preview[:500]) if input_preview else None
+    if provider is not None and not isinstance(provider, str):
+        provider = str(provider)
+    if model is not None and not isinstance(model, str):
+        model = str(model)
     with get_db_connection(db_path) as conn:
         cursor = conn.cursor()
         cursor.execute("PRAGMA table_info(agent_runs);")
@@ -1255,6 +1265,12 @@ def complete_task_with_agent_run(
         tokens_used = 0
     if cost_booked is not None:
         cost_booked = validate_financial_numeric(cost_booked, field_name="cost_booked", allow_none=True, allow_negative=False)
+    if provider_request_id is not None and not isinstance(provider_request_id, str):
+        provider_request_id = None
+    if provider is not None and not isinstance(provider, str):
+        provider = str(provider)
+    if model is not None and not isinstance(model, str):
+        model = str(model)
 
     now = time.time()
     safe_input = sanitize_memory_content(input_preview[:500]) if input_preview else None

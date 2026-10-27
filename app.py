@@ -1442,12 +1442,13 @@ def get_last_agent_execution() -> Optional[Dict[str, Any]]:
 
 def set_last_agent_execution(tokens_used: int, token_source: str, provider: str = "unknown", provider_request_id: Optional[str] = None, model: Optional[str] = None):
     """Durable in-memory record of provider usage metadata for orchestration layers."""
+    clean_req_id = provider_request_id if (isinstance(provider_request_id, str) and provider_request_id.strip()) else None
     _last_agent_execution_ctx.data = {
         "tokens_used": max(int(tokens_used), 0),
         "token_source": token_source,
-        "provider": provider,
-        "provider_request_id": provider_request_id,
-        "model": model
+        "provider": str(provider) if provider else "unknown",
+        "provider_request_id": clean_req_id,
+        "model": str(model) if model else None
     }
 
 def call_agent_gemini(system_prompt, full_prompt, api_key, role_name, preferred_model='gemini-3.5-flash-lite'):
@@ -1487,7 +1488,16 @@ def call_agent_gemini(system_prompt, full_prompt, api_key, role_name, preferred_
                     task_name = workflow_state.get('current_task', 'تطبيق ويب')
                 
                 # Phase 2.6-A1: Extract genuine provider request ID from HTTP headers or payload
-                provider_req_id = res.headers.get('x-goog-request-id') or res.headers.get('x-request-id') or res_json.get('id')
+                raw_req_id = None
+                if hasattr(res, 'headers') and hasattr(res.headers, 'get'):
+                    val = res.headers.get('x-goog-request-id') or res.headers.get('x-request-id')
+                    if isinstance(val, str) and val.strip():
+                        raw_req_id = val.strip()
+                if not raw_req_id and isinstance(res_json, dict):
+                    val = res_json.get('id')
+                    if isinstance(val, str) and val.strip():
+                        raw_req_id = val.strip()
+                provider_req_id = raw_req_id
                 source_tag = "provider_reported" if is_reported else "estimated"
                 set_last_agent_execution(token_count, source_tag, "gemini", provider_request_id=provider_req_id, model=cur_m)
 
@@ -1621,7 +1631,16 @@ def call_agent(agent_file, role_name, short_name, color, prompt, context_text=""
                 reply = res_json['choices'][0]['message']['content']
                 usage = res_json.get('usage', {})
                 # Phase 2.6-A1: Extract genuine provider request ID from OpenRouter response
-                provider_req_id = res_json.get('id') or res.headers.get('x-request-id')
+                raw_req_id = None
+                if isinstance(res_json, dict):
+                    val = res_json.get('id')
+                    if isinstance(val, str) and val.strip():
+                        raw_req_id = val.strip()
+                if not raw_req_id and hasattr(res, 'headers') and hasattr(res.headers, 'get'):
+                    val = res.headers.get('x-request-id')
+                    if isinstance(val, str) and val.strip():
+                        raw_req_id = val.strip()
+                provider_req_id = raw_req_id
                 if 'total_tokens' in usage:
                     try:
                         tok_cnt = max(0, int(usage.get('total_tokens') or 0))

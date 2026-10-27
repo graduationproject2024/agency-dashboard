@@ -487,6 +487,9 @@ def execute_single_task(
         tokens_used = None
         token_source = "estimated"
         provider_request_id = None
+        provider = None
+        model = None
+
         if isinstance(output_res, tuple) and len(output_res) >= 3:
             output = output_res[0]
             tokens_used = output_res[1]
@@ -504,19 +507,22 @@ def execute_single_task(
                 token_source = "provider_reported" if tokens_used is not None else "estimated"
         else:
             output = output_res
-            provider = None
-            model = None
-            try:
-                from app import get_last_agent_execution
-                meta = get_last_agent_execution()
-                if meta and meta.get("tokens_used") is not None:
+
+        try:
+            from app import get_last_agent_execution
+            meta = get_last_agent_execution()
+            if meta:
+                if tokens_used is None and meta.get("tokens_used") is not None:
                     tokens_used = meta["tokens_used"]
                     token_source = meta.get("token_source", "provider_reported")
+                if provider_request_id is None:
                     provider_request_id = meta.get("provider_request_id")
+                if provider is None:
                     provider = meta.get("provider")
+                if model is None:
                     model = meta.get("model")
-            except Exception:
-                pass
+        except Exception:
+            pass
         
         if not output or not str(output).strip():
             raise RuntimeError(f"Agent {agent_id} returned empty or invalid output.")
