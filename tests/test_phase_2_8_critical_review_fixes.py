@@ -196,25 +196,39 @@ def test_release_gate_open_blocking_findings_blocks(temp_db):
 def test_release_gate_non_blocking_findings_policy_permits_release(temp_db):
     """Non-blocking findings (medium/low/warning) do not block release if deliverables and QA are valid."""
     sess_id = db_store.create_session("Non-blocking Finding Session", "Task", db_path=temp_db)
+    html = "<!DOCTYPE html><html><head><title>App</title></head><body>App</body></html>"
+    css = "body { margin: 0; }"
+    js = "console.log('clean');"
+    
+    rep = run_qa_checks(
+        app_html=html,
+        app_css=css,
+        app_js=js,
+        session_id=sess_id,
+        db_path=temp_db
+    )
+    assert rep["passed"] is True
+    qa_run_id = rep["qa_run_id"]
+    manifest = rep["artifact_manifest"]
+
     db_store.record_qa_finding(
         session_id=sess_id,
         task_id=None,
-        qa_run_id="run_1",
+        qa_run_id=qa_run_id,
         severity="low",
         category="performance",
         artifact_name="index.html",
         evidence="Image tag missing alt text",
         status="open",
+        artifact_revision=manifest.get("artifact_revision"),
         db_path=temp_db
     )
-    html = "<!DOCTYPE html><html><head><title>App</title></head><body>App</body></html>"
-    sha = hashlib.sha256(html.encode("utf-8")).hexdigest()
-    manifest = {
-        "session_id": sess_id,
-        "qa_run_id": "run_1",
-        "artifacts": [{"relative_path": "index.html", "sha256": sha}]
-    }
-    res = evaluate_release_gate(sess_id, candidate_files={"index.html": html}, artifact_manifest=manifest, db_path=temp_db)
+    res = evaluate_release_gate(
+        sess_id,
+        candidate_files={"index.html": html, "style.css": css, "script.js": js},
+        artifact_manifest=manifest,
+        db_path=temp_db
+    )
     assert res["allowed"] is True
     assert res["status"] == "passed"
     assert res["blocking_findings_count"] == 0

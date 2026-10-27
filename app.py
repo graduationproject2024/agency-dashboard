@@ -2079,6 +2079,28 @@ def validate_css_structure(css_text):
     return len(errors) == 0, errors
 
 
+def compute_artifact_revision(candidate_files: Optional[Dict[str, Any]]) -> str:
+    """
+    Compute deterministic canonical SHA-256 revision hash across candidate files.
+    Sorts relative paths, computes SHA-256 of each file's bytes, and aggregates as:
+    f"{rel_path}:{sha256};"
+    """
+    if not candidate_files or not isinstance(candidate_files, dict):
+        return ""
+    hasher = hashlib.sha256()
+    for rel_path in sorted(candidate_files.keys()):
+        content = candidate_files[rel_path] or ""
+        if isinstance(content, str):
+            c_bytes = content.encode("utf-8")
+        elif isinstance(content, bytes):
+            c_bytes = content
+        else:
+            c_bytes = str(content).encode("utf-8")
+        file_sha = hashlib.sha256(c_bytes).hexdigest().lower()
+        hasher.update(f"{rel_path}:{file_sha};".encode("utf-8"))
+    return hasher.hexdigest()
+
+
 def build_artifact_manifest(
     candidate_files: Dict[str, Union[str, bytes]],
     qa_run_id: Optional[str] = None,
@@ -2169,6 +2191,7 @@ def build_artifact_manifest(
         "manifest_version": "1.0",
         "qa_run_id": qa_run_id,
         "delivery_id": delivery_id,
+        "validation_status": validation_status,
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "total_artifacts": len(manifest_items),
         "artifacts": manifest_items
@@ -2284,16 +2307,20 @@ def run_qa_checks(
         candidate_files["index.html"] = app_html
     if app_css:
         candidate_files["style.css"] = app_css
-        candidate_files["css/style.css"] = app_css
     if app_js:
         candidate_files["script.js"] = app_js
-        candidate_files["js/script.js"] = app_js
+
+    canonical_revision = compute_artifact_revision(candidate_files)
+    effective_revision = artifact_revision or canonical_revision
 
     manifest = build_artifact_manifest(
         candidate_files,
         qa_run_id=qa_run_id,
         validation_status="passed" if passed else "failed"
     )
+    manifest["session_id"] = session_id
+    manifest["artifact_revision"] = effective_revision
+    manifest["validation_status"] = "passed" if passed else "failed"
 
     recorded_finding_ids = []
     resolved_finding_ids = []
@@ -2301,6 +2328,20 @@ def run_qa_checks(
 
     if session_id:
         try:
+            # Persist authoritative QA execution run record
+            db_store.record_qa_run(
+                qa_run_id=qa_run_id,
+                session_id=session_id,
+                artifact_revision=effective_revision,
+                validation_status="passed" if passed else "failed",
+                task_id=task_id,
+                checks=checks,
+                errors=errors,
+                db_path=db_path
+            )
+
+
+
             for err in errors:
                 err_lower = err.lower()
                 if "path traversal" in err_lower or "file://" in err_lower or "disallowed" in err_lower:
@@ -2339,6 +2380,7 @@ def run_qa_checks(
                     remediation_recommendation=f"Resolve {cat} defect in {art}: {err}",
                     responsible_agent_id="engineering-senior-developer",
                     status="open",
+                    artifact_revision=effective_revision,
                     db_path=db_path
                 )
                 recorded_finding_ids.append(fid)
@@ -2362,6 +2404,8 @@ def run_qa_checks(
                 f_status = ef.get("status")
                 art_name = ef.get("artifact_name")
                 f_task = ef.get("task_id")
+                f_rev = ef.get("artifact_revision")
+                f_sess = ef.get("session_id")
 
                 if f_status == "verified_resolved":
                     continue
@@ -2371,17 +2415,27 @@ def run_qa_checks(
                     unresolved_finding_ids.append(fid)
                     continue
 
+                # Scope check 0: Session binding - findings from another session cannot be resolved
+                if f_sess and f_sess != session_id:
+                    unresolved_finding_ids.append(fid)
+                    continue
+
+                # Scope check 1: Revision binding - finding from revision A cannot be resolved by a run for revision B
+                if f_rev and f_rev != effective_revision:
+                    unresolved_finding_ids.append(fid)
+                    continue
+
                 # If explicit findings were targeted, restrict resolution strictly to those IDs
                 if target_set is not None and fid not in target_set:
                     unresolved_finding_ids.append(fid)
                     continue
 
-                # Scope check 1: The specific artifact must have been verified in this QA run
+                # Scope check 2: The specific artifact must have been verified in this QA run
                 if art_name not in verified_artifacts:
                     unresolved_finding_ids.append(fid)
                     continue
 
-                # Scope check 2: If finding is bound to a specific task, and task_id was supplied, they must match
+                # Scope check 3: If finding is bound to a specific task, and task_id was supplied, they must match
                 if f_task and task_id and f_task != task_id:
                     unresolved_finding_ids.append(fid)
                     continue
@@ -2403,13 +2457,21 @@ def run_qa_checks(
                     logging.warning("Persistence error updating QA finding %s: %s", fid, ve)
                     unresolved_finding_ids.append(fid)
 
+            # Ensure any finding explicitly targeted by caller that was not resolved is tracked in unresolved_findings
+            if target_set is not None:
+                for target_fid in target_set:
+                    if target_fid not in resolved_finding_ids and target_fid not in unresolved_finding_ids:
+                        unresolved_finding_ids.append(target_fid)
+
         except Exception as pe:
             logging.warning("Failed to process QA findings: %s", pe)
     
     return {
         "passed": passed,
         "qa_run_id": qa_run_id,
+        "artifact_revision": effective_revision,
         "manifest": manifest,
+        "artifact_manifest": manifest,
         "checks": checks,
         "errors": errors,
         "recorded_finding_ids": recorded_finding_ids,
@@ -2582,28 +2644,55 @@ def evaluate_release_gate(
             if uncompleted_qa:
                 reasons.append(f"Required QA specialist tasks have not completed: {uncompleted_qa}")
 
-        # 3. Artifact Manifest & QA Evidence Source of Truth
-        persisted_manifest = db_store.get_artifact_manifest(session_id, db_path=db_path)
+        # 3. Mandatory Candidate Files Verification (Fix bypass where missing candidate_files skipped checks)
+        candidate_map = {}
+        candidate_rev_hash = ""
+        if candidate_files is None:
+            reasons.append("Missing candidate deliverables: candidate_files must be provided to verify release integrity")
+        elif not isinstance(candidate_files, dict):
+            reasons.append(f"Malformed candidate_files: expected dictionary, got {type(candidate_files).__name__}")
+        elif len(candidate_files) == 0:
+            reasons.append("Empty candidate deliverables: candidate_files cannot be empty")
+        else:
+            if not candidate_files.get("index.html") or not str(candidate_files["index.html"]).strip():
+                reasons.append("Required candidate deliverable index.html is missing or empty")
+            candidate_map = candidate_files
+            candidate_rev_hash = compute_artifact_revision(candidate_files)
+
+        # 4. Artifact Manifest & Authoritative Persisted QA Certification
         manifest_to_evaluate = None
+        claimed_qa_run_id = None
 
         if artifact_manifest is not None:
-            manifest_to_evaluate = artifact_manifest
-        elif persisted_manifest:
-            manifest_to_evaluate = {
-                "qa_run_id": persisted_manifest[0].get("qa_run_id") if persisted_manifest else None,
-                "session_id": session_id,
-                "artifacts": persisted_manifest,
-                "validation_status": "failed" if any(p.get("validation_status") == "failed" for p in persisted_manifest) else "passed"
-            }
-
-        # Validation: Manifest existence
-        if manifest_to_evaluate is None:
-            reasons.append("Missing artifact manifest: no candidate deliverables or certified manifest found")
-            reasons.append("Required QA verification has not been executed (missing QA evidence)")
-        elif not isinstance(manifest_to_evaluate, dict):
-            reasons.append(f"Malformed artifact manifest: manifest must be an object/dictionary, got {type(manifest_to_evaluate).__name__}")
-            reasons.append("Required QA verification has not been executed (malformed QA evidence)")
+            if not isinstance(artifact_manifest, dict):
+                reasons.append(f"Malformed artifact manifest: manifest must be an object/dictionary, got {type(artifact_manifest).__name__}")
+                reasons.append("Required QA verification has not been executed (malformed QA evidence)")
+            else:
+                manifest_to_evaluate = artifact_manifest
+                claimed_qa_run_id = artifact_manifest.get("qa_run_id")
         else:
+            persisted_entries = db_store.get_artifact_manifest(session_id, db_path=db_path)
+            if not persisted_entries:
+                reasons.append("Missing artifact manifest: no candidate deliverables or certified manifest found")
+                reasons.append("Required QA verification has not been executed (missing QA evidence)")
+            else:
+                claimed_qa_run_id = persisted_entries[0].get("qa_run_id")
+                manifest_to_evaluate = {
+                    "qa_run_id": claimed_qa_run_id,
+                    "session_id": session_id,
+                    "artifact_revision": persisted_entries[0].get("artifact_revision"),
+                    "artifacts": persisted_entries,
+                    "validation_status": "failed" if any(p.get("validation_status") == "failed" for p in persisted_entries) else "passed"
+                }
+
+        if manifest_to_evaluate is not None and isinstance(manifest_to_evaluate, dict):
+            # Check validation_status: MUST be explicitly present and equal 'passed'
+            val_status = manifest_to_evaluate.get("validation_status")
+            if not val_status:
+                reasons.append("Manifest missing required validation_status: validation_status must be explicitly present")
+            elif val_status != "passed":
+                reasons.append(f"Required QA verification checks failed: candidate manifest status is '{val_status}' (expected 'passed')")
+
             # Check session / candidate identity
             man_sess = manifest_to_evaluate.get("session_id")
             if man_sess and man_sess != session_id:
@@ -2612,9 +2701,44 @@ def evaluate_release_gate(
                     f"does not match release session '{session_id}' (cross-session or mismatched execution identity)"
                 )
 
-            # Check manifest validation status
-            if manifest_to_evaluate.get("validation_status") == "failed":
-                reasons.append("Required QA verification checks failed: candidate manifest status is 'failed'")
+            # Check qa_run_id: MUST be present, non-empty, and refer to real persisted QA execution
+            if not claimed_qa_run_id or not str(claimed_qa_run_id).strip():
+                reasons.append("Manifest missing qa_run_id: manifest does not contain a valid QA run identifier")
+                qa_run = None
+            else:
+                qa_run = db_store.get_qa_run(str(claimed_qa_run_id).strip(), db_path=db_path)
+                if not qa_run:
+                    reasons.append(
+                        f"Untrusted or forged QA evidence: qa_run_id '{claimed_qa_run_id}' "
+                        f"does not exist in authoritative persistence layer"
+                    )
+                else:
+                    if qa_run.get("session_id") != session_id:
+                        reasons.append(
+                            f"QA run session mismatch: persisted qa_run_id '{claimed_qa_run_id}' "
+                            f"belongs to session '{qa_run.get('session_id')}', not '{session_id}'"
+                        )
+                    if qa_run.get("validation_status") != "passed":
+                        reasons.append(
+                            f"Authoritative QA execution failed or incomplete: persisted run status is '{qa_run.get('validation_status')}'"
+                        )
+                    qa_rev = qa_run.get("artifact_revision")
+                    if not qa_rev:
+                        reasons.append(
+                            f"Authoritative QA execution '{claimed_qa_run_id}' is missing artifact revision binding"
+                        )
+                    else:
+                        if candidate_rev_hash and qa_rev != candidate_rev_hash:
+                            reasons.append(
+                                f"Artifact revision mismatch: candidate files revision '{candidate_rev_hash[:10]}...' "
+                                f"does not match certified QA run revision '{qa_rev[:10]}...'"
+                            )
+                        man_rev = manifest_to_evaluate.get("artifact_revision")
+                        if man_rev and man_rev != qa_rev:
+                            reasons.append(
+                                f"Manifest revision mismatch: manifest claims revision '{man_rev[:10]}...' "
+                                f"but authoritative QA run recorded '{qa_rev[:10]}...'"
+                            )
 
             # Check artifacts list
             artifacts_list = manifest_to_evaluate.get("artifacts")
@@ -2623,7 +2747,6 @@ def evaluate_release_gate(
             elif len(artifacts_list) == 0:
                 reasons.append("Empty artifact manifest: candidate deliverable manifest contains no artifacts")
             else:
-                # Validate individual manifest entries
                 sha_pattern = re.compile(r'^[0-9a-fA-F]{64}$')
                 manifest_map = {}
                 for idx, item in enumerate(artifacts_list):
@@ -2646,35 +2769,34 @@ def evaluate_release_gate(
                     if item.get("validation_status") == "failed":
                         reasons.append(f"QA verification failed for artifact '{clean_rel}' in candidate manifest")
 
-                # Deliverable index.html presence in manifest
                 if "index.html" not in manifest_map:
                     reasons.append("Required candidate deliverable index.html is missing from certified manifest")
 
-                # 4. Candidate files verification against manifest
-                if candidate_files is not None:
-                    if not isinstance(candidate_files, dict):
-                        reasons.append(f"Malformed candidate_files: expected dictionary, got {type(candidate_files).__name__}")
-                    else:
-                        if not candidate_files.get("index.html") or not str(candidate_files["index.html"]).strip():
-                            reasons.append("Required candidate deliverable index.html is missing or empty")
-
-                        for rel_name, content in candidate_files.items():
-                            if rel_name not in manifest_map:
-                                reasons.append(f"Candidate file '{rel_name}' is not certified in artifact manifest")
-                            else:
-                                actual_sha = hashlib.sha256((content or "").encode("utf-8")).hexdigest().lower()
-                                expected_sha = manifest_map[rel_name]
-                                if actual_sha != expected_sha:
-                                    reasons.append(
-                                        f"Artifact digest mismatch for {rel_name}: candidate hash {actual_sha[:10]}... "
-                                        f"does not match certified QA manifest {expected_sha[:10]}... (stale or tampered evidence)"
-                                    )
+                # Candidate content byte-for-byte digest verification
+                if candidate_map:
+                    for rel_name, content in candidate_map.items():
+                        if rel_name not in manifest_map:
+                            reasons.append(f"Candidate file '{rel_name}' is not certified in artifact manifest")
+                        else:
+                            c_bytes = content.encode("utf-8") if isinstance(content, str) else (content if isinstance(content, bytes) else str(content).encode("utf-8"))
+                            actual_sha = hashlib.sha256(c_bytes).hexdigest().lower()
+                            expected_sha = manifest_map[rel_name]
+                            if actual_sha != expected_sha:
+                                reasons.append(
+                                    f"Artifact digest mismatch for {rel_name}: candidate hash {actual_sha[:10]}... "
+                                    f"does not match certified QA manifest {expected_sha[:10]}... (stale or tampered evidence)"
+                                )
 
         # 5. Open QA findings check (blocking vs non-blocking)
         findings = db_store.list_qa_findings(session_id=session_id, db_path=db_path)
         for f in findings:
             sev = f.get("severity")
             st = f.get("status")
+            f_rev = f.get("artifact_revision")
+            # Precision finding scoping: findings bound to a different/obsolete artifact revision
+            # do not apply to this candidate revision.
+            if candidate_rev_hash and f_rev and f_rev != candidate_rev_hash:
+                continue
             if st not in ("verified_resolved", "accepted"):
                 if sev in ("critical", "high"):
                     unresolved_blocking.append(f)
@@ -2699,26 +2821,20 @@ def evaluate_release_gate(
 
         # Revision binding verification
         approved_list = [a for a in approvals if a.get("status") == "approved"]
-        if approved_list and candidate_files:
-            hasher = hashlib.sha256()
-            for k in sorted(candidate_files.keys()):
-                val = candidate_files[k] or ""
-                hasher.update(f"{k}:{hashlib.sha256(val.encode('utf-8')).hexdigest()};".encode("utf-8"))
-            current_rev_hash = hasher.hexdigest()
-
+        if approved_list and candidate_rev_hash:
             latest_approved = approved_list[0]
             appr_rev = latest_approved.get("artifact_revision_hash")
             manifest_id = manifest_to_evaluate.get("qa_run_id") if manifest_to_evaluate else None
-            if appr_rev and appr_rev != current_rev_hash and appr_rev != manifest_id:
+            if appr_rev and appr_rev != candidate_rev_hash and appr_rev != manifest_id:
                 reasons.append(
                     f"Human approval was granted for a different artifact revision "
-                    f"(approved {appr_rev[:10]}... vs current {current_rev_hash[:10]}...). Re-approval required."
+                    f"(approved {appr_rev[:10]}... vs current {candidate_rev_hash[:10]}...). Re-approval required."
                 )
 
         allowed = len(reasons) == 0
         gate_status = "passed" if allowed else "blocked"
         approval_status = "approved" if (approved_list and not pending_apprs) else ("pending" if pending_apprs else ("none" if not approvals else "rejected"))
-        qa_status = "passed" if (manifest_to_evaluate and not unresolved_blocking and not any("QA" in r for r in reasons)) else "failed"
+        qa_status = "passed" if (manifest_to_evaluate and not unresolved_blocking and not any("QA" in r for r in reasons) and not any("manifest" in r.lower() for r in reasons)) else "failed"
 
         return {
             "allowed": allowed,
@@ -3151,6 +3267,22 @@ def continue_workflow(feedback="", session_id=None, call_agent_fn=None):
             qa_report = run_qa_checks(app_html, app_css, app_js, session_id=session_id)
         except TypeError:
             qa_report = run_qa_checks(app_html, app_css, app_js)
+        if session_id and qa_report and qa_report.get("qa_run_id"):
+            try:
+                existing_run = db_store.get_qa_run(qa_report["qa_run_id"])
+                if not existing_run:
+                    db_store.record_qa_run(
+                        qa_run_id=qa_report["qa_run_id"],
+                        session_id=session_id,
+                        artifact_revision=qa_report.get("artifact_revision") or compute_artifact_revision({"index.html": app_html, "style.css": app_css, "script.js": app_js}),
+                        validation_status="passed" if qa_report.get("passed") else "failed",
+                        checks=qa_report.get("checks", {}),
+                        errors=qa_report.get("errors", [])
+                    )
+                if qa_report.get("manifest") and not qa_report["manifest"].get("session_id"):
+                    qa_report["manifest"]["session_id"] = session_id
+            except Exception as pe:
+                logging.warning("Failed to ensure QA run persistence in continue_workflow: %s", pe)
         with state_lock:
             workflow_state["qa_report"] = qa_report
 
@@ -3226,6 +3358,22 @@ def continue_workflow(feedback="", session_id=None, call_agent_fn=None):
                             qa_report = run_qa_checks(app_html, app_css, app_js, session_id=session_id)
                         except TypeError:
                             qa_report = run_qa_checks(app_html, app_css, app_js)
+                        if session_id and qa_report and qa_report.get("qa_run_id"):
+                            try:
+                                existing_run = db_store.get_qa_run(qa_report["qa_run_id"])
+                                if not existing_run:
+                                    db_store.record_qa_run(
+                                        qa_run_id=qa_report["qa_run_id"],
+                                        session_id=session_id,
+                                        artifact_revision=qa_report.get("artifact_revision") or compute_artifact_revision({"index.html": app_html, "style.css": app_css, "script.js": app_js}),
+                                        validation_status="passed" if qa_report.get("passed") else "failed",
+                                        checks=qa_report.get("checks", {}),
+                                        errors=qa_report.get("errors", [])
+                                    )
+                                if qa_report.get("manifest") and not qa_report["manifest"].get("session_id"):
+                                    qa_report["manifest"]["session_id"] = session_id
+                            except Exception as pe:
+                                logging.warning("Failed to ensure QA run persistence in remediation loop: %s", pe)
                         with state_lock:
                             workflow_state["qa_report"] = qa_report
                             workflow_state["outputs"]["development"] = rem_output

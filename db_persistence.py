@@ -634,7 +634,35 @@ def init_db(db_path: Optional[str] = None):
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_approvals_status ON human_approvals(status);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_approvals_action ON human_approvals(action_type);")
 
-        # 14. Phase 2.8 schema enhancements to task_handoffs and workflow_tasks
+        # 14. QA Runs table (Phase 2.8 Trusted QA Certification & Execution Evidence)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS qa_runs (
+            qa_run_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            task_id TEXT,
+            artifact_revision TEXT NOT NULL,
+            validation_status TEXT NOT NULL CHECK(validation_status IN ('passed', 'failed')),
+            checks_json TEXT NOT NULL DEFAULT '{}',
+            errors_json TEXT NOT NULL DEFAULT '[]',
+            created_at REAL NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES workflow_sessions(session_id) ON DELETE CASCADE
+        );
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_qa_runs_session ON qa_runs(session_id);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_qa_runs_status ON qa_runs(validation_status);")
+
+        # Phase 2.8 schema enhancements to qa_findings and artifact_manifests (artifact_revision binding)
+        cursor.execute("PRAGMA table_info(qa_findings);")
+        qaf_cols = {row[1] for row in cursor.fetchall()}
+        if "artifact_revision" not in qaf_cols:
+            cursor.execute("ALTER TABLE qa_findings ADD COLUMN artifact_revision TEXT;")
+
+        cursor.execute("PRAGMA table_info(artifact_manifests);")
+        man_cols = {row[1] for row in cursor.fetchall()}
+        if "artifact_revision" not in man_cols:
+            cursor.execute("ALTER TABLE artifact_manifests ADD COLUMN artifact_revision TEXT;")
+
+        # 15. Phase 2.8 schema enhancements to task_handoffs and workflow_tasks
         cursor.execute("PRAGMA table_info(task_handoffs);")
         hoff_cols = {row[1] for row in cursor.fetchall()}
         if "contract_version" not in hoff_cols:
@@ -1791,10 +1819,11 @@ def record_qa_finding(
     responsible_agent_id: Optional[str] = None,
     task_id: Optional[str] = None,
     status: str = "open",
+    artifact_revision: Optional[str] = None,
     db_path: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Persist structured QA finding with audit trail.
+    Persist structured QA finding with audit trail and artifact revision binding.
     Ensures that verification history and findings remain durable and tamper-resistant.
     """
     if severity not in VALID_QA_SEVERITIES:
@@ -1814,12 +1843,12 @@ def record_qa_finding(
             INSERT INTO qa_findings (
                 finding_id, session_id, task_id, qa_run_id, severity, category,
                 artifact_name, evidence, remediation_recommendation, responsible_agent_id,
-                status, verification_history_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?);
+                status, verification_history_json, artifact_revision, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?);
         """, (
             finding_id, session_id, task_id, qa_run_id, severity, category,
             artifact_name, safe_evidence, safe_remed, responsible_agent_id,
-            status, now, now
+            status, artifact_revision, now, now
         ))
         conn.commit()
 
@@ -1836,6 +1865,7 @@ def record_qa_finding(
         "responsible_agent_id": responsible_agent_id,
         "status": status,
         "verification_history": [],
+        "artifact_revision": artifact_revision,
         "created_at": now,
         "updated_at": now
     })
@@ -1958,6 +1988,102 @@ def update_qa_finding_status(
         conn.commit()
 
     return (True, "")
+
+
+# =========================================================================
+# QA Execution Certification & Evidence Layer (Phase 2.8)
+# =========================================================================
+
+def record_qa_run(
+    qa_run_id: str,
+    session_id: str,
+    artifact_revision: str,
+    validation_status: str,
+    task_id: Optional[str] = None,
+    checks: Optional[Dict[str, Any]] = None,
+    errors: Optional[List[str]] = None,
+    db_path: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Persist an authoritative QA test execution record linked to session and immutable artifact revision.
+    Enforces deterministic validation_status ('passed' or 'failed').
+    """
+    if not qa_run_id or not str(qa_run_id).strip():
+        raise ValueError("qa_run_id is required and cannot be empty")
+    if not session_id or not str(session_id).strip():
+        raise ValueError("session_id is required and cannot be empty")
+    if not artifact_revision or not str(artifact_revision).strip():
+        raise ValueError("artifact_revision is required and cannot be empty")
+    if validation_status not in ("passed", "failed"):
+        raise ValueError(f"Invalid validation_status '{validation_status}', must be 'passed' or 'failed'")
+
+    now = time.time()
+    checks_json = json.dumps(checks or {})
+    errors_json = json.dumps(errors or [])
+
+    with get_db_connection(db_path) as conn:
+        conn.execute("""
+            INSERT INTO qa_runs (
+                qa_run_id, session_id, task_id, artifact_revision,
+                validation_status, checks_json, errors_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(qa_run_id) DO UPDATE SET
+                validation_status = excluded.validation_status,
+                checks_json = excluded.checks_json,
+                errors_json = excluded.errors_json,
+                artifact_revision = excluded.artifact_revision;
+        """, (qa_run_id, session_id, task_id, artifact_revision, validation_status, checks_json, errors_json, now))
+        conn.commit()
+
+    return {
+        "qa_run_id": qa_run_id,
+        "session_id": session_id,
+        "task_id": task_id,
+        "artifact_revision": artifact_revision,
+        "validation_status": validation_status,
+        "checks": checks or {},
+        "errors": errors or [],
+        "created_at": now
+    }
+
+
+def get_qa_run(qa_run_id: str, db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Retrieve an authoritative persisted QA execution record by qa_run_id."""
+    if not qa_run_id:
+        return None
+    with get_db_connection(db_path) as conn:
+        row = conn.execute("SELECT * FROM qa_runs WHERE qa_run_id = ?;", (str(qa_run_id),)).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        try:
+            d["checks"] = json.loads(d.get("checks_json") or "{}")
+        except Exception:
+            d["checks"] = {}
+        try:
+            d["errors"] = json.loads(d.get("errors_json") or "[]")
+        except Exception:
+            d["errors"] = []
+        return d
+
+
+def list_qa_runs(session_id: str, db_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    """List all persisted QA execution records for a session in reverse chronological order."""
+    with get_db_connection(db_path) as conn:
+        rows = conn.execute("SELECT * FROM qa_runs WHERE session_id = ? ORDER BY created_at DESC;", (session_id,)).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["checks"] = json.loads(d.get("checks_json") or "{}")
+            except Exception:
+                d["checks"] = {}
+            try:
+                d["errors"] = json.loads(d.get("errors_json") or "[]")
+            except Exception:
+                d["errors"] = []
+            out.append(d)
+        return out
 
 
 # =========================================================================
@@ -2691,11 +2817,12 @@ def record_artifact_manifest(
     qa_run_id: Optional[str] = None,
     manifest: Optional[List[Dict[str, Any]]] = None,
     delivery_id: Optional[str] = None,
+    artifact_revision: Optional[str] = None,
     db_path: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """
     Persist validated artifact manifest entries linked to a specific session,
-    QA validation run, and atomic publication delivery ID.
+    QA validation run, atomic publication delivery ID, and immutable artifact revision.
     Enforces deterministic manifest IDs and idempotent storage.
     """
     if not manifest:
@@ -2709,6 +2836,7 @@ def record_artifact_manifest(
             sha256_hash = str(item.get("sha256") or "").lower()
             artifact_type = str(item.get("artifact_type") or "asset")
             val_status = str(item.get("validation_status") or "passed")
+            eff_rev = artifact_revision or item.get("artifact_revision")
             
             # Deterministic manifest entry ID
             raw_key = f"{session_id}_{qa_run_id or 'none'}_{delivery_id or 'none'}_{rel_path}"
@@ -2718,12 +2846,13 @@ def record_artifact_manifest(
                 INSERT INTO artifact_manifests (
                     manifest_id, session_id, qa_run_id, delivery_id,
                     relative_path, file_size, sha256, artifact_type,
-                    validation_status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    validation_status, artifact_revision, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(manifest_id) DO UPDATE SET
                     delivery_id = excluded.delivery_id,
-                    validation_status = excluded.validation_status;
-            """, (mid, session_id, qa_run_id, delivery_id, rel_path, file_size, sha256_hash, artifact_type, val_status, now))
+                    validation_status = excluded.validation_status,
+                    artifact_revision = excluded.artifact_revision;
+            """, (mid, session_id, qa_run_id, delivery_id, rel_path, file_size, sha256_hash, artifact_type, val_status, eff_rev, now))
             
             records.append({
                 "manifest_id": mid,
@@ -2735,6 +2864,7 @@ def record_artifact_manifest(
                 "sha256": sha256_hash,
                 "artifact_type": artifact_type,
                 "validation_status": val_status,
+                "artifact_revision": eff_rev,
                 "created_at": now
             })
         conn.commit()
