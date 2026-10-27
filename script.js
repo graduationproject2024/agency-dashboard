@@ -1458,6 +1458,8 @@ async function loadQualityGatesData() {
                     ${reasonsHtml}
                 </div>
             `;
+        } else {
+            cardEl.innerHTML = '<div style="background: rgba(218, 54, 51, 0.15); border: 1px solid #da3633; border-radius: 8px; padding: 15px; color: #f85149; text-align: center;">تعذر جلب تقرير بوابة الإطلاق من الخادم.</div>';
         }
 
         const findRes = await fetch(`/api/sessions/${encodeURIComponent(currentOrchSessionId)}/qa_findings`);
@@ -1507,6 +1509,9 @@ async function loadQualityGatesData() {
         }
     } catch (err) {
         console.error("Error loading quality gates data:", err);
+        if (cardEl) {
+            cardEl.innerHTML = '<div style="background: rgba(218, 54, 51, 0.15); border: 1px solid #da3633; border-radius: 8px; padding: 15px; color: #f85149; text-align: center;">خطأ في الاتصال أثناء جلب بيانات بوابات الجودة.</div>';
+        }
     }
 }
 

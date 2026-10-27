@@ -1927,6 +1927,10 @@ def update_qa_finding_status(
             return (False, f"QA finding {finding_id} not found")
 
         finding = dict(row)
+        # Idempotent state transition guard: preserve audit integrity on repeat runs
+        if finding.get("status") == eff_status:
+            return (True, "")
+
         # Prevent self-certification
         if eff_status == "verified_resolved":
             if verified_by_agent and verified_by_agent == finding.get("responsible_agent_id"):

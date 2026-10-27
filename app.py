@@ -2175,7 +2175,16 @@ def build_artifact_manifest(
     }
 
 
-def run_qa_checks(app_html, app_css="", app_js="", session_id=None, task_id=None, db_path=None):
+def run_qa_checks(
+    app_html,
+    app_css="",
+    app_js="",
+    session_id=None,
+    task_id=None,
+    verified_finding_ids=None,
+    artifact_revision=None,
+    db_path=None
+):
     """
     Production QA Gate Entry Point:
     Directly testable structural, syntactic, security, and asset completeness verification.
@@ -2184,6 +2193,9 @@ def run_qa_checks(app_html, app_css="", app_js="", session_id=None, task_id=None
     inspects local asset references for path traversal escapes, and returns a structured report
     with a deterministic candidate artifact manifest.
     When session_id is provided, persists structured findings to the durable qa_findings registry.
+    Scoping: A QA run may resolve ONLY findings for which it has sufficient, explicit evidence
+    that the specific issue has been fixed. Unrelated findings, findings for other artifacts,
+    or findings not covered by this run strictly remain open.
     """
     errors = []
     qa_run_id = f"qa_run_{uuid.uuid4().hex[:12]}"
@@ -2284,6 +2296,9 @@ def run_qa_checks(app_html, app_css="", app_js="", session_id=None, task_id=None
     )
 
     recorded_finding_ids = []
+    resolved_finding_ids = []
+    unresolved_finding_ids = []
+
     if session_id:
         try:
             for err in errors:
@@ -2328,19 +2343,68 @@ def run_qa_checks(app_html, app_css="", app_js="", session_id=None, task_id=None
                 )
                 recorded_finding_ids.append(fid)
 
-            # If passed, verify previously open findings for this session (independent QA verification)
-            if passed:
-                existing_findings = db_store.list_qa_findings(session_id=session_id, status="open", db_path=db_path)
-                for ef in existing_findings:
-                    db_store.update_qa_finding_status(
-                        finding_id=ef["finding_id"],
+            # Scoped QA Finding Resolution:
+            # Only resolve findings for which this QA run has sufficient, explicit evidence that the issue is fixed.
+            existing_findings = db_store.list_qa_findings(session_id=session_id, db_path=db_path)
+
+            verified_artifacts = set()
+            if app_html and isinstance(app_html, str) and len(app_html.strip()) >= 50 and checks.get("html_doctype_or_tags") and checks.get("html_structure_valid"):
+                verified_artifacts.add("index.html")
+            if app_css and isinstance(app_css, str) and app_css.strip() and checks.get("css_syntax_balanced"):
+                verified_artifacts.add("style.css")
+            if app_js and isinstance(app_js, str) and app_js.strip() and checks.get("js_syntax_validated"):
+                verified_artifacts.add("script.js")
+
+            target_set = set(verified_finding_ids) if verified_finding_ids is not None else None
+
+            for ef in existing_findings:
+                fid = ef.get("finding_id")
+                f_status = ef.get("status")
+                art_name = ef.get("artifact_name")
+                f_task = ef.get("task_id")
+
+                if f_status == "verified_resolved":
+                    continue
+
+                # If this QA run failed, no open findings may be resolved
+                if not passed:
+                    unresolved_finding_ids.append(fid)
+                    continue
+
+                # If explicit findings were targeted, restrict resolution strictly to those IDs
+                if target_set is not None and fid not in target_set:
+                    unresolved_finding_ids.append(fid)
+                    continue
+
+                # Scope check 1: The specific artifact must have been verified in this QA run
+                if art_name not in verified_artifacts:
+                    unresolved_finding_ids.append(fid)
+                    continue
+
+                # Scope check 2: If finding is bound to a specific task, and task_id was supplied, they must match
+                if f_task and task_id and f_task != task_id:
+                    unresolved_finding_ids.append(fid)
+                    continue
+
+                # Perform independent QA verification transition
+                try:
+                    ok, err = db_store.update_qa_finding_status(
+                        finding_id=fid,
                         status="verified_resolved",
                         verified_by_agent="engineering-qa-engineer",
-                        note="Verified resolved by passed QA test run",
+                        note=f"Verified resolved by passed QA test run {qa_run_id} for artifact {art_name}",
                         db_path=db_path
                     )
+                    if ok:
+                        resolved_finding_ids.append(fid)
+                    else:
+                        unresolved_finding_ids.append(fid)
+                except Exception as ve:
+                    logging.warning("Persistence error updating QA finding %s: %s", fid, ve)
+                    unresolved_finding_ids.append(fid)
+
         except Exception as pe:
-            logging.warning("Failed to record QA findings to persistence: %s", pe)
+            logging.warning("Failed to process QA findings: %s", pe)
     
     return {
         "passed": passed,
@@ -2349,6 +2413,8 @@ def run_qa_checks(app_html, app_css="", app_js="", session_id=None, task_id=None
         "checks": checks,
         "errors": errors,
         "recorded_finding_ids": recorded_finding_ids,
+        "resolved_findings": resolved_finding_ids,
+        "unresolved_findings": unresolved_finding_ids,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
     }
 
@@ -2445,125 +2511,246 @@ def evaluate_release_gate(
     db_path: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Phase 2.8: Fail-closed production release gate.
-    Evaluates real artifacts and persistent execution evidence.
-    Fails closed if:
-    - Session does not exist.
-    - Required QA verification has not run.
-    - Required tests or checks failed.
-    - Required artifacts are missing or invalid.
-    - Unresolved critical or high QA findings remain open.
-    - Required human approvals are absent, pending, expired, or rejected.
-    - Evidence belongs to a different or stale artifact revision (hash mismatch).
-    - Workflow state contains failed or blocked tasks.
+    Phase 2.8: Genuinely fail-closed production release gate.
+    Evaluates real artifacts, persisted execution records, and QA certification.
+    Enforces strict fail-closed release policy:
+    A release is ONLY approved if:
+    - Session exists in persistence and is in a valid state.
+    - Certified artifact manifest is present, non-empty, and structurally valid.
+    - All manifest artifact digests are valid 64-character hex SHA-256 hashes.
+    - Candidate files (if supplied) match manifest digests byte-for-byte.
+    - Required deliverable 'index.html' is present and non-empty.
+    - Candidate files are completely covered by certified manifest (no uncertified files).
+    - QA verification has been executed, passed, and belongs to this exact session/candidate.
+    - Required QA specialist tasks (if present in workflow) have completed successfully.
+    - No active, running, failed, or blocked tasks exist in the workflow.
+    - No unresolved critical or high QA findings remain open.
+    - Required human approvals are granted for the current artifact revision (anti-tampering).
+    - Any persistence or evidence retrieval failure immediately fails closed.
     """
     reasons = []
+    unresolved_blocking = []
+    non_blocking_findings = []
+    qa_status = "unverified"
+    approval_status = "none"
 
-    # 1. Session check
-    sess = db_store.get_session(session_id, db_path=db_path)
-    if not sess:
+    try:
+        # 1. Session persistence check
+        sess = db_store.get_session(session_id, db_path=db_path)
+        if not sess:
+            return {
+                "allowed": False,
+                "status": "blocked",
+                "gate_name": "release_gate",
+                "session_id": session_id,
+                "reasons": ["Session does not exist in persistence layer"],
+                "qa_status": "unverified",
+                "approval_status": "none",
+                "blocking_findings_count": 0,
+                "blocking_findings": [],
+                "non_blocking_findings_count": 0,
+                "non_blocking_findings": [],
+                "eval_timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+
+        # 2. Workflow task state check
+        tasks = db_store.list_tasks_for_session(session_id, db_path=db_path)
+        failed_tasks = [t["task_id"] for t in tasks if isinstance(t, dict) and t.get("status") == "failed"]
+        blocked_tasks = [t["task_id"] for t in tasks if isinstance(t, dict) and t.get("status") == "blocked"]
+        active_tasks = [
+            t["task_id"] for t in tasks
+            if isinstance(t, dict) and t.get("status") in ("running", "ready") and t.get("stage") != "delivery"
+        ]
+        if failed_tasks:
+            reasons.append(f"Workflow contains {len(failed_tasks)} failed task(s): {failed_tasks}")
+        if blocked_tasks:
+            reasons.append(f"Workflow contains {len(blocked_tasks)} blocked task(s): {blocked_tasks}")
+        if active_tasks:
+            reasons.append(f"Workflow contains {len(active_tasks)} active/uncompleted pre-delivery task(s): {active_tasks}")
+
+        # Required QA specialist task execution check
+        qa_tasks = [
+            t for t in tasks
+            if isinstance(t, dict) and (
+                t.get("stage") == "qa" or
+                "qa" in str(t.get("division_id", "")).lower() or
+                "qa" in str(t.get("title", "")).lower()
+            )
+        ]
+        if qa_tasks:
+            uncompleted_qa = [t["task_id"] for t in qa_tasks if t.get("status") != "completed"]
+            if uncompleted_qa:
+                reasons.append(f"Required QA specialist tasks have not completed: {uncompleted_qa}")
+
+        # 3. Artifact Manifest & QA Evidence Source of Truth
+        persisted_manifest = db_store.get_artifact_manifest(session_id, db_path=db_path)
+        manifest_to_evaluate = None
+
+        if artifact_manifest is not None:
+            manifest_to_evaluate = artifact_manifest
+        elif persisted_manifest:
+            manifest_to_evaluate = {
+                "qa_run_id": persisted_manifest[0].get("qa_run_id") if persisted_manifest else None,
+                "session_id": session_id,
+                "artifacts": persisted_manifest,
+                "validation_status": "failed" if any(p.get("validation_status") == "failed" for p in persisted_manifest) else "passed"
+            }
+
+        # Validation: Manifest existence
+        if manifest_to_evaluate is None:
+            reasons.append("Missing artifact manifest: no candidate deliverables or certified manifest found")
+            reasons.append("Required QA verification has not been executed (missing QA evidence)")
+        elif not isinstance(manifest_to_evaluate, dict):
+            reasons.append(f"Malformed artifact manifest: manifest must be an object/dictionary, got {type(manifest_to_evaluate).__name__}")
+            reasons.append("Required QA verification has not been executed (malformed QA evidence)")
+        else:
+            # Check session / candidate identity
+            man_sess = manifest_to_evaluate.get("session_id")
+            if man_sess and man_sess != session_id:
+                reasons.append(
+                    f"QA evidence candidate mismatch: manifest session_id '{man_sess}' "
+                    f"does not match release session '{session_id}' (cross-session or mismatched execution identity)"
+                )
+
+            # Check manifest validation status
+            if manifest_to_evaluate.get("validation_status") == "failed":
+                reasons.append("Required QA verification checks failed: candidate manifest status is 'failed'")
+
+            # Check artifacts list
+            artifacts_list = manifest_to_evaluate.get("artifacts")
+            if artifacts_list is None or not isinstance(artifacts_list, list):
+                reasons.append("Malformed artifact manifest: 'artifacts' must be a list")
+            elif len(artifacts_list) == 0:
+                reasons.append("Empty artifact manifest: candidate deliverable manifest contains no artifacts")
+            else:
+                # Validate individual manifest entries
+                sha_pattern = re.compile(r'^[0-9a-fA-F]{64}$')
+                manifest_map = {}
+                for idx, item in enumerate(artifacts_list):
+                    if not isinstance(item, dict):
+                        reasons.append(f"Malformed artifact entry at index {idx}: expected dictionary, got {type(item).__name__}")
+                        continue
+                    rel_p = item.get("relative_path")
+                    if not rel_p or not str(rel_p).strip():
+                        reasons.append(f"Malformed artifact entry at index {idx}: missing 'relative_path'")
+                        continue
+                    clean_rel = str(rel_p).strip()
+                    raw_sha = item.get("sha256")
+                    if not raw_sha or not isinstance(raw_sha, str) or not sha_pattern.match(raw_sha):
+                        reasons.append(
+                            f"Invalid or missing manifest digest for artifact '{clean_rel}': expected valid 64-character hexadecimal SHA-256 hash"
+                        )
+                    else:
+                        manifest_map[clean_rel] = raw_sha.lower()
+
+                    if item.get("validation_status") == "failed":
+                        reasons.append(f"QA verification failed for artifact '{clean_rel}' in candidate manifest")
+
+                # Deliverable index.html presence in manifest
+                if "index.html" not in manifest_map:
+                    reasons.append("Required candidate deliverable index.html is missing from certified manifest")
+
+                # 4. Candidate files verification against manifest
+                if candidate_files is not None:
+                    if not isinstance(candidate_files, dict):
+                        reasons.append(f"Malformed candidate_files: expected dictionary, got {type(candidate_files).__name__}")
+                    else:
+                        if not candidate_files.get("index.html") or not str(candidate_files["index.html"]).strip():
+                            reasons.append("Required candidate deliverable index.html is missing or empty")
+
+                        for rel_name, content in candidate_files.items():
+                            if rel_name not in manifest_map:
+                                reasons.append(f"Candidate file '{rel_name}' is not certified in artifact manifest")
+                            else:
+                                actual_sha = hashlib.sha256((content or "").encode("utf-8")).hexdigest().lower()
+                                expected_sha = manifest_map[rel_name]
+                                if actual_sha != expected_sha:
+                                    reasons.append(
+                                        f"Artifact digest mismatch for {rel_name}: candidate hash {actual_sha[:10]}... "
+                                        f"does not match certified QA manifest {expected_sha[:10]}... (stale or tampered evidence)"
+                                    )
+
+        # 5. Open QA findings check (blocking vs non-blocking)
+        findings = db_store.list_qa_findings(session_id=session_id, db_path=db_path)
+        for f in findings:
+            sev = f.get("severity")
+            st = f.get("status")
+            if st not in ("verified_resolved", "accepted"):
+                if sev in ("critical", "high"):
+                    unresolved_blocking.append(f)
+                else:
+                    non_blocking_findings.append(f)
+
+        if unresolved_blocking:
+            reasons.append(f"Unresolved critical/high blocking findings exist ({len(unresolved_blocking)} blocking findings)")
+
+        # 6. Approvals check
+        approvals = db_store.list_approval_requests(session_id=session_id, db_path=db_path)
+        pending_apprs = [a for a in approvals if a.get("status") == "pending"]
+        rejected_apprs = [a for a in approvals if a.get("status") == "rejected"]
+        expired_apprs = [a for a in approvals if a.get("status") == "expired"]
+
+        if pending_apprs:
+            reasons.append(f"Protected action blocked: {len(pending_apprs)} approval request(s) pending human sign-off")
+        if rejected_apprs:
+            reasons.append(f"Protected action blocked: human approval was rejected ({rejected_apprs[0].get('decision_reason', 'no reason provided')})")
+        if expired_apprs and not any(a.get("status") == "approved" for a in approvals):
+            reasons.append("Protected action blocked: approval request expired without authorized decision")
+
+        # Revision binding verification
+        approved_list = [a for a in approvals if a.get("status") == "approved"]
+        if approved_list and candidate_files:
+            hasher = hashlib.sha256()
+            for k in sorted(candidate_files.keys()):
+                val = candidate_files[k] or ""
+                hasher.update(f"{k}:{hashlib.sha256(val.encode('utf-8')).hexdigest()};".encode("utf-8"))
+            current_rev_hash = hasher.hexdigest()
+
+            latest_approved = approved_list[0]
+            appr_rev = latest_approved.get("artifact_revision_hash")
+            manifest_id = manifest_to_evaluate.get("qa_run_id") if manifest_to_evaluate else None
+            if appr_rev and appr_rev != current_rev_hash and appr_rev != manifest_id:
+                reasons.append(
+                    f"Human approval was granted for a different artifact revision "
+                    f"(approved {appr_rev[:10]}... vs current {current_rev_hash[:10]}...). Re-approval required."
+                )
+
+        allowed = len(reasons) == 0
+        gate_status = "passed" if allowed else "blocked"
+        approval_status = "approved" if (approved_list and not pending_apprs) else ("pending" if pending_apprs else ("none" if not approvals else "rejected"))
+        qa_status = "passed" if (manifest_to_evaluate and not unresolved_blocking and not any("QA" in r for r in reasons)) else "failed"
+
+        return {
+            "allowed": allowed,
+            "status": gate_status,
+            "gate_name": "release_gate",
+            "session_id": session_id,
+            "reasons": reasons,
+            "qa_status": qa_status,
+            "approval_status": approval_status,
+            "blocking_findings_count": len(unresolved_blocking),
+            "blocking_findings": [f.get("finding_id") for f in unresolved_blocking],
+            "non_blocking_findings_count": len(non_blocking_findings),
+            "non_blocking_findings": [f.get("finding_id") for f in non_blocking_findings],
+            "eval_timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+    except Exception as e:
+        logging.exception("Exception during evaluate_release_gate for session %s: %s", session_id, e)
         return {
             "allowed": False,
             "status": "blocked",
             "gate_name": "release_gate",
             "session_id": session_id,
-            "reasons": ["Session does not exist in persistence layer"],
+            "reasons": [f"Persistence or evidence-retrieval failure during release-gate evaluation: {str(e)}"],
             "qa_status": "unverified",
-            "approval_status": "none"
+            "approval_status": "none",
+            "blocking_findings_count": 0,
+            "blocking_findings": [],
+            "non_blocking_findings_count": 0,
+            "non_blocking_findings": [],
+            "eval_timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
         }
-
-    # 2. Workflow task state check
-    tasks = db_store.list_tasks_for_session(session_id, db_path=db_path)
-    failed_tasks = [t["task_id"] for t in tasks if t.get("status") == "failed"]
-    blocked_tasks = [t["task_id"] for t in tasks if t.get("status") == "blocked"]
-    if failed_tasks:
-        reasons.append(f"Workflow contains {len(failed_tasks)} failed task(s): {failed_tasks}")
-    if blocked_tasks:
-        reasons.append(f"Workflow contains {len(blocked_tasks)} blocked task(s): {blocked_tasks}")
-
-    # 3. QA run check
-    qa_manifest = db_store.get_artifact_manifest(session_id, db_path=db_path)
-    findings = db_store.list_qa_findings(session_id=session_id, db_path=db_path)
-
-    # Has QA been executed?
-    if not qa_manifest and not findings and not artifact_manifest:
-        reasons.append("Required QA verification has not been executed (missing QA evidence)")
-
-    # 4. Open QA findings check
-    unresolved_blocking = [
-        f for f in findings
-        if f.get("severity") in ("critical", "high") and f.get("status") not in ("verified_resolved", "accepted")
-    ]
-    if unresolved_blocking:
-        reasons.append(f"Unresolved critical/high QA findings exist ({len(unresolved_blocking)} blocking findings)")
-
-    # 5. Candidate files & Manifest integrity check
-    if candidate_files:
-        if not candidate_files.get("index.html") or not candidate_files["index.html"].strip():
-            reasons.append("Required candidate deliverable index.html is missing or empty")
-
-        if artifact_manifest and isinstance(artifact_manifest, dict):
-            manifest_items = artifact_manifest.get("artifacts", [])
-            manifest_map = {item["relative_path"]: item.get("sha256") for item in manifest_items}
-            for rel_name, content in candidate_files.items():
-                if rel_name in manifest_map and content is not None:
-                    actual_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
-                    expected_sha = manifest_map[rel_name]
-                    if actual_sha != expected_sha:
-                        reasons.append(
-                            f"Artifact digest mismatch for {rel_name}: candidate hash {actual_sha[:10]}... "
-                            f"does not match certified QA manifest {expected_sha[:10]}... (stale or tampered evidence)"
-                        )
-
-    # 6. Approvals check
-    approvals = db_store.list_approval_requests(session_id=session_id, db_path=db_path)
-    pending_apprs = [a for a in approvals if a.get("status") == "pending"]
-    rejected_apprs = [a for a in approvals if a.get("status") == "rejected"]
-    expired_apprs = [a for a in approvals if a.get("status") == "expired"]
-
-    if pending_apprs:
-        reasons.append(f"Protected action blocked: {len(pending_apprs)} approval request(s) pending human sign-off")
-    if rejected_apprs:
-        reasons.append(f"Protected action blocked: human approval was rejected ({rejected_apprs[0].get('decision_reason', 'no reason provided')})")
-    if expired_apprs and not any(a.get("status") == "approved" for a in approvals):
-        reasons.append("Protected action blocked: approval request expired without authorized decision")
-
-    # If approval is approved, check revision binding against candidate files
-    approved_list = [a for a in approvals if a.get("status") == "approved"]
-    if approved_list and candidate_files:
-        # compute candidate revision hash (hash of sorted artifact digests)
-        hasher = hashlib.sha256()
-        for k in sorted(candidate_files.keys()):
-            val = candidate_files[k] or ""
-            hasher.update(f"{k}:{hashlib.sha256(val.encode('utf-8')).hexdigest()};".encode("utf-8"))
-        current_rev_hash = hasher.hexdigest()
-
-        latest_approved = approved_list[0]
-        appr_rev = latest_approved.get("artifact_revision_hash")
-        manifest_id = artifact_manifest.get("qa_run_id") if artifact_manifest else None
-        if appr_rev and appr_rev != current_rev_hash and appr_rev != manifest_id:
-            reasons.append(
-                f"Human approval was granted for a different artifact revision "
-                f"(approved {appr_rev[:10]}... vs current {current_rev_hash[:10]}...). Re-approval required."
-            )
-
-    allowed = len(reasons) == 0
-    gate_status = "passed" if allowed else "blocked"
-    approval_status = "approved" if (approved_list and not pending_apprs) else ("pending" if pending_apprs else ("none" if not approvals else "rejected"))
-    qa_status = "passed" if (qa_manifest or artifact_manifest) and not unresolved_blocking else "failed"
-
-    return {
-        "allowed": allowed,
-        "status": gate_status,
-        "gate_name": "release_gate",
-        "session_id": session_id,
-        "reasons": reasons,
-        "qa_status": qa_status,
-        "approval_status": approval_status,
-        "blocking_findings_count": len(unresolved_blocking),
-        "blocking_findings": [f.get("finding_id") for f in unresolved_blocking],
-        "eval_timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-    }
 
 
 def publish_workflow_deliverables(

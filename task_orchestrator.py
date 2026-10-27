@@ -22,20 +22,48 @@ STAGE_DIVISION_DEFAULTS = {
     "delivery": ("project-management", "Project Management")
 }
 
+MAX_WORKFLOW_TASKS = 1000
+
 def detect_cycles(task_defs: Any) -> Tuple[bool, List[str]]:
     """
     Check for circular dependencies in a proposed task graph using DFS.
     task_defs: either a list of task dicts (with 'id' or 'task_id' and 'dependencies')
                or a dict mapping node -> list of dependencies.
+    Resilient against non-dictionary elements, invalid types, and deep graphs.
     Returns (has_cycle: bool, cycle_path: List[str]).
     """
     adj = {}
     if isinstance(task_defs, list):
         for t in task_defs:
-            tid = t.get("id") or t.get("task_id")
-            adj[tid] = t.get("dependencies", [])
+            if not isinstance(t, dict):
+                continue
+            raw_id = t.get("id") if "id" in t else t.get("task_id")
+            if raw_id is None:
+                continue
+            tid = str(raw_id).strip()
+            if not tid:
+                continue
+            raw_deps = t.get("dependencies")
+            if isinstance(raw_deps, list):
+                adj[tid] = [str(d).strip() for d in raw_deps if d is not None and str(d).strip()]
+            else:
+                adj[tid] = []
     elif isinstance(task_defs, dict):
-        adj = task_defs
+        for k, v in task_defs.items():
+            k_str = str(k).strip()
+            if not k_str:
+                continue
+            if isinstance(v, list):
+                adj[k_str] = [str(d).strip() for d in v if d is not None and str(d).strip()]
+            else:
+                adj[k_str] = []
+    else:
+        return False, []
+
+    # Check for direct self-dependencies first
+    for node, deps in adj.items():
+        if node in deps:
+            return True, [node, node]
 
     visited = {}  # 0 = unvisited, 1 = visiting, 2 = visited
     cycle_path = []
@@ -62,30 +90,33 @@ def detect_cycles(task_defs: Any) -> Tuple[bool, List[str]]:
         visited[node] = 0
 
     for node in adj:
-        if visited[node] == 0:
+        if visited.get(node) == 0:
             if dfs(node, []):
                 return True, cycle_path
 
     return False, []
 
 
-def validate_workflow_graph(task_defs: List[Dict[str, Any]]) -> Dict[str, Any]:
+def validate_workflow_graph(task_defs: Any) -> Dict[str, Any]:
     """
     Validate a workflow graph before starting execution:
-    1. Reject empty task list.
-    2. Enforce unique task IDs (no duplicates).
-    3. Enforce valid references: all dependencies must reference existing task IDs within the graph.
-    4. Detect circular dependencies and extract exact cycle path.
-    5. Compute deterministic topological execution levels (for parallel execution stages).
-    6. Validate input/output contract continuity between dependent tasks.
+    1. Reject non-list collections and empty task list.
+    2. Enforce complexity limits (<= 1000 tasks).
+    3. Validate task dictionaries and non-empty, unique identifiers.
+    4. Enforce valid dependency types and references.
+    5. Detect self-dependencies.
+    6. Detect circular dependencies and extract exact cycle path.
+    7. Compute deterministic topological execution levels (for parallel execution stages).
+    8. Validate input/output contract continuity between dependent tasks.
     """
     errors = []
     warnings = []
 
-    if not task_defs or not isinstance(task_defs, list):
+    if task_defs is None or not isinstance(task_defs, list):
+        got_type = type(task_defs).__name__ if task_defs is not None else "None"
         return {
             "is_valid": False,
-            "errors": ["Task list cannot be empty or non-list"],
+            "errors": [f"Task collection must be a list, got: {got_type}"],
             "warnings": [],
             "task_count": 0,
             "execution_levels": [],
@@ -93,19 +124,36 @@ def validate_workflow_graph(task_defs: List[Dict[str, Any]]) -> Dict[str, Any]:
             "cycle_path": []
         }
 
+    if len(task_defs) == 0:
+        return {
+            "is_valid": False,
+            "errors": ["Task list cannot be empty"],
+            "warnings": [],
+            "task_count": 0,
+            "execution_levels": [],
+            "has_cycles": False,
+            "cycle_path": []
+        }
+
+    if len(task_defs) > MAX_WORKFLOW_TASKS:
+        errors.append(f"Workflow exceeds maximum task limit ({len(task_defs)} > {MAX_WORKFLOW_TASKS})")
+
     seen_ids = set()
     duplicate_ids = set()
     task_map = {}
 
-    for t in task_defs:
+    for idx, t in enumerate(task_defs):
         if not isinstance(t, dict):
-            errors.append(f"Task definition must be a dictionary, got: {type(t)}")
+            errors.append(f"Task definition at index {idx} must be a dictionary, got: {type(t).__name__}")
             continue
-        tid = t.get("id") or t.get("task_id")
-        if not tid or not str(tid).strip():
-            errors.append("Task definition missing required 'id' or 'task_id'")
+        raw_tid = t.get("id") if "id" in t else t.get("task_id")
+        if raw_tid is None:
+            errors.append(f"Task definition at index {idx} missing required 'id' or 'task_id'")
             continue
-        tid_str = str(tid).strip()
+        tid_str = str(raw_tid).strip()
+        if not tid_str:
+            errors.append(f"Task definition at index {idx} has empty or whitespace identifier")
+            continue
         if tid_str in seen_ids:
             duplicate_ids.add(tid_str)
         seen_ids.add(tid_str)
@@ -114,24 +162,35 @@ def validate_workflow_graph(task_defs: List[Dict[str, Any]]) -> Dict[str, Any]:
     if duplicate_ids:
         errors.append(f"Duplicate task IDs detected: {sorted(list(duplicate_ids))}")
 
-    # Dependency existence check
+    # Dependency existence and type checks
     missing_deps = []
     for tid, t in task_map.items():
-        deps = t.get("dependencies") or []
-        if not isinstance(deps, list):
-            errors.append(f"Task '{tid}' dependencies must be a list, got {type(deps)}")
-            continue
-        for d in deps:
-            d_str = str(d).strip()
-            if d_str not in seen_ids:
-                missing_deps.append((tid, d_str))
+        if "dependencies" in t:
+            deps = t.get("dependencies")
+            if not isinstance(deps, list):
+                errors.append(f"Task '{tid}' dependencies must be a list, got {type(deps).__name__}")
+                continue
+            for dep_item in deps:
+                if dep_item is None or not isinstance(dep_item, (str, int)):
+                    errors.append(f"Task '{tid}' contains invalid dependency value: {dep_item!r} (expected string or integer identifier)")
+                    continue
+                d_str = str(dep_item).strip()
+                if not d_str:
+                    errors.append(f"Task '{tid}' contains empty dependency identifier")
+                    continue
+                if d_str == tid:
+                    errors.append(f"Self-dependency detected: task '{tid}' cannot depend on itself")
+                    continue
+                if d_str not in seen_ids:
+                    missing_deps.append((tid, d_str))
 
     if missing_deps:
         for tid, dep in missing_deps:
             errors.append(f"Missing dependency reference: task '{tid}' depends on non-existent task '{dep}'")
 
-    # Cycle detection
-    has_cycle, cycle_path = detect_cycles(task_defs)
+    # Cycle detection: run ONLY on sanitized dictionary definitions
+    valid_task_list = list(task_map.values())
+    has_cycle, cycle_path = detect_cycles(valid_task_list)
     if has_cycle:
         errors.append(f"Cycle detected / Circular dependency detected in task graph: {' -> '.join(cycle_path)}")
 
@@ -140,25 +199,28 @@ def validate_workflow_graph(task_defs: List[Dict[str, Any]]) -> Dict[str, Any]:
         req_contract = t.get("required_contract") or t.get("input_contract")
         if req_contract:
             deps = t.get("dependencies") or []
-            for d in deps:
-                dep_task = task_map.get(str(d).strip())
-                if dep_task:
-                    dep_output_contract = dep_task.get("output_contract")
-                    if dep_output_contract and dep_output_contract != req_contract:
-                        warnings.append(
-                            f"Contract mismatch: task '{tid}' requires '{req_contract}', but dependency '{d}' produces '{dep_output_contract}'"
-                        )
+            if isinstance(deps, list):
+                for d in deps:
+                    dep_task = task_map.get(str(d).strip())
+                    if dep_task and isinstance(dep_task, dict):
+                        dep_output_contract = dep_task.get("output_contract")
+                        if dep_output_contract and dep_output_contract != req_contract:
+                            warnings.append(
+                                f"Contract mismatch: task '{tid}' requires '{req_contract}', but dependency '{d}' produces '{dep_output_contract}'"
+                            )
 
-    # Compute topological execution levels if no cycles and no missing dependencies
+    # Compute topological execution levels if no cycles and no missing dependencies and no duplicates
     execution_levels = []
-    if not has_cycle and not missing_deps and not duplicate_ids:
+    if not has_cycle and not missing_deps and not duplicate_ids and len(errors) == 0:
         in_degree = {tid: 0 for tid in seen_ids}
         adj = {tid: [] for tid in seen_ids}
         for tid, t in task_map.items():
-            deps = [str(d).strip() for d in (t.get("dependencies") or [])]
+            raw_deps = t.get("dependencies") or []
+            deps = [str(d).strip() for d in raw_deps if d is not None and str(d).strip()] if isinstance(raw_deps, list) else []
             in_degree[tid] = len(deps)
             for d in deps:
-                adj[d].append(tid)
+                if d in adj:
+                    adj[d].append(tid)
 
         current_level = sorted([tid for tid, deg in in_degree.items() if deg == 0])
         remaining = set(seen_ids)
@@ -167,8 +229,9 @@ def validate_workflow_graph(task_defs: List[Dict[str, Any]]) -> Dict[str, Any]:
             execution_levels.append(current_level)
             next_level = []
             for node in current_level:
-                remaining.remove(node)
-                for downstream in adj[node]:
+                if node in remaining:
+                    remaining.remove(node)
+                for downstream in adj.get(node, []):
                     in_degree[downstream] -= 1
                     if in_degree[downstream] == 0:
                         next_level.append(downstream)
@@ -188,14 +251,15 @@ def validate_workflow_graph(task_defs: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 class WorkflowDAG:
     """Validated Directed Acyclic Graph wrapper for enterprise task orchestration."""
-    def __init__(self, tasks: List[Dict[str, Any]]):
-        self.raw_tasks = copy.deepcopy(tasks)
-        self.validation = validate_workflow_graph(self.raw_tasks)
+    def __init__(self, tasks: Any):
+        self.raw_tasks = copy.deepcopy(tasks) if isinstance(tasks, (list, dict)) else []
+        self.validation = validate_workflow_graph(tasks)
         if not self.validation["is_valid"]:
             raise ValueError(f"Invalid workflow task graph: {'; '.join(self.validation['errors'])}")
         self.task_map = {
-            (t.get("id") or t.get("task_id")): t
+            str(t.get("id") if "id" in t else t.get("task_id")).strip(): t
             for t in self.raw_tasks
+            if isinstance(t, dict) and (t.get("id") or t.get("task_id"))
         }
 
     @property
